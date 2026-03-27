@@ -13,7 +13,7 @@ var jwtSecret = []byte("raahi_secret_key")
 func GenerateJWT(userId primitive.ObjectID) (string, error) {
 	claims := jwt.MapClaims{
 		"userId": userId.Hex(),
-		"exp":    time.Now().Add(72 * time.Hour).Unix(),
+		"exp":    time.Now().Add(365 * 24 * time.Hour).Unix(), // 1 year for dev
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

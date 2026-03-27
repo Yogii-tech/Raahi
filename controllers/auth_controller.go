@@ -10,8 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
-	"golang.org/x/crypto/bcrypt"
 )
 
 var userCollection *mongo.Collection
@@ -20,51 +20,72 @@ func InitializeAuthCollection() {
 	userCollection = config.Database.Collection("users")
 }
 
-func Register(c *gin.Context) {
-	var body models.User
-	c.BindJSON(&body)
+func SendOTP(c *gin.Context) {
+	var body struct {
+		PhoneNumber string `json:"phone_number"`
+	}
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
 
-	hash, _ := bcrypt.GenerateFromPassword([]byte(body.Password), 10)
-	body.Password = string(hash)
+	// In a real app, generate a 6-digit random OTP and send it via SMS
+	otp := "123456"
 
-	userCollection.InsertOne(context.Background(), body)
-	c.JSON(http.StatusCreated, gin.H{"message": "User registered"})
+	_, err := userCollection.UpdateOne(
+		context.Background(),
+		bson.M{"phone_number": body.PhoneNumber},
+		bson.M{"$set": bson.M{"otp": otp}},
+		nil,
+	)
+
+	// If user doesn't exist, create it
+	if err == nil {
+		var user models.User
+		err = userCollection.FindOne(context.Background(), bson.M{"phone_number": body.PhoneNumber}).Decode(&user)
+		if err != nil {
+			newUser := models.User{
+				ID:          primitive.NewObjectID(),
+				PhoneNumber: body.PhoneNumber,
+				OTP:         otp,
+			}
+			userCollection.InsertOne(context.Background(), newUser)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "OTP sent", "otp": otp}) // For dev, returning OTP in response
 }
 
-func Login(c *gin.Context) {
-	var body models.User
-	c.BindJSON(&body)
+func VerifyOTP(c *gin.Context) {
+	var body struct {
+		PhoneNumber string `json:"phone_number"`
+		OTP         string `json:"otp"`
+	}
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
 
 	var user models.User
 	err := userCollection.FindOne(
 		context.Background(),
-		bson.M{"email": body.Email},
+		bson.M{"phone_number": body.PhoneNumber, "otp": body.OTP},
 	).Decode(&user)
 
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid OTP"})
 		return
 	}
 
-	if bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(body.Password)) != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-		return
-	}
-
+	// Create JWT token
 	token, _ := utils.GenerateJWT(user.ID)
-	c.JSON(http.StatusOK, gin.H{"token": token})
-}
 
-func DeleteUser(c *gin.Context) {
-	id := c.Param("id")
-	res, err := userCollection.DeleteOne(context.Background(), bson.M{"_id": id})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user"})
-		return
-	}
-	if res.DeletedCount == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"message": "User deleted"})
+	// Optionally clear OTP after verification
+	userCollection.UpdateOne(
+		context.Background(),
+		bson.M{"_id": user.ID},
+		bson.M{"$set": bson.M{"otp": ""}},
+	)
+
+	c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
 }

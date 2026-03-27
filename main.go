@@ -13,10 +13,15 @@ func main() {
 	config.ConnectDB()
 	controllers.InitializeAuthCollection()
 	controllers.InitializeRideCollection()
+	controllers.InitializeUserController()
 	r := gin.Default()
 
 	// Add CORS middleware
-	r.Use(cors.Default())
+	corsConfig := cors.DefaultConfig()
+	corsConfig.AllowAllOrigins = true
+	corsConfig.AllowHeaders = append(corsConfig.AllowHeaders, "Authorization")
+	corsConfig.AllowMethods = append(corsConfig.AllowMethods, "PUT", "DELETE", "PATCH")
+	r.Use(cors.New(corsConfig))
 
 	routes.RegisterRoutes(r)
 	r.Run(":8081")
