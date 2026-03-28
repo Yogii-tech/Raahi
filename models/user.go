@@ -14,4 +14,5 @@ type User struct {
 	OTP             string             `bson:"otp" json:"otp"`
 	TrustedContacts []Contact          `bson:"trusted_contacts" json:"trusted_contacts"`
 	Role            string             `bson:"role" json:"role"`
+	Language        string             `bson:"language" json:"language"`
 }

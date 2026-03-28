@@ -48,6 +48,7 @@ func SendOTP(c *gin.Context) {
 				ID:          primitive.NewObjectID(),
 				PhoneNumber: body.PhoneNumber,
 				OTP:         otp,
+				Language:    "en",
 			}
 			userCollection.InsertOne(context.Background(), newUser)
 		}
