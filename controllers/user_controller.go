@@ -69,9 +69,10 @@ func UpdateProfile(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var body struct {
-		Name     string `json:"name"`
-		Role     string `json:"role"`
-		Language string `json:"language"`
+		Name     string                 `json:"name"`
+		Role     string                 `json:"role"`
+		Language string                 `json:"language"`
+		Vehicle  *models.VehicleDetails `json:"vehicle"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
@@ -85,6 +86,10 @@ func UpdateProfile(c *gin.Context) {
 
 	if body.Language != "" {
 		updateFields["language"] = body.Language
+	}
+
+	if body.Vehicle != nil {
+		updateFields["vehicle"] = body.Vehicle
 	}
 
 	update := bson.M{
