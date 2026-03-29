@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var userCollection *mongo.Collection
@@ -32,26 +33,18 @@ func SendOTP(c *gin.Context) {
 	// In a real app, generate a 6-digit random OTP and send it via SMS
 	otp := "123456"
 
-	_, err := userCollection.UpdateOne(
-		context.Background(),
-		bson.M{"phone_number": body.PhoneNumber},
-		bson.M{"$set": bson.M{"otp": otp}},
-		nil,
-	)
+	// Upsert user: Update if exists, create if not
+	opts := options.Update().SetUpsert(true)
+	filter := bson.M{"phone_number": body.PhoneNumber}
+	update := bson.M{
+		"$set":         bson.M{"otp": otp},
+		"$setOnInsert": bson.M{"_id": primitive.NewObjectID(), "language": "en"},
+	}
 
-	// If user doesn't exist, create it
-	if err == nil {
-		var user models.User
-		err = userCollection.FindOne(context.Background(), bson.M{"phone_number": body.PhoneNumber}).Decode(&user)
-		if err != nil {
-			newUser := models.User{
-				ID:          primitive.NewObjectID(),
-				PhoneNumber: body.PhoneNumber,
-				OTP:         otp,
-				Language:    "en",
-			}
-			userCollection.InsertOne(context.Background(), newUser)
-		}
+	_, err := userCollection.UpdateOne(context.Background(), filter, update, opts)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate OTP"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "OTP sent", "otp": otp}) // For dev, returning OTP in response

@@ -107,6 +107,7 @@ func GetAvailableRides(c *gin.Context) {
 
 	for i := range rides {
 		rides[i].TakenSeats = getTakenSeats(rides[i].ID)
+		rides[i].SeatsBooked = len(rides[i].TakenSeats)
 	}
 
 	c.JSON(http.StatusOK, rides)
@@ -124,6 +125,7 @@ func GetRideDetails(c *gin.Context) {
 	}
 
 	ride.TakenSeats = getTakenSeats(ride.ID)
+	ride.SeatsBooked = len(ride.TakenSeats)
 	c.JSON(http.StatusOK, ride)
 }
 
@@ -334,6 +336,7 @@ func GetRecentRides(c *gin.Context) {
 
 	for i := range rides {
 		rides[i].TakenSeats = getTakenSeats(rides[i].ID)
+		rides[i].SeatsBooked = len(rides[i].TakenSeats)
 	}
 
 	c.JSON(http.StatusOK, rides)
