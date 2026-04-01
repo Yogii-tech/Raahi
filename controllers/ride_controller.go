@@ -52,12 +52,18 @@ func CreateRide(c *gin.Context) {
 	// Delete existing rides for this driver to keep it clean
 	rideCollection.DeleteMany(context.Background(), bson.M{"driverId": userId, "status": "available"})
 
+	// Ensure date is never empty - use current date if not provided
+	rideDate := body.Date
+	if rideDate == "" {
+		rideDate = time.Now().Format("02/01/2006")
+	}
+
 	ride := models.Ride{
 		DriverID:      userId,
 		DriverName:    driver.Name,
 		Pickup:        body.Pickup,
 		Dropoff:       body.Dropoff,
-		Date:          body.Date,
+		Date:          rideDate,
 		VehicleModel:  body.VehicleModel,
 		VehicleNumber: body.VehicleNumber,
 		DepartureTime: body.DepartureTime,
@@ -96,8 +102,31 @@ func getTakenSeats(rideId primitive.ObjectID) []int {
 	return taken
 }
 
+// backfillDate ensures every ride has a human-readable date string.
+// If the driver already set one, it is kept. Otherwise the ride's
+// creation timestamp is formatted as DD/MM/YYYY.
+func backfillDate(rides []models.Ride) {
+	for i := range rides {
+		if rides[i].Date == "" && !rides[i].CreatedAt.IsZero() {
+			rides[i].Date = rides[i].CreatedAt.Format("02/01/2006")
+		}
+	}
+}
+
 func GetAvailableRides(c *gin.Context) {
-	cursor, err := rideCollection.Find(context.Background(), bson.M{"status": "available"})
+	filter := bson.M{"status": "available"}
+
+	pickup := c.Query("pickup")
+	if pickup != "" {
+		filter["pickup"] = primitive.Regex{Pattern: pickup, Options: "i"}
+	}
+
+	dropoff := c.Query("dropoff")
+	if dropoff != "" {
+		filter["dropoff"] = primitive.Regex{Pattern: dropoff, Options: "i"}
+	}
+
+	cursor, err := rideCollection.Find(context.Background(), filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch rides"})
 		return
@@ -113,6 +142,7 @@ func GetAvailableRides(c *gin.Context) {
 		rides[i].TakenSeats = getTakenSeats(rides[i].ID)
 		rides[i].SeatsBooked = len(rides[i].TakenSeats)
 	}
+	backfillDate(rides)
 
 	c.JSON(http.StatusOK, rides)
 }
@@ -130,6 +160,9 @@ func GetRideDetails(c *gin.Context) {
 
 	ride.TakenSeats = getTakenSeats(ride.ID)
 	ride.SeatsBooked = len(ride.TakenSeats)
+	if ride.Date == "" && !ride.CreatedAt.IsZero() {
+		ride.Date = ride.CreatedAt.Format("02/01/2006")
+	}
 	c.JSON(http.StatusOK, ride)
 }
 
@@ -213,6 +246,10 @@ func GetDriverRequests(c *gin.Context) {
 	for _, b := range bookings {
 		var ride models.Ride
 		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
+		// Backfill date if empty
+		if ride.Date == "" && !ride.CreatedAt.IsZero() {
+			ride.Date = ride.CreatedAt.Format("02/01/2006")
+		}
 		response = append(response, BookingResponse{
 			Booking: b,
 			Ride:    ride,
@@ -247,6 +284,10 @@ func GetPassengerBookings(c *gin.Context) {
 		var ride models.Ride
 		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
 		ride.TakenSeats = getTakenSeats(ride.ID) // Populate real-time taken seats
+		// Backfill date if empty
+		if ride.Date == "" && !ride.CreatedAt.IsZero() {
+			ride.Date = ride.CreatedAt.Format("02/01/2006")
+		}
 		response = append(response, BookingResponse{
 			Booking: b,
 			Ride:    ride,
@@ -274,6 +315,7 @@ func SaveRecentRide(c *gin.Context) {
 		DriverID:  userId, // Using DriverID because unified Ride model
 		Pickup:    body.Pickup,
 		Dropoff:   body.Dropoff,
+		Date:      time.Now().Format("02/01/2006"), // Add current date
 		CreatedAt: time.Now(),
 	}
 
@@ -357,6 +399,7 @@ func GetRecentRides(c *gin.Context) {
 		rides[i].TakenSeats = getTakenSeats(rides[i].ID)
 		rides[i].SeatsBooked = len(rides[i].TakenSeats)
 	}
+	backfillDate(rides)
 
 	c.JSON(http.StatusOK, rides)
 }

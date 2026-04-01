@@ -31,5 +31,5 @@ func main() {
 	r.Static("/uploads", "./uploads")
 
 	routes.RegisterRoutes(r)
-	r.Run(":8081")
+	r.Run(":8080")
 }
