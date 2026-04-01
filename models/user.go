@@ -11,6 +11,7 @@ type VehicleDetails struct {
 	VehicleName       string `bson:"vehicle_name" json:"vehicle_name"`
 	VehicleType       string `bson:"vehicle_type" json:"vehicle_type"`
 	Seats             int    `bson:"seats" json:"seats"`
+	SeatingLayout     string `bson:"seating_layout" json:"seating_layout"`
 	VehicleNumber     string `bson:"vehicle_number" json:"vehicle_number"`
 	DrivingLicenseURL string `bson:"dl_url" json:"dl_url"`
 	RCURL             string `bson:"rc_url" json:"rc_url"`

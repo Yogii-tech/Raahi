@@ -32,7 +32,9 @@ func CreateRide(c *gin.Context) {
 		VehicleModel  string  `json:"vehicleModel"`
 		VehicleNumber string  `json:"vehicleNumber"`
 		DepartureTime string  `json:"departureTime"`
+		Date          string  `json:"date"`
 		SeatsTotal    int     `json:"seatsTotal"`
+		SeatingLayout string  `json:"seatingLayout"`
 		PricePerSeat  float64 `json:"pricePerSeat"`
 	}
 
@@ -55,10 +57,12 @@ func CreateRide(c *gin.Context) {
 		DriverName:    driver.Name,
 		Pickup:        body.Pickup,
 		Dropoff:       body.Dropoff,
+		Date:          body.Date,
 		VehicleModel:  body.VehicleModel,
 		VehicleNumber: body.VehicleNumber,
 		DepartureTime: body.DepartureTime,
 		SeatsTotal:    body.SeatsTotal,
+		SeatingLayout: body.SeatingLayout,
 		SeatsBooked:   0,
 		PricePerSeat:  body.PricePerSeat,
 		Status:        "available",
@@ -200,7 +204,22 @@ func GetDriverRequests(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, bookings)
+	type BookingResponse struct {
+		models.Booking
+		Ride models.Ride `json:"ride"`
+	}
+
+	var response []BookingResponse
+	for _, b := range bookings {
+		var ride models.Ride
+		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
+		response = append(response, BookingResponse{
+			Booking: b,
+			Ride:    ride,
+		})
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func GetPassengerBookings(c *gin.Context) {

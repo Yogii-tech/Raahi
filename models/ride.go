@@ -13,8 +13,10 @@ type Ride struct {
 	VehicleNumber string             `bson:"vehicleNumber" json:"vehicleNumber"`
 	Pickup        string             `bson:"pickup" json:"pickup"`
 	Dropoff       string             `bson:"dropoff" json:"dropoff"`
+	Date          string             `bson:"date" json:"date"`
 	DepartureTime string             `bson:"departureTime" json:"departureTime"`
 	SeatsTotal    int                `bson:"seatsTotal" json:"seatsTotal"`
+	SeatingLayout string             `bson:"seatingLayout" json:"seatingLayout"`
 	SeatsBooked   int                `bson:"seatsBooked" json:"seatsBooked"`
 	PricePerSeat  float64            `bson:"pricePerSeat" json:"pricePerSeat"`
 	TakenSeats    []int              `bson:"takenSeats" json:"takenSeats"`
