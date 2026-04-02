@@ -14,6 +14,16 @@ func RegisterRoutes(r *gin.Engine) {
 	{
 		auth.POST("/otp/send", controllers.SendOTP)
 		auth.POST("/otp/verify", controllers.VerifyOTP)
+		auth.POST("/promote-admin", middleware.AuthMiddleware(), controllers.PromoteToAdmin)
+	}
+
+	admin := api.Group("/admin")
+	admin.Use(middleware.AuthMiddleware(), middleware.RequireAdmin())
+	{
+		admin.GET("/stats", controllers.GetAdminStats)
+		admin.GET("/bookings", controllers.GetAllAdminBookings)
+		admin.GET("/drivers", controllers.GetAllDrivers)
+		admin.GET("/reports/:type", controllers.DownloadReport)
 	}
 
 	rides := api.Group("/rides")

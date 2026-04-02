@@ -83,3 +83,37 @@ func VerifyOTP(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
 }
+
+func PromoteToAdmin(c *gin.Context) {
+	userIdVal, exists := c.Get("userId")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized user"})
+		return
+	}
+	userId := userIdVal.(primitive.ObjectID)
+
+	var body struct {
+		SecretKey string `json:"secret_key"`
+	}
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	if body.SecretKey != "admin_secret_123" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid secret key"})
+		return
+	}
+
+	_, err := userCollection.UpdateOne(
+		context.Background(),
+		bson.M{"_id": userId},
+		bson.M{"$set": bson.M{"role": "admin"}},
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update role"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Promoted to admin successfully", "role": "admin"})
+}
