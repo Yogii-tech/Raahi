@@ -3,6 +3,7 @@ package routes
 import (
 	"raahi-backend/controllers"
 	"raahi-backend/middleware"
+	"raahi-backend/models"
 
 	"github.com/gin-gonic/gin"
 )
@@ -29,15 +30,20 @@ func RegisterRoutes(r *gin.Engine) {
 	rides := api.Group("/rides")
 	rides.Use(middleware.AuthMiddleware())
 	{
-		rides.POST("/create", controllers.CreateRide)
+		// Driver-only actions
+		rides.POST("/create", middleware.RequireRole(models.RoleDriver), controllers.CreateRide)
+		rides.GET("/requests", middleware.RequireRole(models.RoleDriver), controllers.GetDriverRequests)
+		rides.PUT("/bookings/:bookingId", middleware.RequireRole(models.RoleDriver), controllers.UpdateBookingStatus)
+		rides.POST("/recent", middleware.RequireRole(models.RoleDriver), controllers.SaveRecentRide)
+		rides.GET("/recent", middleware.RequireRole(models.RoleDriver), controllers.GetRecentRides)
+
+		// Passenger-only actions
+		rides.POST("/:rideId/book", middleware.RequireRole(models.RolePassenger), controllers.BookRide)
+		rides.GET("/bookings", middleware.RequireRole(models.RolePassenger), controllers.GetPassengerBookings)
+
+		// Publicly accessible actions (but still require Auth)
 		rides.GET("/available", controllers.GetAvailableRides)
 		rides.GET("/:rideId", controllers.GetRideDetails)
-		rides.POST("/:rideId/book", controllers.BookRide)
-		rides.GET("/requests", controllers.GetDriverRequests)
-		rides.GET("/bookings", controllers.GetPassengerBookings)
-		rides.PUT("/bookings/:bookingId", controllers.UpdateBookingStatus)
-		rides.POST("/recent", controllers.SaveRecentRide)
-		rides.GET("/recent", controllers.GetRecentRides)
 		rides.POST("/viewed", controllers.MarkNotificationsViewed)
 	}
 

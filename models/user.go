@@ -42,3 +42,9 @@ type User struct {
 	VAHANVerified        bool               `bson:"vahan_verified" json:"vahan_verified"`
 	VAHANOwnerName       string             `bson:"vahan_owner_name,omitempty" json:"vahan_owner_name,omitempty"`
 }
+
+const (
+	RoleAdmin     = "admin"
+	RoleDriver    = "driver"
+	RolePassenger = "passenger"
+)

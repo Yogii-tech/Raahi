@@ -23,10 +23,10 @@ func InitializeAuthCollection() {
 
 func SendOTP(c *gin.Context) {
 	var body struct {
-		PhoneNumber string `json:"phone_number"`
+		PhoneNumber string `json:"phone_number" binding:"required,numeric,len=10"`
 	}
-	if err := c.BindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid phone number format. Expected 10 digits."})
 		return
 	}
 
@@ -52,11 +52,11 @@ func SendOTP(c *gin.Context) {
 
 func VerifyOTP(c *gin.Context) {
 	var body struct {
-		PhoneNumber string `json:"phone_number"`
-		OTP         string `json:"otp"`
+		PhoneNumber string `json:"phone_number" binding:"required,numeric,len=10"`
+		OTP         string `json:"otp" binding:"required,numeric,len=6"`
 	}
-	if err := c.BindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid phone number or OTP format"})
 		return
 	}
 
@@ -93,10 +93,10 @@ func PromoteToAdmin(c *gin.Context) {
 	userId := userIdVal.(primitive.ObjectID)
 
 	var body struct {
-		SecretKey string `json:"secret_key"`
+		SecretKey string `json:"secret_key" binding:"required"`
 	}
-	if err := c.BindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Secret key is required"})
 		return
 	}
 

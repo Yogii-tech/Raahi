@@ -7,6 +7,7 @@ import (
 
 	"raahi-backend/config"
 	"raahi-backend/models"
+	"raahi-backend/utils"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
@@ -38,8 +39,22 @@ func CreateRide(c *gin.Context) {
 		PricePerSeat  float64 `json:"pricePerSeat"`
 	}
 
-	if err := c.BindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input formatting"})
+		return
+	}
+
+	// Validation: Location sanitization and length
+	pickup := utils.SanitizeString(body.Pickup)
+	dropoff := utils.SanitizeString(body.Dropoff)
+	if len(pickup) < 2 || len(pickup) > 100 || len(dropoff) < 2 || len(dropoff) > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Pickup and Dropoff locations must be between 2 and 100 characters"})
+		return
+	}
+
+	// Validation: Positive seats and price
+	if body.SeatsTotal <= 0 || body.PricePerSeat < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid seat count or price. Must be positive."})
 		return
 	}
 
@@ -61,8 +76,8 @@ func CreateRide(c *gin.Context) {
 	ride := models.Ride{
 		DriverID:      userId,
 		DriverName:    driver.Name,
-		Pickup:        body.Pickup,
-		Dropoff:       body.Dropoff,
+		Pickup:        pickup,
+		Dropoff:       dropoff,
 		Date:          rideDate,
 		VehicleModel:  body.VehicleModel,
 		VehicleNumber: body.VehicleNumber,
@@ -178,8 +193,35 @@ func BookRide(c *gin.Context) {
 		MotionSickness bool  `json:"motionSickness"`
 	}
 
-	if err := c.BindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
+		return
+	}
+
+	// Basic Validation
+	if body.SeatsRequested <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "You must request at least 1 seat"})
+		return
+	}
+
+	// Fetch the ride to verify existence and capacity
+	var ride models.Ride
+	err := rideCollection.FindOne(context.Background(), bson.M{"_id": rideId}).Decode(&ride)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found or unavailable"})
+		return
+	}
+
+	// Security Check: Cannot book your own ride
+	if ride.DriverID == passengerId {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You cannot book your own ride"})
+		return
+	}
+
+	// Logic Check: Overbooking Prevention
+	takenCount := len(getTakenSeats(rideId))
+	if takenCount+body.SeatsRequested > ride.SeatsTotal {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Not enough seats available"})
 		return
 	}
 
@@ -194,7 +236,7 @@ func BookRide(c *gin.Context) {
 		CreatedAt:      time.Now(),
 	}
 
-	_, err := bookingCollection.InsertOne(context.Background(), booking)
+	_, err = bookingCollection.InsertOne(context.Background(), booking)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to book ride"})
 		return
@@ -349,6 +391,15 @@ func UpdateBookingStatus(c *gin.Context) {
 		return
 	}
 
+	// Ownership check: Is this booking for a ride owned by this driver?
+	userId := c.MustGet("userId").(primitive.ObjectID)
+	var ride models.Ride
+	err = rideCollection.FindOne(context.Background(), bson.M{"_id": booking.RideID}).Decode(&ride)
+	if err != nil || ride.DriverID != userId {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: You do not own this ride's booking requests"})
+		return
+	}
+
 	// Update status
 	_, err = bookingCollection.UpdateOne(
 		context.Background(),
@@ -407,6 +458,14 @@ func GetRecentRides(c *gin.Context) {
 func MarkNotificationsViewed(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	role := c.Query("role") // "driver" or "passenger"
+
+	// Fetch user to verify they have the claimed role
+	var user models.User
+	config.Database.Collection("users").FindOne(context.Background(), bson.M{"_id": userId}).Decode(&user)
+	if user.Role != role {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: role mismatch"})
+		return
+	}
 
 	var filter bson.M
 	var update bson.M

@@ -6,6 +6,7 @@ import (
 
 	"raahi-backend/config"
 	"raahi-backend/models"
+	"raahi-backend/utils"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
@@ -46,9 +47,18 @@ func UpdateTrustedContacts(c *gin.Context) {
 		return
 	}
 
-	// Limit to 2 contacts
+	// Validation: All contacts must have valid 10-digit phone numbers
+	for _, contact := range contacts {
+		if len(contact.Phone) != 10 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Trusted contacts must have valid 10-digit phone numbers"})
+			return
+		}
+	}
+
+	// Explicit limit of 2 contacts (No silent truncation)
 	if len(contacts) > 2 {
-		contacts = contacts[:2]
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Maximum 2 trusted contacts allowed"})
+		return
 	}
 
 	_, err := userProfileCollection.UpdateOne(
@@ -79,9 +89,26 @@ func UpdateProfile(c *gin.Context) {
 		return
 	}
 
+	// Validation: Name length and sanitization
+	sanitizedName := utils.SanitizeString(body.Name)
+	if len(sanitizedName) < 2 || len(sanitizedName) > 50 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Name must be between 2 and 50 characters"})
+		return
+	}
+
+	// Fetch current user role
+	var currentUser models.User
+	userProfileCollection.FindOne(context.Background(), bson.M{"_id": userId}).Decode(&currentUser)
+
 	updateFields := bson.M{
-		"name": body.Name,
-		"role": body.Role,
+		"name": sanitizedName,
+	}
+
+	// Only update role if user is NOT already an admin.
+	// This allows normal users to switch between driver <-> passenger
+	// but prevents them from promoting themselves to admin.
+	if currentUser.Role != models.RoleAdmin && (body.Role == models.RoleDriver || body.Role == models.RolePassenger) {
+		updateFields["role"] = body.Role
 	}
 
 	if body.Language != "" {
