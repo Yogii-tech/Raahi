@@ -21,26 +21,27 @@ type VehicleDetails struct {
 }
 
 type User struct {
-	ID                   primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	PhoneNumber          string             `bson:"phone_number" json:"phone_number"`
-	Name                 string             `bson:"name" json:"name"`
-	OTP                  string             `bson:"otp" json:"otp"`
-	TrustedContacts      []Contact          `bson:"trusted_contacts" json:"trusted_contacts"`
-	Role                 string             `bson:"role" json:"role"`
-	Language             string             `bson:"language" json:"language"`
-	Vehicle              *VehicleDetails    `bson:"vehicle,omitempty" json:"vehicle,omitempty"`
+	ID              primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	PhoneNumber     string             `bson:"phone_number" json:"phone_number"`
+	Name            string             `bson:"name" json:"name"`
+	OTP             string             `bson:"otp" json:"otp"`
+	RefreshToken    string             `bson:"refresh_token" json:"refresh_token"`
+	TrustedContacts []Contact          `bson:"trusted_contacts" json:"trusted_contacts"`
+	Role            string             `bson:"role" json:"role"`
+	Language        string             `bson:"language" json:"language"`
+	Vehicle         *VehicleDetails    `bson:"vehicle,omitempty" json:"vehicle,omitempty"`
 	// Verification
-	VerificationStatus   string             `bson:"verification_status" json:"verification_status"`
-	VerificationNote     string             `bson:"verification_note" json:"verification_note"`
-	BlurFlags            map[string]bool    `bson:"blur_flags,omitempty" json:"blur_flags,omitempty"`
+	VerificationStatus string          `bson:"verification_status" json:"verification_status"`
+	VerificationNote   string          `bson:"verification_note" json:"verification_note"`
+	BlurFlags          map[string]bool `bson:"blur_flags,omitempty" json:"blur_flags,omitempty"`
 	// Owner / Driver split
-	IsVehicleOwner       bool               `bson:"is_vehicle_owner" json:"is_vehicle_owner"`
-	OwnerName            string             `bson:"owner_name,omitempty" json:"owner_name,omitempty"`
-	OwnerPhone           string             `bson:"owner_phone,omitempty" json:"owner_phone,omitempty"`
-	AuthorizationLetterURL string           `bson:"authorization_letter_url,omitempty" json:"authorization_letter_url,omitempty"`
+	IsVehicleOwner         bool   `bson:"is_vehicle_owner" json:"is_vehicle_owner"`
+	OwnerName              string `bson:"owner_name,omitempty" json:"owner_name,omitempty"`
+	OwnerPhone             string `bson:"owner_phone,omitempty" json:"owner_phone,omitempty"`
+	AuthorizationLetterURL string `bson:"authorization_letter_url,omitempty" json:"authorization_letter_url,omitempty"`
 	// VAHAN verification
-	VAHANVerified        bool               `bson:"vahan_verified" json:"vahan_verified"`
-	VAHANOwnerName       string             `bson:"vahan_owner_name,omitempty" json:"vahan_owner_name,omitempty"`
+	VAHANVerified  bool   `bson:"vahan_verified" json:"vahan_verified"`
+	VAHANOwnerName string `bson:"vahan_owner_name,omitempty" json:"vahan_owner_name,omitempty"`
 }
 
 const (

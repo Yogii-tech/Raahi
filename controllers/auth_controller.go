@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"net/http"
+	"os"
 
 	"raahi-backend/config"
 	"raahi-backend/models"
@@ -71,17 +72,94 @@ func VerifyOTP(c *gin.Context) {
 		return
 	}
 
-	// Create JWT token
-	token, _ := utils.GenerateJWT(user.ID)
+	// Create both Access and Refresh tokens
+	accessToken, _ := utils.GenerateJWT(user.ID)
+	refreshToken, _ := utils.GenerateRefreshToken(user.ID)
 
-	// Optionally clear OTP after verification
-	userCollection.UpdateOne(
+	// Save refresh token in DB and clear OTP
+	_, err = userCollection.UpdateOne(
 		context.Background(),
 		bson.M{"_id": user.ID},
-		bson.M{"$set": bson.M{"otp": ""}},
+		bson.M{
+			"$set": bson.M{
+				"otp":           "",
+				"refresh_token": refreshToken,
+			},
+		},
 	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to login"})
+		return
+	}
 
-	c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
+	// Set HttpOnly cookies for Web clients
+	isSecure := os.Getenv("GIN_MODE") == "release"
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("auth_token", accessToken, 3600, "/", "", isSecure, true)
+	c.SetCookie("auth_refresh_token", refreshToken, 30*24*3600, "/", "", isSecure, true)
+
+	c.JSON(http.StatusOK, gin.H{
+		"token":         accessToken,
+		"refresh_token": refreshToken,
+		"user":          user,
+	})
+}
+
+func RefreshToken(c *gin.Context) {
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	c.ShouldBindJSON(&body)
+
+	refreshToken := body.RefreshToken
+	if refreshToken == "" {
+		// Fallback to cookie
+		if cookie, err := c.Cookie("auth_refresh_token"); err == nil {
+			refreshToken = cookie
+		}
+	}
+
+	if refreshToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Refresh token is required"})
+		return
+	}
+
+	// Validate JWT structure/expiry
+	userId, err := utils.ValidateRefreshToken(refreshToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired refresh token"})
+		return
+	}
+
+	// Check if this token exists in our DB for this user
+	var user models.User
+	err = userCollection.FindOne(context.Background(), bson.M{
+		"_id":           userId,
+		"refresh_token": refreshToken,
+	}).Decode(&user)
+
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Token revoked or mismatch"})
+		return
+	}
+
+	// Token is valid and matches DB, issue NEW access token
+	newAccessToken, _ := utils.GenerateJWT(userId)
+
+	// Set HttpOnly cookie for new token
+	isSecure := os.Getenv("GIN_MODE") == "release"
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("auth_token", newAccessToken, 3600, "/", "", isSecure, true)
+
+	c.JSON(http.StatusOK, gin.H{
+		"token": newAccessToken,
+	})
+}
+
+func Logout(c *gin.Context) {
+	c.SetCookie("auth_token", "", -1, "/", "", false, true)
+	c.SetCookie("auth_refresh_token", "", -1, "/", "", false, true)
+	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
 }
 
 func PromoteToAdmin(c *gin.Context) {
@@ -100,7 +178,12 @@ func PromoteToAdmin(c *gin.Context) {
 		return
 	}
 
-	if body.SecretKey != "admin_secret_123" {
+	adminKey := os.Getenv("ADMIN_PROMOTION_KEY")
+	if adminKey == "" {
+		adminKey = "admin_secret_123" // Fallback but should log this
+	}
+
+	if body.SecretKey != adminKey {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid secret key"})
 		return
 	}

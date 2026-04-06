@@ -10,11 +10,15 @@ import (
 
 func RegisterRoutes(r *gin.Engine) {
 	api := r.Group("/api")
+	api.Use(middleware.GlobalRateLimiter())
 
 	auth := api.Group("/auth")
+	auth.Use(middleware.AuthRateLimiter()) // Apply strict auth rate limiting
 	{
 		auth.POST("/otp/send", controllers.SendOTP)
 		auth.POST("/otp/verify", controllers.VerifyOTP)
+		auth.POST("/refresh", controllers.RefreshToken)
+		auth.POST("/logout", controllers.Logout)
 		auth.POST("/promote-admin", middleware.AuthMiddleware(), controllers.PromoteToAdmin)
 	}
 
@@ -34,8 +38,8 @@ func RegisterRoutes(r *gin.Engine) {
 		rides.POST("/create", middleware.RequireRole(models.RoleDriver), controllers.CreateRide)
 		rides.GET("/requests", middleware.RequireRole(models.RoleDriver), controllers.GetDriverRequests)
 		rides.PUT("/bookings/:bookingId", middleware.RequireRole(models.RoleDriver), controllers.UpdateBookingStatus)
-		rides.POST("/recent", middleware.RequireRole(models.RoleDriver), controllers.SaveRecentRide)
-		rides.GET("/recent", middleware.RequireRole(models.RoleDriver), controllers.GetRecentRides)
+		rides.POST("/recent", controllers.SaveRecentRide)
+		rides.GET("/recent", controllers.GetRecentRides)
 
 		// Passenger-only actions
 		rides.POST("/:rideId/book", middleware.RequireRole(models.RolePassenger), controllers.BookRide)
@@ -45,6 +49,13 @@ func RegisterRoutes(r *gin.Engine) {
 		rides.GET("/available", controllers.GetAvailableRides)
 		rides.GET("/:rideId", controllers.GetRideDetails)
 		rides.POST("/viewed", controllers.MarkNotificationsViewed)
+	}
+
+	chat := api.Group("/chat")
+	chat.Use(middleware.AuthMiddleware())
+	{
+		chat.POST("/:bookingId", controllers.SendMessage)
+		chat.GET("/:bookingId", controllers.GetMessages)
 	}
 
 	user := api.Group("/user")

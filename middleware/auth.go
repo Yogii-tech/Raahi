@@ -12,20 +12,25 @@ import (
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header missing"})
-			c.Abort()
-			return
-		}
-
 		parts := strings.Split(authHeader, " ")
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid authorization format"})
+		token := ""
+		if len(parts) == 2 && parts[0] == "Bearer" {
+			token = parts[1]
+		} else {
+			// Fallback: Check Cookie if header is missing/invalid
+			cookie, err := c.Cookie("auth_token")
+			if err == nil {
+				token = cookie
+			}
+		}
+
+		if token == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization token missing"})
 			c.Abort()
 			return
 		}
 
-		userId, err := utils.ValidateJWT(parts[1])
+		userId, err := utils.ValidateJWT(token)
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 			c.Abort()
