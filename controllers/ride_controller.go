@@ -22,6 +22,14 @@ var bookingCollection *mongo.Collection
 func InitializeRideCollection() {
 	rideCollection = config.Database.Collection("rides")
 	bookingCollection = config.Database.Collection("bookings")
+
+	// Create TTL index to auto-delete rides and bookings after 7 days (604800 seconds)
+	ttlIndex := mongo.IndexModel{
+		Keys:    bson.M{"createdAt": 1},
+		Options: options.Index().SetExpireAfterSeconds(604800),
+	}
+	rideCollection.Indexes().CreateOne(context.Background(), ttlIndex)
+	bookingCollection.Indexes().CreateOne(context.Background(), ttlIndex)
 }
 
 func CreateRide(c *gin.Context) {
@@ -281,7 +289,8 @@ func GetDriverRequests(c *gin.Context) {
 
 	type BookingResponse struct {
 		models.Booking
-		Ride models.Ride `json:"ride"`
+		Ride            models.Ride `json:"ride"`
+		UnreadChatCount int64       `json:"unreadChatCount"`
 	}
 
 	var response []BookingResponse
@@ -293,8 +302,9 @@ func GetDriverRequests(c *gin.Context) {
 			ride.Date = ride.CreatedAt.Format("02/01/2006")
 		}
 		response = append(response, BookingResponse{
-			Booking: b,
-			Ride:    ride,
+			Booking:         b,
+			Ride:            ride,
+			UnreadChatCount: GetUnreadMessageCount(b.ID, "passenger"),
 		})
 	}
 
@@ -318,7 +328,8 @@ func GetPassengerBookings(c *gin.Context) {
 
 	type BookingResponse struct {
 		models.Booking
-		Ride models.Ride `json:"ride"`
+		Ride            models.Ride `json:"ride"`
+		UnreadChatCount int64       `json:"unreadChatCount"`
 	}
 
 	var response []BookingResponse
@@ -331,8 +342,9 @@ func GetPassengerBookings(c *gin.Context) {
 			ride.Date = ride.CreatedAt.Format("02/01/2006")
 		}
 		response = append(response, BookingResponse{
-			Booking: b,
-			Ride:    ride,
+			Booking:         b,
+			Ride:            ride,
+			UnreadChatCount: GetUnreadMessageCount(b.ID, "driver"),
 		})
 	}
 

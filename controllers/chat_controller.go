@@ -19,6 +19,13 @@ var chatCollection *mongo.Collection
 
 func InitializeChatCollection() {
 	chatCollection = config.Database.Collection("chat")
+
+	// Create TTL index to auto-delete chat messages after 7 days (604800 seconds)
+	ttlIndex := mongo.IndexModel{
+		Keys:    bson.M{"created_at": 1},
+		Options: options.Index().SetExpireAfterSeconds(604800),
+	}
+	chatCollection.Indexes().CreateOne(context.Background(), ttlIndex)
 }
 
 func SendMessage(c *gin.Context) {
@@ -122,4 +129,52 @@ func GetMessages(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, messages)
+}
+
+func GetUnreadMessageCount(bookingID primitive.ObjectID, otherRole string) int64 {
+	count, err := chatCollection.CountDocuments(context.Background(), bson.M{
+		"booking_id": bookingID,
+		"role":       otherRole,
+		"is_read":    bson.M{"$ne": true},
+	})
+	if err != nil {
+		return 0
+	}
+	return count
+}
+
+func MarkMessagesAsRead(c *gin.Context) {
+	userId := c.MustGet("userId").(primitive.ObjectID)
+	bookingIdHex := c.Param("bookingId")
+	bookingId, _ := primitive.ObjectIDFromHex(bookingIdHex)
+
+	// If user is driver, mark passenger messages as read, and vice versa
+	var booking models.Booking
+	bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
+	var ride models.Ride
+	rideCollection.FindOne(context.Background(), bson.M{"_id": booking.RideID}).Decode(&ride)
+
+	otherRole := "passenger"
+	if ride.DriverID == userId {
+		otherRole = "passenger"
+	} else {
+		otherRole = "driver"
+	}
+
+	_, err := chatCollection.UpdateMany(
+		context.Background(),
+		bson.M{
+			"booking_id": bookingId,
+			"role":       otherRole,
+			"is_read":    bson.M{"$ne": true},
+		},
+		bson.M{"$set": bson.M{"is_read": true}},
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to mark messages as read"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Messages marked as read"})
 }

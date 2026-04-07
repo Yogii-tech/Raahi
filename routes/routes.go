@@ -56,6 +56,7 @@ func RegisterRoutes(r *gin.Engine) {
 	{
 		chat.POST("/:bookingId", controllers.SendMessage)
 		chat.GET("/:bookingId", controllers.GetMessages)
+		chat.POST("/:bookingId/read", controllers.MarkMessagesAsRead)
 	}
 
 	user := api.Group("/user")
