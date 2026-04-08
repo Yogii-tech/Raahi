@@ -3,12 +3,14 @@ package controllers
 import (
 	"context"
 	"encoding/csv"
+	"fmt"
 	"net/http"
 
 	"raahi-backend/models"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 func GetAdminStats(c *gin.Context) {
@@ -18,6 +20,35 @@ func GetAdminStats(c *gin.Context) {
 	confirmedCount, _ := bookingCollection.CountDocuments(context.Background(), bson.M{"status": "accepted"})
 	canceledCount, _ := bookingCollection.CountDocuments(context.Background(), bson.M{"status": "rejected"})
 
+	var latestPayments []gin.H
+	bookingOptions := options.Find()
+	bookingOptions.SetSort(bson.D{{Key: "_id", Value: -1}})
+	bookingOptions.SetLimit(4)
+	bookingCursor, berr := bookingCollection.Find(context.Background(), bson.M{"status": "accepted"}, bookingOptions)
+	if berr == nil {
+		var recentBookings []models.Booking
+		bookingCursor.All(context.Background(), &recentBookings)
+		for _, b := range recentBookings {
+			var passenger models.User
+			var ride models.Ride
+			userCollection.FindOne(context.Background(), bson.M{"_id": b.PassengerID}).Decode(&passenger)
+			rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
+
+			paymentAmount := float64(b.SeatsRequested) * ride.PricePerSeat
+			name := passenger.Name
+			if name == "" {
+				name = "Passenger"
+			}
+			latestPayments = append(latestPayments, gin.H{
+				"name":   name,
+				"detail": fmt.Sprintf("₹%.0f", paymentAmount),
+			})
+		}
+	}
+	if latestPayments == nil {
+		latestPayments = []gin.H{}
+	}
+
 	// Since we might not have timestamps sorted neatly without options, we'll just take simple counts
 	c.JSON(http.StatusOK, gin.H{
 		"totalRides": ridesCount,
@@ -25,12 +56,7 @@ func GetAdminStats(c *gin.Context) {
 		"confirmed":  confirmedCount,
 		"drivers":    driversCount,
 		"canceled":   canceledCount,
-		"activities": []gin.H{
-			{"name": "Amit Sharma", "amount": 700},
-			{"name": "Priya Verma", "amount": 350},
-			{"name": "Rohan Gupta", "amount": 1050},
-			{"name": "Suresh Negi", "amount": 1400},
-		}, // Mocked latest activity for UI demonstration as per image
+		"activities": latestPayments,
 	})
 }
 
@@ -87,7 +113,7 @@ func DownloadReport(c *gin.Context) {
 	c.Writer.Header().Set("Content-Disposition", "attachment;filename="+reportType+".csv")
 
 	writer := csv.NewWriter(c.Writer)
-	
+
 	if reportType == "daily_bookings" {
 		writer.Write([]string{"Date", "Bookings", "Revenue"})
 		writer.Write([]string{"2026-04-01", "25", "12500"})
@@ -121,6 +147,7 @@ func GetAllDrivers(c *gin.Context) {
 		VehicleName   string `json:"vehicleName"`
 		VehicleNumber string `json:"vehicleNumber"`
 		VehicleType   string `json:"vehicleType"`
+		SeatsFilled   int    `json:"seatsFilled"`
 		Seats         int    `json:"seats"`
 		TotalRides    int64  `json:"totalRides"`
 	}
@@ -140,6 +167,29 @@ func GetAllDrivers(c *gin.Context) {
 			da.VehicleType = d.Vehicle.VehicleType
 			da.Seats = d.Vehicle.Seats
 		}
+
+		var activeRide models.Ride
+		err := rideCollection.FindOne(context.Background(), bson.M{
+			"driverId": d.ID,
+			"status":   "available",
+		}).Decode(&activeRide)
+		if err == nil {
+			// Count accepted seats live from bookings (most accurate)
+			acceptedCursor, _ := bookingCollection.Find(context.Background(), bson.M{
+				"rideId": activeRide.ID,
+				"status": "accepted",
+			})
+			var acceptedBookings []models.Booking
+			acceptedCursor.All(context.Background(), &acceptedBookings)
+			acceptedSeats := 0
+			for _, ab := range acceptedBookings {
+				acceptedSeats += ab.SeatsRequested
+			}
+			da.SeatsFilled = activeRide.SeatsTotal - acceptedSeats
+		} else {
+			da.SeatsFilled = 0 // No active ride
+		}
+
 		response = append(response, da)
 	}
 

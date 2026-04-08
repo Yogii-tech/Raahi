@@ -458,13 +458,46 @@ func GetRecentRides(c *gin.Context) {
 		return
 	}
 
+	type RideResponse struct {
+		models.Ride
+		AcceptedSeats []int `json:"acceptedSeats"`
+		PendingSeats  []int `json:"pendingSeats"`
+	}
+
+	var response []RideResponse
 	for i := range rides {
 		rides[i].TakenSeats = getTakenSeats(rides[i].ID)
 		rides[i].SeatsBooked = len(rides[i].TakenSeats)
+		if rides[i].Date == "" && !rides[i].CreatedAt.IsZero() {
+			rides[i].Date = rides[i].CreatedAt.Format("02/01/2006")
+		}
+
+		// Separate accepted vs pending seat layouts
+		acceptedSeats := []int{}
+		pendingSeats := []int{}
+		bCursor, _ := bookingCollection.Find(context.Background(), bson.M{"rideId": rides[i].ID})
+		var bList []models.Booking
+		bCursor.All(context.Background(), &bList)
+		for _, b := range bList {
+			if b.Status == "accepted" {
+				acceptedSeats = append(acceptedSeats, b.SeatLayout...)
+			} else if b.Status == "pending" {
+				pendingSeats = append(pendingSeats, b.SeatLayout...)
+			}
+		}
+
+		response = append(response, RideResponse{
+			Ride:          rides[i],
+			AcceptedSeats: acceptedSeats,
+			PendingSeats:  pendingSeats,
+		})
 	}
 	backfillDate(rides)
 
-	c.JSON(http.StatusOK, rides)
+	if response == nil {
+		response = []RideResponse{}
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func MarkNotificationsViewed(c *gin.Context) {

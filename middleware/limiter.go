@@ -13,10 +13,10 @@ import (
 
 // AuthRateLimiter limits the number of requests to authentication endpoints.
 func AuthRateLimiter() gin.HandlerFunc {
-	// Define the rate: 5 requests per minute
+	// Define the rate: 300 requests per minute (high for local testing)
 	rate := limiter.Rate{
 		Period: 1 * time.Minute,
-		Limit:  5,
+		Limit:  300,
 	}
 
 	// Use an in-memory store for now
