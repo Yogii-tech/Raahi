@@ -38,6 +38,8 @@ func RegisterRoutes(r *gin.Engine) {
 		rides.POST("/create", middleware.RequireRole(models.RoleDriver), controllers.CreateRide)
 		rides.GET("/requests", middleware.RequireRole(models.RoleDriver), controllers.GetDriverRequests)
 		rides.PUT("/bookings/:bookingId", middleware.RequireRole(models.RoleDriver), controllers.UpdateBookingStatus)
+		rides.PUT("/bookings/:bookingId/complete", middleware.RequireRole(models.RoleDriver), controllers.CompleteBooking)
+		rides.PUT("/:rideId/complete", middleware.RequireRole(models.RoleDriver), controllers.CompleteRide)
 		rides.POST("/recent", controllers.SaveRecentRide)
 		rides.GET("/recent", controllers.GetRecentRides)
 

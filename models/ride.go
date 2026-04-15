@@ -22,6 +22,7 @@ type Ride struct {
 	TakenSeats    []int              `bson:"takenSeats" json:"takenSeats"`
 	DriverName    string             `bson:"driverName" json:"driverName"`
 	Status        string             `bson:"status" json:"status"` // "available", "completed", "cancelled"
+	CompletedAt   time.Time          `bson:"completedAt" json:"completedAt"`
 	CreatedAt     time.Time          `bson:"createdAt" json:"createdAt"`
 }
 
@@ -33,7 +34,8 @@ type Booking struct {
 	SeatLayout        []int              `bson:"seatLayout" json:"seatLayout"` // Selected seat indexes
 	RoofCarrier       bool               `bson:"roofCarrier" json:"roofCarrier"`
 	MotionSickness    bool               `bson:"motionSickness" json:"motionSickness"`
-	Status            string             `bson:"status" json:"status"` // "pending", "accepted", "rejected"
+	Status            string             `bson:"status" json:"status"` // "pending", "accepted", "rejected", "completed"
+	CompletedAt       time.Time          `bson:"completedAt" json:"completedAt"`
 	ViewedByPassenger bool               `bson:"viewedByPassenger" json:"viewedByPassenger"`
 	ViewedByDriver    bool               `bson:"viewedByDriver" json:"viewedByDriver"`
 	CreatedAt         time.Time          `bson:"createdAt" json:"createdAt"`
