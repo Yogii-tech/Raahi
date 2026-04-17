@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"raahi-backend/config"
 	"raahi-backend/models"
@@ -42,7 +43,8 @@ func RequireRole(allowedRoles ...string) gin.HandlerFunc {
 			}
 		}
 
-		if !isAllowed {
+		if !isAllowed && user.Role != models.RoleAdmin {
+			log.Printf("🚫 Access Denied for User %s: Role '%s' not in %v", userId.Hex(), user.Role, allowedRoles)
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Permission denied: access restricted for your role"})
 			return
 		}

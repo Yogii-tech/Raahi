@@ -24,6 +24,7 @@ func main() {
 	controllers.InitializeUserController()
 	controllers.InitializeChatCollection() // For RaahiChat
 	r := gin.Default()
+	r.SetTrustedProxies(nil)
 
 	// Add CORS middleware
 	corsConfig := cors.DefaultConfig()
