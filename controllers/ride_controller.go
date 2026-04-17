@@ -72,8 +72,9 @@ func CreateRide(c *gin.Context) {
 	}
 	config.Database.Collection("users").FindOne(context.Background(), bson.M{"_id": userId}).Decode(&driver)
 
-	// Delete existing rides for this driver to keep it clean
-	rideCollection.DeleteMany(context.Background(), bson.M{"driverId": userId, "status": "available"})
+	// We no longer delete existing 'available' rides here so that a driver
+	// logged into multiple devices (e.g., laptop and mobile) posting different
+	// trips simultaneously does not experience silent deletions causing out-of-sync states.
 
 	// Ensure date is never empty - use current date if not provided
 	rideDate := body.Date
@@ -269,7 +270,13 @@ func GetDriverRequests(c *gin.Context) {
 		return
 	}
 
-	var rideIds []primitive.ObjectID
+	// If driver has no rides, return empty array immediately
+	if len(rides) == 0 {
+		c.JSON(http.StatusOK, []struct{}{})
+		return
+	}
+
+	rideIds := make([]primitive.ObjectID, 0, len(rides))
 	for _, ride := range rides {
 		rideIds = append(rideIds, ride.ID)
 	}
@@ -294,7 +301,7 @@ func GetDriverRequests(c *gin.Context) {
 		UnreadChatCount int64       `json:"unreadChatCount"`
 	}
 
-	var response []BookingResponse
+	response := make([]BookingResponse, 0)
 	for _, b := range bookings {
 		var ride models.Ride
 		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
@@ -335,7 +342,7 @@ func GetPassengerBookings(c *gin.Context) {
 		CompletedSeats  []int       `json:"completedSeats"`
 	}
 
-	var response []BookingResponse
+	response := make([]BookingResponse, 0)
 	for _, b := range bookings {
 		var ride models.Ride
 		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)

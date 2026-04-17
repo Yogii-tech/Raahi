@@ -75,6 +75,7 @@ func GetAllAdminBookings(c *gin.Context) {
 		PassengerName string `json:"passengerName"`
 		Status        string `json:"status"`
 		DriverName    string `json:"driverName"`
+		Ride          string `json:"ride"`
 	}
 
 	var response []BookingAdmin
@@ -100,6 +101,7 @@ func GetAllAdminBookings(c *gin.Context) {
 			PassengerName: passenger.Name,
 			Status:        status,
 			DriverName:    ride.DriverName,
+			Ride:          ride.Pickup + " → " + ride.Dropoff,
 		})
 	}
 
@@ -150,6 +152,7 @@ func GetAllDrivers(c *gin.Context) {
 		SeatsFilled   int    `json:"seatsFilled"`
 		Seats         int    `json:"seats"`
 		TotalRides    int64  `json:"totalRides"`
+		CurrentRide   string `json:"currentRide"`
 	}
 
 	var response []DriverAdmin
@@ -160,6 +163,7 @@ func GetAllDrivers(c *gin.Context) {
 			Name:       d.Name,
 			Phone:      d.PhoneNumber,
 			TotalRides: rideCount,
+			CurrentRide: "—",
 		}
 		if d.Vehicle != nil {
 			da.VehicleName = d.Vehicle.VehicleName
@@ -186,6 +190,7 @@ func GetAllDrivers(c *gin.Context) {
 				acceptedSeats += ab.SeatsRequested
 			}
 			da.SeatsFilled = activeRide.SeatsTotal - acceptedSeats
+			da.CurrentRide = activeRide.Pickup + " → " + activeRide.Dropoff
 		} else {
 			da.SeatsFilled = 0 // No active ride
 		}
