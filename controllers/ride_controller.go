@@ -80,6 +80,41 @@ func CreateRide(c *gin.Context) {
 	rideDate := body.Date
 	if rideDate == "" {
 		rideDate = time.Now().Format("02/01/2006")
+	} else {
+		parsedDate, err := time.Parse("02/01/2006", rideDate)
+		if err == nil {
+			now := time.Now()
+			today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			if parsedDate.Before(today) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot post a ride for a past date"})
+				return
+			} else if parsedDate.Equal(today) && body.DepartureTime != "" {
+				// Parse time format
+				importStrings := true // Handled by generic import logic if needed
+				_ = importStrings
+				
+				// Provide multiple formats for parsing the departure time
+				formats := []string{"03:04 PM", "3:04 PM", "03:04PM", "3:04PM", "15:04"}
+				var parsedTime time.Time
+				var errTime error
+				for _, f := range formats {
+					parsedTime, errTime = time.Parse(f, body.DepartureTime)
+					if errTime == nil {
+						break
+					}
+				}
+				
+				if errTime == nil {
+					if parsedTime.Hour() < now.Hour() || (parsedTime.Hour() == now.Hour() && parsedTime.Minute() < now.Minute()) {
+						c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot post a ride for a past time today"})
+						return
+					}
+				}
+			}
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid date format, expected DD/MM/YYYY"})
+			return
+		}
 	}
 
 	ride := models.Ride{
@@ -162,13 +197,27 @@ func GetAvailableRides(c *gin.Context) {
 		return
 	}
 
+	var validRides []models.Ride
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
 	for i := range rides {
+		if rides[i].Date != "" {
+			parsedDate, err := time.Parse("02/01/2006", rides[i].Date)
+			if err == nil && parsedDate.Before(today) {
+				// Ride is in the past, auto-expire it
+				rideCollection.UpdateOne(context.Background(), bson.M{"_id": rides[i].ID}, bson.M{"$set": bson.M{"status": "expired"}})
+				continue
+			}
+		}
+
 		rides[i].TakenSeats = getTakenSeats(rides[i].ID)
 		rides[i].SeatsBooked = len(rides[i].TakenSeats)
+		validRides = append(validRides, rides[i])
 	}
-	backfillDate(rides)
+	backfillDate(validRides)
 
-	c.JSON(http.StatusOK, rides)
+	c.JSON(http.StatusOK, validRides)
 }
 
 func GetRideDetails(c *gin.Context) {
@@ -460,8 +509,7 @@ func GetRecentRides(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	opts := options.Find().
-		SetSort(bson.D{{Key: "createdAt", Value: -1}}).
-		SetLimit(5)
+		SetSort(bson.D{{Key: "createdAt", Value: -1}})
 
 	cursor, err := rideCollection.Find(
 		context.Background(),
