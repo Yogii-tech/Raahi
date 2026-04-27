@@ -31,7 +31,11 @@ func InitializeChatCollection() {
 func SendMessage(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	bookingIdHex := c.Param("bookingId")
-	bookingId, _ := primitive.ObjectIDFromHex(bookingIdHex)
+	bookingId, err := primitive.ObjectIDFromHex(bookingIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid booking ID format"})
+		return
+	}
 
 	var msgInput struct {
 		Text string `json:"text" binding:"required"`
@@ -44,7 +48,7 @@ func SendMessage(c *gin.Context) {
 
 	// Verify the user is part of this booking
 	var booking models.Booking
-	err := bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
+	err = bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
 		return
@@ -92,19 +96,26 @@ func SendMessage(c *gin.Context) {
 func GetMessages(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	bookingIdHex := c.Param("bookingId")
-	bookingId, _ := primitive.ObjectIDFromHex(bookingIdHex)
+	bookingId, err := primitive.ObjectIDFromHex(bookingIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid booking ID format"})
+		return
+	}
 
 	// Verify ownership
 	var booking models.Booking
-	err := bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
+	err = bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
 		return
 	}
 
 	var ride models.Ride
-	chatCollection.FindOne(context.Background(), bson.M{"_id": booking.RideID}) // Placeholder to avoid error
 	err = rideCollection.FindOne(context.Background(), bson.M{"_id": booking.RideID}).Decode(&ride)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+		return
+	}
 
 	if userId != ride.DriverID && userId != booking.PassengerID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
@@ -146,7 +157,11 @@ func GetUnreadMessageCount(bookingID primitive.ObjectID, otherRole string) int64
 func MarkMessagesAsRead(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	bookingIdHex := c.Param("bookingId")
-	bookingId, _ := primitive.ObjectIDFromHex(bookingIdHex)
+	bookingId, err := primitive.ObjectIDFromHex(bookingIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid booking ID format"})
+		return
+	}
 
 	// If user is driver, mark passenger messages as read, and vice versa
 	var booking models.Booking
@@ -161,7 +176,7 @@ func MarkMessagesAsRead(c *gin.Context) {
 		otherRole = "driver"
 	}
 
-	_, err := chatCollection.UpdateMany(
+	_, err = chatCollection.UpdateMany(
 		context.Background(),
 		bson.M{
 			"booking_id": bookingId,

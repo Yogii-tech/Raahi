@@ -1,3 +1,9 @@
+//go:build ignore
+// +build ignore
+
+// This is a standalone utility script for debugging.
+// Run with: go run scratch/check_db.go
+
 package main
 
 import (
@@ -16,7 +22,7 @@ func main() {
 	}
 	defer client.Disconnect(context.Background())
 
-	collection := client.Database("raahi").Collection("rides")
+	collection := client.Database("Raahi").Collection("rides")
 	cursor, err := collection.Find(context.Background(), bson.M{})
 	if err != nil {
 		fmt.Println("Find error:", err)
@@ -27,9 +33,9 @@ func main() {
 	cursor.All(context.Background(), &results)
 	fmt.Printf("Total rides in DB: %d\n", len(results))
 	for i, r := range results {
-        if i >= 10 { // Just print the first 10
-            break
-        }
+		if i >= 10 { // Just print the first 10
+			break
+		}
 		fmt.Printf("Driver: %v, Pickup: %v, Dropoff: %v, Status: %v, CreatedAt: %v\n", r["driverName"], r["pickup"], r["dropoff"], r["status"], r["createdAt"])
 	}
 }

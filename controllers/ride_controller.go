@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"net/http"
+	"regexp"
 	"time"
 
 	"raahi-backend/config"
@@ -16,6 +17,13 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+// escapeRegex escapes special regex characters to prevent ReDoS injection
+var regexMetaChars = regexp.MustCompile(`[\\^$.|?*+()\[\]{}]`)
+
+func escapeRegex(s string) string {
+	return regexMetaChars.ReplaceAllString(s, `\$0`)
+}
+
 var rideCollection *mongo.Collection
 var bookingCollection *mongo.Collection
 
@@ -28,8 +36,11 @@ func InitializeRideCollection() {
 		Keys:    bson.M{"createdAt": 1},
 		Options: options.Index().SetExpireAfterSeconds(604800),
 	}
-	rideCollection.Indexes().CreateOne(context.Background(), ttlIndex)
-	bookingCollection.Indexes().CreateOne(context.Background(), ttlIndex)
+	// Using a timeout context for background indexing as it's not request-specific
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rideCollection.Indexes().CreateOne(ctx, ttlIndex)
+	bookingCollection.Indexes().CreateOne(ctx, ttlIndex)
 }
 
 func CreateRide(c *gin.Context) {
@@ -70,7 +81,11 @@ func CreateRide(c *gin.Context) {
 	var driver struct {
 		Name string `bson:"name"`
 	}
-	config.Database.Collection("users").FindOne(context.Background(), bson.M{"_id": userId}).Decode(&driver)
+	errFetch := config.Database.Collection("users").FindOne(c.Request.Context(), bson.M{"_id": userId}).Decode(&driver)
+	if errFetch != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Driver user record not found"})
+		return
+	}
 
 	// We no longer delete existing 'available' rides here so that a driver
 	// logged into multiple devices (e.g., laptop and mobile) posting different
@@ -89,10 +104,7 @@ func CreateRide(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot post a ride for a past date"})
 				return
 			} else if parsedDate.Equal(today) && body.DepartureTime != "" {
-				// Parse time format
-				importStrings := true // Handled by generic import logic if needed
-				_ = importStrings
-				
+	
 				// Provide multiple formats for parsing the departure time
 				formats := []string{"03:04 PM", "3:04 PM", "03:04PM", "3:04PM", "15:04"}
 				var parsedTime time.Time
@@ -134,8 +146,8 @@ func CreateRide(c *gin.Context) {
 		CreatedAt:     time.Now(),
 	}
 
-	_, err := rideCollection.InsertOne(context.Background(), ride)
-	if err != nil {
+	_, errInsert := rideCollection.InsertOne(c.Request.Context(), ride)
+	if errInsert != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create ride"})
 		return
 	}
@@ -143,8 +155,8 @@ func CreateRide(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"message": "Ride created successfully"})
 }
 
-func getTakenSeats(rideId primitive.ObjectID) []int {
-	cursor, err := bookingCollection.Find(context.Background(), bson.M{
+func getTakenSeats(ctx context.Context, rideId primitive.ObjectID) []int {
+	cursor, err := bookingCollection.Find(ctx, bson.M{
 		"rideId": rideId,
 		"status": bson.M{"$in": []string{"pending", "accepted"}},
 	})
@@ -152,7 +164,7 @@ func getTakenSeats(rideId primitive.ObjectID) []int {
 		return []int{}
 	}
 	var bookings []models.Booking
-	cursor.All(context.Background(), &bookings)
+	cursor.All(ctx, &bookings)
 
 	taken := []int{}
 	for _, b := range bookings {
@@ -177,22 +189,22 @@ func GetAvailableRides(c *gin.Context) {
 
 	pickup := c.Query("pickup")
 	if pickup != "" {
-		filter["pickup"] = primitive.Regex{Pattern: pickup, Options: "i"}
+		filter["pickup"] = primitive.Regex{Pattern: escapeRegex(pickup), Options: "i"}
 	}
 
 	dropoff := c.Query("dropoff")
 	if dropoff != "" {
-		filter["dropoff"] = primitive.Regex{Pattern: dropoff, Options: "i"}
+		filter["dropoff"] = primitive.Regex{Pattern: escapeRegex(dropoff), Options: "i"}
 	}
 
-	cursor, err := rideCollection.Find(context.Background(), filter)
+	cursor, err := rideCollection.Find(c.Request.Context(), filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch rides"})
 		return
 	}
 
 	var rides []models.Ride
-	if err := cursor.All(context.Background(), &rides); err != nil {
+	if err := cursor.All(c.Request.Context(), &rides); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse rides"})
 		return
 	}
@@ -206,12 +218,12 @@ func GetAvailableRides(c *gin.Context) {
 			parsedDate, err := time.Parse("02/01/2006", rides[i].Date)
 			if err == nil && parsedDate.Before(today) {
 				// Ride is in the past, auto-expire it
-				rideCollection.UpdateOne(context.Background(), bson.M{"_id": rides[i].ID}, bson.M{"$set": bson.M{"status": "expired"}})
+				rideCollection.UpdateOne(c.Request.Context(), bson.M{"_id": rides[i].ID}, bson.M{"$set": bson.M{"status": "expired"}})
 				continue
 			}
 		}
 
-		rides[i].TakenSeats = getTakenSeats(rides[i].ID)
+		rides[i].TakenSeats = getTakenSeats(c.Request.Context(), rides[i].ID)
 		rides[i].SeatsBooked = len(rides[i].TakenSeats)
 		validRides = append(validRides, rides[i])
 	}
@@ -222,16 +234,20 @@ func GetAvailableRides(c *gin.Context) {
 
 func GetRideDetails(c *gin.Context) {
 	rideIdHex := c.Param("rideId")
-	rideId, _ := primitive.ObjectIDFromHex(rideIdHex)
+	rideId, err := primitive.ObjectIDFromHex(rideIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ride ID format"})
+		return
+	}
 
 	var ride models.Ride
-	err := rideCollection.FindOne(context.Background(), bson.M{"_id": rideId}).Decode(&ride)
+	err = rideCollection.FindOne(c.Request.Context(), bson.M{"_id": rideId}).Decode(&ride)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
 		return
 	}
 
-	ride.TakenSeats = getTakenSeats(ride.ID)
+	ride.TakenSeats = getTakenSeats(c.Request.Context(), ride.ID)
 	ride.SeatsBooked = len(ride.TakenSeats)
 	if ride.Date == "" && !ride.CreatedAt.IsZero() {
 		ride.Date = ride.CreatedAt.Format("02/01/2006")
@@ -242,7 +258,11 @@ func GetRideDetails(c *gin.Context) {
 func BookRide(c *gin.Context) {
 	passengerId := c.MustGet("userId").(primitive.ObjectID)
 	rideIdHex := c.Param("rideId")
-	rideId, _ := primitive.ObjectIDFromHex(rideIdHex)
+	rideId, err := primitive.ObjectIDFromHex(rideIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ride ID format"})
+		return
+	}
 
 	var body struct {
 		SeatsRequested int   `json:"seatsRequested"`
@@ -264,7 +284,7 @@ func BookRide(c *gin.Context) {
 
 	// Fetch the ride to verify existence and capacity
 	var ride models.Ride
-	err := rideCollection.FindOne(context.Background(), bson.M{"_id": rideId}).Decode(&ride)
+	err = rideCollection.FindOne(c.Request.Context(), bson.M{"_id": rideId}).Decode(&ride)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found or unavailable"})
 		return
@@ -277,7 +297,7 @@ func BookRide(c *gin.Context) {
 	}
 
 	// Logic Check: Overbooking Prevention
-	takenCount := len(getTakenSeats(rideId))
+	takenCount := len(getTakenSeats(c.Request.Context(), rideId))
 	if takenCount+body.SeatsRequested > ride.SeatsTotal {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Not enough seats available"})
 		return
@@ -294,7 +314,7 @@ func BookRide(c *gin.Context) {
 		CreatedAt:      time.Now(),
 	}
 
-	_, err = bookingCollection.InsertOne(context.Background(), booking)
+	_, err = bookingCollection.InsertOne(c.Request.Context(), booking)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to book ride"})
 		return
@@ -307,14 +327,14 @@ func GetDriverRequests(c *gin.Context) {
 	driverId := c.MustGet("userId").(primitive.ObjectID)
 
 	// Sub-query to get all rides created by this driver
-	cursor, err := rideCollection.Find(context.Background(), bson.M{"driverId": driverId})
+	cursor, err := rideCollection.Find(c.Request.Context(), bson.M{"driverId": driverId})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver rides"})
 		return
 	}
 
 	var rides []models.Ride
-	if err := cursor.All(context.Background(), &rides); err != nil {
+	if err := cursor.All(c.Request.Context(), &rides); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse rides"})
 		return
 	}
@@ -332,14 +352,14 @@ func GetDriverRequests(c *gin.Context) {
 
 	// Filter bookings for those rideIds, sorted by newest first
 	opts := options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}})
-	cursor, err = bookingCollection.Find(context.Background(), bson.M{"rideId": bson.M{"$in": rideIds}}, opts)
+	cursor, err = bookingCollection.Find(c.Request.Context(), bson.M{"rideId": bson.M{"$in": rideIds}}, opts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch requests"})
 		return
 	}
 
 	var bookings []models.Booking
-	if err := cursor.All(context.Background(), &bookings); err != nil {
+	if err := cursor.All(c.Request.Context(), &bookings); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings"})
 		return
 	}
@@ -353,7 +373,10 @@ func GetDriverRequests(c *gin.Context) {
 	response := make([]BookingResponse, 0)
 	for _, b := range bookings {
 		var ride models.Ride
-		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
+		errRide := rideCollection.FindOne(c.Request.Context(), bson.M{"_id": b.RideID}).Decode(&ride)
+		if errRide != nil {
+			continue
+		}
 		// Backfill date if empty
 		if ride.Date == "" && !ride.CreatedAt.IsZero() {
 			ride.Date = ride.CreatedAt.Format("02/01/2006")
@@ -372,14 +395,14 @@ func GetPassengerBookings(c *gin.Context) {
 	passengerId := c.MustGet("userId").(primitive.ObjectID)
 
 	opts := options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}})
-	cursor, err := bookingCollection.Find(context.Background(), bson.M{"passengerId": passengerId}, opts)
+	cursor, err := bookingCollection.Find(c.Request.Context(), bson.M{"passengerId": passengerId}, opts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings"})
 		return
 	}
 
 	var bookings []models.Booking
-	if err := cursor.All(context.Background(), &bookings); err != nil {
+	if err := cursor.All(c.Request.Context(), &bookings); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings"})
 		return
 	}
@@ -394,14 +417,17 @@ func GetPassengerBookings(c *gin.Context) {
 	response := make([]BookingResponse, 0)
 	for _, b := range bookings {
 		var ride models.Ride
-		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
-		ride.TakenSeats = getTakenSeats(ride.ID) // Populate real-time taken seats
+		errRide := rideCollection.FindOne(c.Request.Context(), bson.M{"_id": b.RideID}).Decode(&ride)
+		if errRide != nil {
+			continue
+		}
+		ride.TakenSeats = getTakenSeats(c.Request.Context(), ride.ID) // Populate real-time taken seats
 		
 		// Map completed seats from other bookings on this ride
 		completedSeats := []int{}
-		bCursor, _ := bookingCollection.Find(context.Background(), bson.M{"rideId": ride.ID, "status": "completed"})
+		bCursor, _ := bookingCollection.Find(c.Request.Context(), bson.M{"rideId": ride.ID, "status": "completed"})
 		var bList []models.Booking
-		bCursor.All(context.Background(), &bList)
+		bCursor.All(c.Request.Context(), &bList)
 		for _, ob := range bList {
 			completedSeats = append(completedSeats, ob.SeatLayout...)
 		}
@@ -443,7 +469,7 @@ func SaveRecentRide(c *gin.Context) {
 		CreatedAt: time.Now(),
 	}
 
-	_, err := rideCollection.InsertOne(context.Background(), ride)
+	_, err := rideCollection.InsertOne(c.Request.Context(), ride)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save ride"})
 		return
@@ -454,7 +480,11 @@ func SaveRecentRide(c *gin.Context) {
 
 func UpdateBookingStatus(c *gin.Context) {
 	bookingIdHex := c.Param("bookingId")
-	bookingId, _ := primitive.ObjectIDFromHex(bookingIdHex)
+	bookingId, err := primitive.ObjectIDFromHex(bookingIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid booking ID format"})
+		return
+	}
 
 	var body struct {
 		Status string `json:"status"` // "accepted" or "rejected"
@@ -467,7 +497,7 @@ func UpdateBookingStatus(c *gin.Context) {
 
 	// Get the booking to find the rideId and seatsRequested
 	var booking models.Booking
-	err := bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
+	err = bookingCollection.FindOne(c.Request.Context(), bson.M{"_id": bookingId}).Decode(&booking)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
 		return
@@ -476,7 +506,7 @@ func UpdateBookingStatus(c *gin.Context) {
 	// Ownership check: Is this booking for a ride owned by this driver?
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	var ride models.Ride
-	err = rideCollection.FindOne(context.Background(), bson.M{"_id": booking.RideID}).Decode(&ride)
+	err = rideCollection.FindOne(c.Request.Context(), bson.M{"_id": booking.RideID}).Decode(&ride)
 	if err != nil || ride.DriverID != userId {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: You do not own this ride's booking requests"})
 		return
@@ -484,7 +514,7 @@ func UpdateBookingStatus(c *gin.Context) {
 
 	// Update status
 	_, err = bookingCollection.UpdateOne(
-		context.Background(),
+		c.Request.Context(),
 		bson.M{"_id": bookingId},
 		bson.M{"$set": bson.M{"status": body.Status}},
 	)
@@ -496,7 +526,7 @@ func UpdateBookingStatus(c *gin.Context) {
 	// If accepted, update ride's seatsBooked
 	if body.Status == "accepted" {
 		rideCollection.UpdateOne(
-			context.Background(),
+			c.Request.Context(),
 			bson.M{"_id": booking.RideID},
 			bson.M{"$inc": bson.M{"seatsBooked": booking.SeatsRequested}},
 		)
@@ -512,7 +542,7 @@ func GetRecentRides(c *gin.Context) {
 		SetSort(bson.D{{Key: "createdAt", Value: -1}})
 
 	cursor, err := rideCollection.Find(
-		context.Background(),
+		c.Request.Context(),
 		bson.M{"driverId": userId},
 		opts,
 	)
@@ -522,7 +552,7 @@ func GetRecentRides(c *gin.Context) {
 	}
 
 	rides := []models.Ride{}
-	if err := cursor.All(context.Background(), &rides); err != nil {
+	if err := cursor.All(c.Request.Context(), &rides); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse rides"})
 		return
 	}
@@ -537,7 +567,7 @@ func GetRecentRides(c *gin.Context) {
 
 	var response []RideResponse
 	for i := range rides {
-		rides[i].TakenSeats = getTakenSeats(rides[i].ID)
+		rides[i].TakenSeats = getTakenSeats(c.Request.Context(), rides[i].ID)
 		rides[i].SeatsBooked = len(rides[i].TakenSeats)
 		if rides[i].Date == "" && !rides[i].CreatedAt.IsZero() {
 			rides[i].Date = rides[i].CreatedAt.Format("02/01/2006")
@@ -545,9 +575,9 @@ func GetRecentRides(c *gin.Context) {
 
 		// Separate accepted, pending, and completed seat layouts, newest first
 		bOpts := options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}})
-		bCursor, _ := bookingCollection.Find(context.Background(), bson.M{"rideId": rides[i].ID}, bOpts)
+		bCursor, _ := bookingCollection.Find(c.Request.Context(), bson.M{"rideId": rides[i].ID}, bOpts)
 		var bList []models.Booking
-		bCursor.All(context.Background(), &bList)
+		bCursor.All(c.Request.Context(), &bList)
 		
 		acceptedSeats := []int{}
 		pendingSeats := []int{}
@@ -583,11 +613,9 @@ func MarkNotificationsViewed(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	role := c.Query("role") // "driver" or "passenger"
 
-	// Fetch user to verify they have the claimed role
-	var user models.User
-	config.Database.Collection("users").FindOne(context.Background(), bson.M{"_id": userId}).Decode(&user)
-	if user.Role != role {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: role mismatch"})
+	// Validate the role parameter is one of the expected values
+	if role != "driver" && role != "passenger" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid role parameter. Use 'driver' or 'passenger'."})
 		return
 	}
 
@@ -596,9 +624,9 @@ func MarkNotificationsViewed(c *gin.Context) {
 
 	if role == "driver" {
 		// Driver sees requests for THEIR rides
-		cursor, _ := rideCollection.Find(context.Background(), bson.M{"driverId": userId})
+		cursor, _ := rideCollection.Find(c.Request.Context(), bson.M{"driverId": userId})
 		var rideIds []primitive.ObjectID
-		for cursor.Next(context.Background()) {
+		for cursor.Next(c.Request.Context()) {
 			var r models.Ride
 			cursor.Decode(&r)
 			rideIds = append(rideIds, r.ID)
@@ -611,7 +639,7 @@ func MarkNotificationsViewed(c *gin.Context) {
 		update = bson.M{"$set": bson.M{"viewedByPassenger": true}}
 	}
 
-	bookingCollection.UpdateMany(context.Background(), filter, update)
+	bookingCollection.UpdateMany(c.Request.Context(), filter, update)
 	c.JSON(http.StatusOK, gin.H{"message": "Notifications marked as viewed"})
 }
 
@@ -626,7 +654,7 @@ func CompleteRide(c *gin.Context) {
 
 	// Verify driver ownership
 	var ride models.Ride
-	err = rideCollection.FindOne(context.Background(), bson.M{"_id": rideId, "driverId": userId}).Decode(&ride)
+	err = rideCollection.FindOne(c.Request.Context(), bson.M{"_id": rideId, "driverId": userId}).Decode(&ride)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: You do not own this ride or it does not exist"})
 		return
@@ -640,7 +668,7 @@ func CompleteRide(c *gin.Context) {
 	// Update ride status
 	now := time.Now()
 	_, err = rideCollection.UpdateOne(
-		context.Background(),
+		c.Request.Context(),
 		bson.M{"_id": rideId},
 		bson.M{"$set": bson.M{"status": "completed", "completedAt": now}},
 	)
@@ -651,7 +679,7 @@ func CompleteRide(c *gin.Context) {
 
 	// Also complete all accepted bookings for this ride
 	bookingCollection.UpdateMany(
-		context.Background(),
+		c.Request.Context(),
 		bson.M{"rideId": rideId, "status": "accepted"},
 		bson.M{"$set": bson.M{"status": "completed", "completedAt": now}},
 	)
@@ -666,7 +694,7 @@ func CompleteRide(c *gin.Context) {
 		"viewed":    false,
 		"createdAt": now,
 	}
-	adminNotificationsCollection.InsertOne(context.Background(), notification)
+	adminNotificationsCollection.InsertOne(c.Request.Context(), notification)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Trip marked as completed"})
 }
@@ -682,7 +710,7 @@ func CompleteBooking(c *gin.Context) {
 
 	// Get the booking
 	var booking models.Booking
-	err = bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
+	err = bookingCollection.FindOne(c.Request.Context(), bson.M{"_id": bookingId}).Decode(&booking)
 
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
@@ -691,7 +719,7 @@ func CompleteBooking(c *gin.Context) {
 
 	// Verify driver ownership of the ride this booking belongs to
 	var ride models.Ride
-	err = rideCollection.FindOne(context.Background(), bson.M{"_id": booking.RideID, "driverId": userId}).Decode(&ride)
+	err = rideCollection.FindOne(c.Request.Context(), bson.M{"_id": booking.RideID, "driverId": userId}).Decode(&ride)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: You do not own this ride's bookings"})
 		return
@@ -705,7 +733,7 @@ func CompleteBooking(c *gin.Context) {
 	// Update booking status
 	now := time.Now()
 	_, err = bookingCollection.UpdateOne(
-		context.Background(),
+		c.Request.Context(),
 		bson.M{"_id": bookingId},
 		bson.M{"$set": bson.M{"status": "completed", "completedAt": now}},
 	)

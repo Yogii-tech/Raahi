@@ -1,5 +1,3 @@
-//go:build ignore
-
 package main
 
 import (
@@ -8,7 +6,6 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func main() {
@@ -21,18 +18,15 @@ func main() {
 
 	collection := client.Database("Raahi").Collection("users")
 	
-	userID, _ := primitive.ObjectIDFromHex("69e2761ab3cf2c6a04441de6")
-	
-	// Set role to passenger for this user
 	result, err := collection.UpdateOne(
 		context.Background(),
-		bson.M{"_id": userID},
-		bson.M{"$set": bson.M{"role": "passenger"}},
+		bson.M{"phone_number": "9411356987"},
+		bson.M{"$set": bson.M{"otp": "121212", "name": "Yogesh", "role": "passenger"}},
 	)
 	if err != nil {
 		fmt.Println("Update error:", err)
 		return
 	}
 
-	fmt.Printf("Updated %d user(s) to 'passenger' role.\n", result.ModifiedCount)
+	fmt.Printf("Updated %d user(s) with test OTP.\n", result.ModifiedCount)
 }

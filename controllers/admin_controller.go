@@ -189,7 +189,7 @@ func GetAllDrivers(c *gin.Context) {
 			for _, ab := range acceptedBookings {
 				acceptedSeats += ab.SeatsRequested
 			}
-			da.SeatsFilled = activeRide.SeatsTotal - acceptedSeats
+			da.SeatsFilled = acceptedSeats
 			da.CurrentRide = activeRide.Pickup + " → " + activeRide.Dropoff
 		} else {
 			da.SeatsFilled = 0 // No active ride

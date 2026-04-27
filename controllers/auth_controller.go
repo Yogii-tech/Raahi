@@ -1,7 +1,6 @@
 package controllers
 
 import (
-	"context"
 	"net/http"
 	"os"
 
@@ -42,13 +41,13 @@ func SendOTP(c *gin.Context) {
 		"$setOnInsert": bson.M{"_id": primitive.NewObjectID(), "language": "en"},
 	}
 
-	_, err := userCollection.UpdateOne(context.Background(), filter, update, opts)
+	_, err := userCollection.UpdateOne(c.Request.Context(), filter, update, opts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate OTP"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "OTP sent", "otp": otp}) // For dev, returning OTP in response
+	c.JSON(http.StatusOK, gin.H{"message": "OTP sent"})
 }
 
 func VerifyOTP(c *gin.Context) {
@@ -63,7 +62,7 @@ func VerifyOTP(c *gin.Context) {
 
 	var user models.User
 	err := userCollection.FindOne(
-		context.Background(),
+		c.Request.Context(),
 		bson.M{"phone_number": body.PhoneNumber, "otp": body.OTP},
 	).Decode(&user)
 
@@ -78,7 +77,7 @@ func VerifyOTP(c *gin.Context) {
 
 	// Save refresh token in DB and clear OTP
 	_, err = userCollection.UpdateOne(
-		context.Background(),
+		c.Request.Context(),
 		bson.M{"_id": user.ID},
 		bson.M{
 			"$set": bson.M{
@@ -101,7 +100,14 @@ func VerifyOTP(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"token":         accessToken,
 		"refresh_token": refreshToken,
-		"user":          user,
+		"user": gin.H{
+			"id":           user.ID,
+			"phone_number": user.PhoneNumber,
+			"name":         user.Name,
+			"role":         user.Role,
+			"language":     user.Language,
+			"vehicle":      user.Vehicle,
+		},
 	})
 }
 
@@ -133,7 +139,7 @@ func RefreshToken(c *gin.Context) {
 
 	// Check if this token exists in our DB for this user
 	var user models.User
-	err = userCollection.FindOne(context.Background(), bson.M{
+	err = userCollection.FindOne(c.Request.Context(), bson.M{
 		"_id":           userId,
 		"refresh_token": refreshToken,
 	}).Decode(&user)
@@ -180,7 +186,8 @@ func PromoteToAdmin(c *gin.Context) {
 
 	adminKey := os.Getenv("ADMIN_PROMOTION_KEY")
 	if adminKey == "" {
-		adminKey = "admin_secret_123" // Fallback but should log this
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Admin promotion is not configured on this server"})
+		return
 	}
 
 	if body.SecretKey != adminKey {
@@ -189,7 +196,7 @@ func PromoteToAdmin(c *gin.Context) {
 	}
 
 	_, err := userCollection.UpdateOne(
-		context.Background(),
+		c.Request.Context(),
 		bson.M{"_id": userId},
 		bson.M{"$set": bson.M{"role": "admin"}},
 	)
