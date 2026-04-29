@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"os"
 
@@ -137,14 +138,18 @@ func RefreshToken(c *gin.Context) {
 		return
 	}
 
-	// Check if this token exists in our DB for this user
+	// Load user by trusted claim, then verify presented token against stored token
 	var user models.User
 	err = userCollection.FindOne(c.Request.Context(), bson.M{
-		"_id":           userId,
-		"refresh_token": refreshToken,
+		"_id": userId,
 	}).Decode(&user)
 
 	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Token revoked or mismatch"})
+		return
+	}
+
+	if subtle.ConstantTimeCompare([]byte(user.RefreshToken), []byte(refreshToken)) != 1 {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Token revoked or mismatch"})
 		return
 	}
