@@ -168,8 +168,9 @@ func RefreshToken(c *gin.Context) {
 }
 
 func Logout(c *gin.Context) {
-	c.SetCookie("auth_token", "", -1, "/", "", false, true)
-	c.SetCookie("auth_refresh_token", "", -1, "/", "", false, true)
+	isSecure := os.Getenv("GIN_MODE") == "release"
+	c.SetCookie("auth_token", "", -1, "/", "", isSecure, true)
+	c.SetCookie("auth_refresh_token", "", -1, "/", "", isSecure, true)
 	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
 }
 
