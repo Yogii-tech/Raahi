@@ -86,13 +86,14 @@ func GetAllAdminBookings(c *gin.Context) {
 		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
 
 		status := b.Status
-		if status == "accepted" {
+		switch b.Status {
+		case "accepted":
 			status = "CONFIRMED"
-		} else if status == "pending" {
+		case "pending":
 			status = "PENDING"
-		} else if status == "rejected" {
+		case "rejected":
 			status = "CANCELLED"
-		} else {
+		default:
 			status = "CANCELLED" // Default to canceled if empty just in case
 		}
 
@@ -116,15 +117,16 @@ func DownloadReport(c *gin.Context) {
 
 	writer := csv.NewWriter(c.Writer)
 
-	if reportType == "daily_bookings" {
+	switch reportType {
+	case "daily_bookings":
 		writer.Write([]string{"Date", "Bookings", "Revenue"})
 		writer.Write([]string{"2026-04-01", "25", "12500"})
 		writer.Write([]string{"2026-04-02", "30", "15000"})
-	} else if reportType == "revenue" {
+	case "revenue":
 		writer.Write([]string{"Month", "Revenue", "Platform Fee"})
 		writer.Write([]string{"Jan", "450000", "45000"})
 		writer.Write([]string{"Feb", "500000", "50000"})
-	} else {
+	default:
 		writer.Write([]string{"Driver Name", "Payout Amount", "Status"})
 		writer.Write([]string{"Vikram Negi", "5000", "Paid"})
 		writer.Write([]string{"Sanjay Rawat", "4200", "Pending"})

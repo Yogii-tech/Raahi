@@ -19,10 +19,12 @@ func main() {
 	}
 
 	config.ConnectDB()
+	config.ConnectRedis()
 	controllers.InitializeAuthCollection()
 	controllers.InitializeRideCollection()
 	controllers.InitializeUserController()
 	controllers.InitializeChatCollection() // For RaahiChat
+	controllers.InitializeLocationCollection()
 	r := gin.Default()
 	r.SetTrustedProxies(nil)
 

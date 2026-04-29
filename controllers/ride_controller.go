@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -37,7 +38,11 @@ func CreateRide(c *gin.Context) {
 
 	var body struct {
 		Pickup        string  `json:"pickup"`
+		PickupLat     float64 `json:"pickupLat"`
+		PickupLng     float64 `json:"pickupLng"`
 		Dropoff       string  `json:"dropoff"`
+		DropoffLat    float64 `json:"dropoffLat"`
+		DropoffLng    float64 `json:"dropoffLng"`
 		VehicleModel  string  `json:"vehicleModel"`
 		VehicleNumber string  `json:"vehicleNumber"`
 		DepartureTime string  `json:"departureTime"`
@@ -81,10 +86,12 @@ func CreateRide(c *gin.Context) {
 	if rideDate == "" {
 		rideDate = time.Now().Format("02/01/2006")
 	} else {
-		parsedDate, err := time.Parse("02/01/2006", rideDate)
+		parsedDateUTC, err := time.Parse("02/01/2006", rideDate)
 		if err == nil {
 			now := time.Now()
-			today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			loc := now.Location()
+			parsedDate := time.Date(parsedDateUTC.Year(), parsedDateUTC.Month(), parsedDateUTC.Day(), 0, 0, 0, 0, loc)
+			today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 			if parsedDate.Before(today) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot post a ride for a past date"})
 				return
@@ -121,7 +128,11 @@ func CreateRide(c *gin.Context) {
 		DriverID:      userId,
 		DriverName:    driver.Name,
 		Pickup:        pickup,
+		PickupLat:     body.PickupLat,
+		PickupLng:     body.PickupLng,
 		Dropoff:       dropoff,
+		DropoffLat:    body.DropoffLat,
+		DropoffLng:    body.DropoffLng,
 		Date:          rideDate,
 		VehicleModel:  body.VehicleModel,
 		VehicleNumber: body.VehicleNumber,
@@ -199,15 +210,40 @@ func GetAvailableRides(c *gin.Context) {
 
 	var validRides []models.Ride
 	now := time.Now()
+	fmt.Printf("GetAvailableRides: Processing %d rides at %s\n", len(rides), now.Format("15:04:05"))
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
 	for i := range rides {
 		if rides[i].Date != "" {
-			parsedDate, err := time.Parse("02/01/2006", rides[i].Date)
-			if err == nil && parsedDate.Before(today) {
-				// Ride is in the past, auto-expire it
-				rideCollection.UpdateOne(context.Background(), bson.M{"_id": rides[i].ID}, bson.M{"$set": bson.M{"status": "expired"}})
-				continue
+			parsedDateUTC, err := time.Parse("02/01/2006", rides[i].Date)
+			if err == nil {
+				loc := now.Location()
+				parsedDate := time.Date(parsedDateUTC.Year(), parsedDateUTC.Month(), parsedDateUTC.Day(), 0, 0, 0, 0, loc)
+				if parsedDate.Before(today) {
+					// Ride is in the past date, auto-expire it
+					rideCollection.UpdateOne(context.Background(), bson.M{"_id": rides[i].ID}, bson.M{"$set": bson.M{"status": "expired"}})
+					continue
+				} else if parsedDate.Equal(today) && rides[i].DepartureTime != "" {
+					// If it's today, check if the time has passed
+					formats := []string{"03:04 PM", "3:04 PM", "03:04PM", "3:04PM", "15:04"}
+					var parsedTime time.Time
+					var errTime error
+					for _, f := range formats {
+						parsedTime, errTime = time.Parse(f, rides[i].DepartureTime)
+						if errTime == nil {
+							break
+						}
+					}
+
+					if errTime == nil {
+						// Compare hour and minute with current time
+						if parsedTime.Hour() < now.Hour() || (parsedTime.Hour() == now.Hour() && parsedTime.Minute() < now.Minute()) {
+							// Ride time has passed today, auto-expire it
+							rideCollection.UpdateOne(context.Background(), bson.M{"_id": rides[i].ID}, bson.M{"$set": bson.M{"status": "expired"}})
+							continue
+						}
+					}
+				}
 			}
 		}
 
@@ -240,15 +276,28 @@ func GetRideDetails(c *gin.Context) {
 }
 
 func BookRide(c *gin.Context) {
+	fmt.Printf("\n--- Incoming BookRide Request ---\n")
 	passengerId := c.MustGet("userId").(primitive.ObjectID)
 	rideIdHex := c.Param("rideId")
 	rideId, _ := primitive.ObjectIDFromHex(rideIdHex)
 
 	var body struct {
-		SeatsRequested int   `json:"seatsRequested"`
-		SeatLayout     []int `json:"seatLayout"`
-		RoofCarrier    bool  `json:"roofCarrier"`
-		MotionSickness bool  `json:"motionSickness"`
+		Type           string `json:"type"` // "passenger" or "parcel"
+		SeatsRequested int    `json:"seatsRequested"`
+		SeatLayout     []int  `json:"seatLayout"`
+		RoofCarrier    bool   `json:"roofCarrier"`
+		MotionSickness bool   `json:"motionSickness"`
+
+		// Parcel specific
+		Pickup        string `json:"pickup"`
+		Dropoff       string `json:"dropoff"`
+		RecipientName string `json:"recipientName"`
+		ContactNumber string `json:"contactNumber"`
+		DropLocation  string `json:"dropLocation"`
+		Notes         string `json:"notes"`
+		ParcelSize    string `json:"parcelSize"`
+		Price         string `json:"price"`
+		PhotoURL      string `json:"photoUrl"`
 	}
 
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -256,13 +305,12 @@ func BookRide(c *gin.Context) {
 		return
 	}
 
-	// Basic Validation
-	if body.SeatsRequested <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "You must request at least 1 seat"})
-		return
+	// Default to passenger if not specified
+	if body.Type == "" {
+		body.Type = "passenger"
 	}
 
-	// Fetch the ride to verify existence and capacity
+	// Fetch the ride
 	var ride models.Ride
 	err := rideCollection.FindOne(context.Background(), bson.M{"_id": rideId}).Decode(&ride)
 	if err != nil {
@@ -270,37 +318,58 @@ func BookRide(c *gin.Context) {
 		return
 	}
 
-	// Security Check: Cannot book your own ride
 	if ride.DriverID == passengerId {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You cannot book your own ride"})
 		return
 	}
 
-	// Logic Check: Overbooking Prevention
-	takenCount := len(getTakenSeats(rideId))
-	if takenCount+body.SeatsRequested > ride.SeatsTotal {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Not enough seats available"})
-		return
-	}
-
 	booking := models.Booking{
-		RideID:         rideId,
-		PassengerID:    passengerId,
-		SeatsRequested: body.SeatsRequested,
-		SeatLayout:     body.SeatLayout,
-		RoofCarrier:    body.RoofCarrier,
-		MotionSickness: body.MotionSickness,
-		Status:         "pending",
-		CreatedAt:      time.Now(),
+		RideID:            rideId,
+		PassengerID:       passengerId,
+		Type:              body.Type,
+		Status:            "pending",
+		CreatedAt:         time.Now(),
+		ViewedByPassenger: true,
+		ViewedByDriver:    false,
 	}
 
-	_, err = bookingCollection.InsertOne(context.Background(), booking)
+	if body.Type == "parcel" {
+		booking.Pickup = body.Pickup
+		booking.Dropoff = body.Dropoff
+		booking.RecipientName = body.RecipientName
+		booking.ContactNumber = body.ContactNumber
+		booking.DropLocation = body.DropLocation
+		booking.Notes = body.Notes
+		booking.ParcelSize = body.ParcelSize
+		booking.Price = body.Price
+		booking.PhotoURL = body.PhotoURL
+	} else {
+		if body.SeatsRequested <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "You must request at least 1 seat"})
+			return
+		}
+		takenCount := len(getTakenSeats(rideId))
+		if takenCount+body.SeatsRequested > ride.SeatsTotal {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Not enough seats available"})
+			return
+		}
+		booking.SeatsRequested = body.SeatsRequested
+		booking.SeatLayout = body.SeatLayout
+		booking.RoofCarrier = body.RoofCarrier
+		booking.MotionSickness = body.MotionSickness
+	}
+
+	res, err := bookingCollection.InsertOne(context.Background(), booking)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to book ride"})
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"message": "Booking request sent to driver"})
+	insertedId := res.InsertedID.(primitive.ObjectID)
+	c.JSON(http.StatusCreated, gin.H{
+		"message":   "Booking request sent to driver",
+		"bookingId": insertedId.Hex(),
+	})
 }
 
 func GetDriverRequests(c *gin.Context) {
@@ -348,6 +417,7 @@ func GetDriverRequests(c *gin.Context) {
 		models.Booking
 		Ride            models.Ride `json:"ride"`
 		UnreadChatCount int64       `json:"unreadChatCount"`
+		PassengerPhone  string      `json:"passengerPhone,omitempty"`
 	}
 
 	response := make([]BookingResponse, 0)
@@ -358,10 +428,14 @@ func GetDriverRequests(c *gin.Context) {
 		if ride.Date == "" && !ride.CreatedAt.IsZero() {
 			ride.Date = ride.CreatedAt.Format("02/01/2006")
 		}
+		var passenger models.User
+		userCollection.FindOne(context.Background(), bson.M{"_id": b.PassengerID}).Decode(&passenger)
+		
 		response = append(response, BookingResponse{
 			Booking:         b,
 			Ride:            ride,
 			UnreadChatCount: GetUnreadMessageCount(b.ID, "passenger"),
+			PassengerPhone:  passenger.PhoneNumber,
 		})
 	}
 
@@ -389,6 +463,7 @@ func GetPassengerBookings(c *gin.Context) {
 		Ride            models.Ride `json:"ride"`
 		UnreadChatCount int64       `json:"unreadChatCount"`
 		CompletedSeats  []int       `json:"completedSeats"`
+		DriverPhone     string      `json:"driverPhone,omitempty"`
 	}
 
 	response := make([]BookingResponse, 0)
@@ -410,11 +485,15 @@ func GetPassengerBookings(c *gin.Context) {
 		if ride.Date == "" && !ride.CreatedAt.IsZero() {
 			ride.Date = ride.CreatedAt.Format("02/01/2006")
 		}
+		var driver models.User
+		userCollection.FindOne(context.Background(), bson.M{"_id": ride.DriverID}).Decode(&driver)
+		
 		response = append(response, BookingResponse{
 			Booking:         b,
 			Ride:            ride,
 			UnreadChatCount: GetUnreadMessageCount(b.ID, "driver"),
 			CompletedSeats:  completedSeats,
+			DriverPhone:     driver.PhoneNumber,
 		})
 	}
 
@@ -425,9 +504,13 @@ func SaveRecentRide(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var body struct {
-		Pickup   string `json:"pickup"`
-		Dropoff  string `json:"dropoff"`
-		RideType string `json:"rideType"`
+		Pickup     string  `json:"pickup"`
+		PickupLat  float64 `json:"pickupLat"`
+		PickupLng  float64 `json:"pickupLng"`
+		Dropoff    string  `json:"dropoff"`
+		DropoffLat float64 `json:"dropoffLat"`
+		DropoffLng float64 `json:"dropoffLng"`
+		RideType   string  `json:"rideType"`
 	}
 
 	if err := c.BindJSON(&body); err != nil {
@@ -436,11 +519,15 @@ func SaveRecentRide(c *gin.Context) {
 	}
 
 	ride := models.Ride{
-		DriverID:  userId, // Using DriverID because unified Ride model
-		Pickup:    body.Pickup,
-		Dropoff:   body.Dropoff,
-		Date:      time.Now().Format("02/01/2006"), // Add current date
-		CreatedAt: time.Now(),
+		DriverID:   userId, // Using DriverID because unified Ride model
+		Pickup:     body.Pickup,
+		PickupLat:  body.PickupLat,
+		PickupLng:  body.PickupLng,
+		Dropoff:    body.Dropoff,
+		DropoffLat: body.DropoffLat,
+		DropoffLng: body.DropoffLng,
+		Date:       time.Now().Format("02/01/2006"), // Add current date
+		CreatedAt:  time.Now(),
 	}
 
 	_, err := rideCollection.InsertOne(context.Background(), ride)
@@ -554,11 +641,12 @@ func GetRecentRides(c *gin.Context) {
 		completedSeats := []int{}
 		
 		for _, b := range bList {
-			if b.Status == "accepted" {
+			switch b.Status {
+			case "accepted":
 				acceptedSeats = append(acceptedSeats, b.SeatLayout...)
-			} else if b.Status == "pending" {
+			case "pending":
 				pendingSeats = append(pendingSeats, b.SeatLayout...)
-			} else if b.Status == "completed" {
+			case "completed":
 				completedSeats = append(completedSeats, b.SeatLayout...)
 			}
 		}

@@ -71,4 +71,19 @@ func RegisterRoutes(r *gin.Engine) {
 	}
 
 	api.POST("/upload", middleware.AuthMiddleware(), controllers.UploadFile)
+
+	// Tracking Layer (High-Performance Location System)
+	tracking := api.Group("/tracking")
+	{
+		// Rider: Regular 5s polling ingestion
+		tracking.POST("/location", controllers.PostRiderLocation)
+		// Customer: Real-time map update relay
+		tracking.GET("/ws/:orderId", controllers.TrackOrderWS)
+	}
+
+	locations := api.Group("/locations")
+	{
+		locations.POST("/record", controllers.RecordLocation)
+		locations.GET("/suggestions", controllers.GetLocationSuggestions)
+	}
 }
