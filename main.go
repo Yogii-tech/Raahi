@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"raahi-backend/config"
 	"raahi-backend/controllers"
 	"raahi-backend/routes"
@@ -24,5 +25,10 @@ func main() {
 	r.Use(cors.New(corsConfig))
 
 	routes.RegisterRoutes(r)
-	r.Run(":8081")
+	
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	r.Run(":" + port)
 }

@@ -1,0 +1,11 @@
+.gcloudignore
+.git
+.gitignore
+bin/
+raahi-backend.exe
+uploads/
+scratch/
+coverage/
+raahi-backend
+vendor/
+.env
