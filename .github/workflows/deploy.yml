@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'Raahi/**'
 
 jobs:
   deploy:
@@ -30,7 +28,7 @@ jobs:
 
     - name: Build and Push Container
       run: |-
-        docker build -t asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }} ./Raahi
+        docker build -t asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }} .
         docker push asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }}
 
     - name: Deploy to Cloud Run
