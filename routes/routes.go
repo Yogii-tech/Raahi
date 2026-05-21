@@ -39,4 +39,6 @@ func RegisterRoutes(r *gin.Engine) {
 		user.GET("/trusted-contacts", controllers.GetTrustedContacts)
 		user.PUT("/trusted-contacts", controllers.UpdateTrustedContacts)
 	}
+
+	api.POST("/upload", middleware.AuthMiddleware(), controllers.UploadFile)
 }

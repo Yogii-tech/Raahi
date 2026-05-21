@@ -24,6 +24,9 @@ WORKDIR /root/
 # Copy the binary from the builder stage
 COPY --from=builder /app/main .
 
+# Create uploads directory
+RUN mkdir -p uploads
+
 # Expose the port the app runs on
 EXPOSE 8080
 

@@ -69,8 +69,9 @@ func UpdateProfile(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var body struct {
-		Name string `json:"name"`
-		Role string `json:"role"`
+		Name    string          `json:"name"`
+		Role    string          `json:"role"`
+		Vehicle *models.Vehicle `json:"vehicle"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
@@ -79,8 +80,9 @@ func UpdateProfile(c *gin.Context) {
 
 	update := bson.M{
 		"$set": bson.M{
-			"name": body.Name,
-			"role": body.Role,
+			"name":    body.Name,
+			"role":    body.Role,
+			"vehicle": body.Vehicle,
 		},
 	}
 

@@ -7,6 +7,19 @@ type Contact struct {
 	Phone string `bson:"phone" json:"phone"`
 }
 
+type Vehicle struct {
+	VehicleName     string `bson:"vehicle_name" json:"vehicle_name"`
+	VehicleType     string `bson:"vehicle_type" json:"vehicle_type"`
+	Seats           int    `bson:"seats" json:"seats"`
+	VehicleNumber   string `bson:"vehicle_number" json:"vehicle_number"`
+	DLUrl           string `bson:"dl_url" json:"dl_url"`
+	RCUrl           string `bson:"rc_url" json:"rc_url"`
+	PollutionUrl    string `bson:"pollution_url" json:"pollution_url"`
+	VehicleImageUrl string `bson:"vehicle_image_url" json:"vehicle_image_url"`
+	OwnershipUrl    string `bson:"ownership_url" json:"ownership_url"`
+	SeatingLayout   string `bson:"seating_layout" json:"seating_layout"` // "sedan", "suv", "bus_2x2"
+}
+
 type User struct {
 	ID              primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	PhoneNumber     string             `bson:"phone_number" json:"phone_number"`
@@ -14,4 +27,5 @@ type User struct {
 	OTP             string             `bson:"otp" json:"otp"`
 	TrustedContacts []Contact          `bson:"trusted_contacts" json:"trusted_contacts"`
 	Role            string             `bson:"role" json:"role"`
+	Vehicle         *Vehicle           `bson:"vehicle,omitempty" json:"vehicle"`
 }
