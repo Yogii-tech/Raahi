@@ -19,9 +19,15 @@ func main() {
 
 	// Add CORS middleware
 	corsConfig := cors.DefaultConfig()
-	corsConfig.AllowAllOrigins = true
+	corsConfig.AllowOrigins = []string{
+		"https://goraahi.in",
+		"https://raahi-web-v2.web.app",
+		"http://localhost:5173", // Still allow local dev
+		"http://localhost:3000",
+	}
 	corsConfig.AllowHeaders = append(corsConfig.AllowHeaders, "Authorization")
-	corsConfig.AllowMethods = append(corsConfig.AllowMethods, "PUT", "DELETE", "PATCH")
+	corsConfig.AllowMethods = append(corsConfig.AllowMethods, "PUT", "DELETE", "PATCH", "OPTIONS")
+	corsConfig.AllowCredentials = true
 	r.Use(cors.New(corsConfig))
 
 	routes.RegisterRoutes(r)

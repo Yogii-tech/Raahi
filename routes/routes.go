@@ -14,6 +14,7 @@ func RegisterRoutes(r *gin.Engine) {
 	{
 		auth.POST("/otp/send", controllers.SendOTP)
 		auth.POST("/otp/verify", controllers.VerifyOTP)
+		auth.POST("/promote-admin", middleware.AuthMiddleware(), controllers.PromoteAdmin)
 	}
 
 	rides := api.Group("/rides")

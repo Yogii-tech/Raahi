@@ -45,10 +45,18 @@ func CreateRide(c *gin.Context) {
 	var driver struct {
 		Name string `bson:"name"`
 	}
-	config.Database.Collection("users").FindOne(context.Background(), bson.M{"_id": userId}).Decode(&driver)
+	err := config.Database.Collection("users").FindOne(context.Background(), bson.M{"_id": userId}).Decode(&driver)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver info"})
+		return
+	}
 
 	// Delete existing rides for this driver to keep it clean
-	rideCollection.DeleteMany(context.Background(), bson.M{"driverId": userId, "status": "available"})
+	_, err = rideCollection.DeleteMany(context.Background(), bson.M{"driverId": userId, "status": "available"})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset available rides"})
+		return
+	}
 
 	ride := models.Ride{
 		DriverID:      userId,
@@ -65,7 +73,7 @@ func CreateRide(c *gin.Context) {
 		CreatedAt:     time.Now(),
 	}
 
-	_, err := rideCollection.InsertOne(context.Background(), ride)
+	_, err = rideCollection.InsertOne(context.Background(), ride)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create ride"})
 		return
@@ -204,14 +212,29 @@ func GetDriverRequests(c *gin.Context) {
 func GetPassengerBookings(c *gin.Context) {
 	passengerId := c.MustGet("userId").(primitive.ObjectID)
 
-	cursor, err := bookingCollection.Find(context.Background(), bson.M{"passengerId": passengerId})
+	pipeline := []bson.M{
+		{"$match": bson.M{"passengerId": passengerId}},
+		{"$lookup": bson.M{
+			"from":         "rides",
+			"localField":   "rideId",
+			"foreignField": "_id",
+			"as":           "rideDetails",
+		}},
+	}
+	
+	cursor, err := bookingCollection.Aggregate(context.Background(), pipeline)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings"})
 		return
 	}
 
-	var bookings []models.Booking
-	if err := cursor.All(context.Background(), &bookings); err != nil {
+	type aggregatedResult struct {
+		models.Booking `bson:",inline"`
+		RideDetails    []models.Ride `bson:"rideDetails"`
+	}
+
+	var results []aggregatedResult
+	if err := cursor.All(context.Background(), &results); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings"})
 		return
 	}
@@ -222,16 +245,21 @@ func GetPassengerBookings(c *gin.Context) {
 	}
 
 	var response []BookingResponse
-	for _, b := range bookings {
-		var ride models.Ride
-		rideCollection.FindOne(context.Background(), bson.M{"_id": b.RideID}).Decode(&ride)
-		ride.TakenSeats = getTakenSeats(ride.ID) // Populate real-time taken seats
+	for _, res := range results {
+		ride := models.Ride{}
+		if len(res.RideDetails) > 0 {
+			ride = res.RideDetails[0]
+			ride.TakenSeats = getTakenSeats(ride.ID) // Populate real-time taken seats
+		}
 		response = append(response, BookingResponse{
-			Booking: b,
+			Booking: res.Booking,
 			Ride:    ride,
 		})
 	}
 
+	if response == nil {
+		response = []BookingResponse{}
+	}
 	c.JSON(http.StatusOK, response)
 }
 
@@ -278,11 +306,27 @@ func UpdateBookingStatus(c *gin.Context) {
 		return
 	}
 
+	driverId := c.MustGet("userId").(primitive.ObjectID)
+
 	// Get the booking to find the rideId and seatsRequested
 	var booking models.Booking
 	err := bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
+		return
+	}
+
+	// Double check race condition
+	if booking.Status != "pending" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Booking status already updated"})
+		return
+	}
+
+	// Authorization check IDOR
+	var ride models.Ride
+	err = rideCollection.FindOne(context.Background(), bson.M{"_id": booking.RideID}).Decode(&ride)
+	if err != nil || ride.DriverID != driverId {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized"})
 		return
 	}
 

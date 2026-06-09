@@ -24,6 +24,12 @@ func ConnectDB() {
 
 	clientOptions := options.Client().ApplyURI(uri)
 
+	// Connection pooling: limits connections to save on free tier
+	maxPool := uint64(10)
+	minPool := uint64(2)
+	clientOptions.SetMaxPoolSize(maxPool)
+	clientOptions.SetMinPoolSize(minPool)
+
 	client, err := mongo.Connect(ctx, clientOptions)
 	if err != nil {
 		log.Fatal("MongoDB connection error:", err)
