@@ -1,18 +1,16 @@
 package controllers
 
 import (
-	"context"
 	"fmt"
-	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
-	"cloud.google.com/go/storage"
 	"github.com/gin-gonic/gin"
 )
 
-const bucketName = "raahi-documents-137804375265"
-
+// UploadFile handles file uploads by saving them locally to the 'uploads' directory.
 func UploadFile(c *gin.Context) {
 	file, err := c.FormFile("file")
 	if err != nil {
@@ -20,46 +18,36 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to storage"})
-		return
+	// Create uploads directory if it doesn't exist
+	uploadDir := "uploads"
+	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
+		err = os.MkdirAll(uploadDir, 0755)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create upload directory"})
+			return
+		}
 	}
-	defer client.Close()
 
-	// Create a unique filename
-	filename := fmt.Sprintf("%d-%s", time.Now().Unix(), file.Filename)
-	bucket := client.Bucket(bucketName)
-	obj := bucket.Object(filename)
+	// Create a unique filename to avoid collisions
+	filename := fmt.Sprintf("%d-%s", time.Now().Unix(), filepath.Base(file.Filename))
+	dst := filepath.Join(uploadDir, filename)
 
-	// Open the uploaded file
-	src, err := file.Open()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open file"})
-		return
-	}
-	defer src.Close()
-
-	// Write to GCS
-	wc := obj.NewWriter(ctx)
-	if _, err = io.Copy(wc, src); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload to storage"})
-		return
-	}
-	if err := wc.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to finalize upload"})
+	// Save the file to the local filesystem
+	if err := c.SaveUploadedFile(file, dst); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file locally"})
 		return
 	}
 
-	// Double check ACL: Ensure the object is publicly readable
-	// (Even though we set bucket level, this is safer)
-	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
-        // Log error but don't fail, bucket policy might already handle it
-        fmt.Printf("Warning: Failed to set ACL on %s: %v\n", filename, err)
-    }
+	// Construct the URL to access the file. 
+	// We use host from the request to support both localhost and IP-based access.
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
+	url := fmt.Sprintf("%s://%s/uploads/%s", scheme, c.Request.Host, filename)
 
-	// Return the public URL
-	url := fmt.Sprintf("https://storage.googleapis.com/%s/%s", bucketName, filename)
-	c.JSON(http.StatusOK, gin.H{"url": url})
+	c.JSON(http.StatusOK, gin.H{
+		"url":      url,
+		"filename": filename,
+	})
 }

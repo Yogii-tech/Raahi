@@ -22,7 +22,7 @@ func InitializeAuthCollection() {
 
 func SendOTP(c *gin.Context) {
 	var body struct {
-		PhoneNumber string `json:"phone_number"`
+		PhoneNumber string `json:"phone_number" binding:"required,min=10,max=15"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
@@ -58,8 +58,8 @@ func SendOTP(c *gin.Context) {
 
 func VerifyOTP(c *gin.Context) {
 	var body struct {
-		PhoneNumber string `json:"phone_number"`
-		OTP         string `json:"otp"`
+		PhoneNumber string `json:"phone_number" binding:"required,min=10,max=15"`
+		OTP         string `json:"otp" binding:"required,len=6"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
@@ -78,7 +78,7 @@ func VerifyOTP(c *gin.Context) {
 	}
 
 	// Create JWT token
-	token, _ := utils.GenerateJWT(user.ID)
+	token, _ := utils.GenerateJWT(user.ID, user.TokenVersion)
 
 	// Optionally clear OTP after verification
 	userCollection.UpdateOne(
@@ -88,4 +88,37 @@ func VerifyOTP(c *gin.Context) {
 	)
 
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
+}
+
+func PromoteAdmin(c *gin.Context) {
+	// Must be protected by generic AuthMiddleware so we know WHO to promote
+	userId := c.MustGet("userId").(primitive.ObjectID)
+
+	var body struct {
+		SecretKey string `json:"secret_key"`
+	}
+
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	// In a real app this should be in .env, using simple hardcoded for Raahi demo
+	if body.SecretKey != "RAAHI_ADMIN_2026" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid admin secret key"})
+		return
+	}
+
+	_, err := userCollection.UpdateOne(
+		context.Background(),
+		bson.M{"_id": userId},
+		bson.M{"$set": bson.M{"role": "admin"}},
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to promote to admin"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Promoted to admin successfully"})
 }
