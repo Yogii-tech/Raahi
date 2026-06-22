@@ -280,6 +280,31 @@ func GetAvailableRides(c *gin.Context) {
 	dropoff := strings.TrimSpace(c.Query("dropoff"))
 	date := strings.TrimSpace(c.Query("date"))
 
+	// Validate user-controlled inputs before using them in DB query construction
+	const maxLocationLen = 100
+	locationPattern := regexp.MustCompile(`^[a-zA-Z0-9\s\-,.]+$`)
+
+	if pickup != "" {
+		if len(pickup) > maxLocationLen || !locationPattern.MatchString(pickup) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid pickup"})
+			return
+		}
+	}
+
+	if dropoff != "" {
+		if len(dropoff) > maxLocationLen || !locationPattern.MatchString(dropoff) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid dropoff"})
+			return
+		}
+	}
+
+	if date != "" {
+		if _, err := time.Parse("2006-01-02", date); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid date format. Use YYYY-MM-DD"})
+			return
+		}
+	}
+
 	log.Printf("🔍 SEARCH REQUEST: pickup='%s', dropoff='%s', date='%s'", pickup, dropoff, date)
 
 	// Build DB filter: always filter available rides, optionally by date
