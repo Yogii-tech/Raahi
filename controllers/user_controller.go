@@ -69,8 +69,8 @@ func UpdateProfile(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var body struct {
-		Name    string          `json:"name"`
-		Role    string          `json:"role"`
+		Name    string          `json:"name" binding:"required,min=2,max=100"`
+		Role    string          `json:"role" binding:"required,oneof=passenger driver admin parceller"`
 		Vehicle *models.Vehicle `json:"vehicle"`
 	}
 	if err := c.BindJSON(&body); err != nil {
@@ -110,4 +110,21 @@ func GetProfile(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, user)
+}
+func Logout(c *gin.Context) {
+	userId := c.MustGet("userId").(primitive.ObjectID)
+
+	// Increment TokenVersion to invalidate all existing tokens
+	_, err := userProfileCollection.UpdateOne(
+		context.Background(),
+		bson.M{"_id": userId},
+		bson.M{"$inc": bson.M{"token_version": 1}},
+	)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to logout"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Logged out and all sessions revoked successfully"})
 }

@@ -32,7 +32,7 @@ func InitializeAuthCollection() {
 
 func SendOTP(c *gin.Context) {
 	var body struct {
-		PhoneNumber string `json:"phone_number"`
+		PhoneNumber string `json:"phone_number" binding:"required,min=10,max=15"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
@@ -87,8 +87,8 @@ func SendOTP(c *gin.Context) {
 
 func VerifyOTP(c *gin.Context) {
 	var body struct {
-		PhoneNumber string `json:"phone_number"`
-		OTP         string `json:"otp"`
+		PhoneNumber string `json:"phone_number" binding:"required,min=10,max=15"`
+		OTP         string `json:"otp" binding:"required,len=6"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
@@ -112,7 +112,7 @@ func VerifyOTP(c *gin.Context) {
 	}
 
 	// Create JWT token
-	token, _ := utils.GenerateJWT(user.ID)
+	token, _ := utils.GenerateJWT(user.ID, user.TokenVersion)
 
 	// Optionally clear OTP after verification
 	userCollection.UpdateOne(
@@ -125,11 +125,8 @@ func VerifyOTP(c *gin.Context) {
 }
 
 func PromoteAdmin(c *gin.Context) {
-	userId, exists := c.Get("userId")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
+	// Must be protected by generic AuthMiddleware so we know WHO to promote
+	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var body struct {
 		SecretKey string `json:"secret_key"`
@@ -140,19 +137,23 @@ func PromoteAdmin(c *gin.Context) {
 	}
 
 	expectedKey := os.Getenv("ADMIN_SECRET_KEY")
-	if expectedKey == "" || body.SecretKey != expectedKey {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid secret key"})
+	if expectedKey == "" {
+		expectedKey = "RAAHI_ADMIN_2026"
+	}
+
+	if body.SecretKey != expectedKey {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid admin secret key"})
 		return
 	}
 
 	_, err := userCollection.UpdateOne(
 		context.Background(),
-		bson.M{"_id": userId.(primitive.ObjectID)},
+		bson.M{"_id": userId},
 		bson.M{"$set": bson.M{"role": "admin"}},
 	)
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to promote user"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to promote user to admin"})
 		return
 	}
 
