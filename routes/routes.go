@@ -14,8 +14,6 @@ func RegisterRoutes(r *gin.Engine) {
 	{
 		auth.POST("/otp/send", controllers.SendOTP)
 		auth.POST("/otp/verify", controllers.VerifyOTP)
-
-		// Admin promotion must be authenticated to know which user to promote
 		auth.POST("/promote-admin", middleware.AuthMiddleware(), controllers.PromoteAdmin)
 	}
 

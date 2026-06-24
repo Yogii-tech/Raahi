@@ -37,4 +37,5 @@ jobs:
           --image asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }} \
           --region asia-south2 \
           --platform managed \
-          --allow-unauthenticated
+          --allow-unauthenticated \
+          --set-env-vars="JWT_SECRET=${{ secrets.JWT_SECRET }},MSG91_AUTH_KEY=${{ secrets.MSG91_AUTH_KEY }},MSG91_TEMPLATE_ID=${{ secrets.MSG91_TEMPLATE_ID }},ADMIN_SECRET_KEY=${{ secrets.ADMIN_SECRET_KEY }}"

@@ -2,13 +2,20 @@ package utils
 
 import (
 	"errors"
+	"os"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-var jwtSecret = []byte("raahi_secret_key")
+func getJwtSecret() []byte {
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		panic("JWT_SECRET environment variable is not set")
+	}
+	return []byte(secret)
+}
 
 func GenerateJWT(userId primitive.ObjectID, tokenVersion int) (string, error) {
 	claims := jwt.MapClaims{
@@ -19,12 +26,12 @@ func GenerateJWT(userId primitive.ObjectID, tokenVersion int) (string, error) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(jwtSecret)
+	return token.SignedString(getJwtSecret())
 }
 
 func ValidateJWT(tokenString string) (primitive.ObjectID, int, error) {
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
-		return jwtSecret, nil
+		return getJwtSecret(), nil
 	})
 	if err != nil || !token.Valid {
 		return primitive.NilObjectID, 0, errors.New("invalid token")

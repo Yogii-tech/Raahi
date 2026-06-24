@@ -3,8 +3,10 @@ package controllers
 import (
 	"fmt"
 	"net/http"
+<<<<<<< HEAD
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,9 +14,22 @@ import (
 
 // UploadFile handles file uploads by saving them locally to the 'uploads' directory.
 func UploadFile(c *gin.Context) {
+	// Limit upload size to 10MB
+	if err := c.Request.ParseMultipartForm(10 << 20); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File size exceeds limit"})
+		return
+	}
+
 	file, err := c.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
+		return
+	}
+
+	// Validate file extension
+	ext := strings.ToLower(filepath.Ext(file.Filename))
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".webp" && ext != ".pdf" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file type. Only images and PDFs are allowed."})
 		return
 	}
 

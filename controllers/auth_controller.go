@@ -2,7 +2,11 @@ package controllers
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
+	"math/big"
 	"net/http"
+	"os"
 
 	"raahi-backend/config"
 	"raahi-backend/models"
@@ -12,9 +16,15 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var userCollection *mongo.Collection
+
+func generateRandomOTP() string {
+	n, _ := rand.Int(rand.Reader, big.NewInt(900000))
+	return fmt.Sprintf("%06d", n.Int64()+100000)
+}
 
 func InitializeAuthCollection() {
 	userCollection = config.Database.Collection("users")
@@ -30,30 +40,49 @@ func SendOTP(c *gin.Context) {
 	}
 
 	// In a real app, generate a 6-digit random OTP and send it via SMS
-	otp := "123456"
+	otp := generateRandomOTP()
 
-	_, err := userCollection.UpdateOne(
+	hashedOTP, err := bcrypt.GenerateFromPassword([]byte(otp), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process OTP"})
+		return
+	}
+
+	_, err = userCollection.UpdateOne(
 		context.Background(),
 		bson.M{"phone_number": body.PhoneNumber},
-		bson.M{"$set": bson.M{"otp": otp}},
+		bson.M{"$set": bson.M{"otp": string(hashedOTP)}},
 		nil,
 	)
+
+	// Send OTP via MSG91 (falls back to console log if not configured)
+	if smsErr := utils.SendOTPviaMSG91(body.PhoneNumber, otp); smsErr != nil {
+		fmt.Printf("[WARN] Failed to send SMS: %v\n", smsErr)
+	}
 
 	// If user doesn't exist, create it
 	if err == nil {
 		var user models.User
 		err = userCollection.FindOne(context.Background(), bson.M{"phone_number": body.PhoneNumber}).Decode(&user)
 		if err != nil {
-			newUser := models.User{
-				ID:          primitive.NewObjectID(),
-				PhoneNumber: body.PhoneNumber,
-				OTP:         otp,
+			if err == mongo.ErrNoDocuments {
+				newUser := models.User{
+					ID:          primitive.NewObjectID(),
+					PhoneNumber: body.PhoneNumber,
+					OTP:         string(hashedOTP),
+				}
+				userCollection.InsertOne(context.Background(), newUser)
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+				return
 			}
-			userCollection.InsertOne(context.Background(), newUser)
 		}
+	} else {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "OTP sent", "otp": otp}) // For dev, returning OTP in response
+	c.JSON(http.StatusOK, gin.H{"message": "OTP sent"})
 }
 
 func VerifyOTP(c *gin.Context) {
@@ -69,10 +98,15 @@ func VerifyOTP(c *gin.Context) {
 	var user models.User
 	err := userCollection.FindOne(
 		context.Background(),
-		bson.M{"phone_number": body.PhoneNumber, "otp": body.OTP},
+		bson.M{"phone_number": body.PhoneNumber},
 	).Decode(&user)
 
 	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid phone number or OTP"})
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(user.OTP), []byte(body.OTP)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid OTP"})
 		return
 	}
@@ -97,14 +131,17 @@ func PromoteAdmin(c *gin.Context) {
 	var body struct {
 		SecretKey string `json:"secret_key"`
 	}
-
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
 		return
 	}
 
-	// In a real app this should be in .env, using simple hardcoded for Raahi demo
-	if body.SecretKey != "RAAHI_ADMIN_2026" {
+	expectedKey := os.Getenv("ADMIN_SECRET_KEY")
+	if expectedKey == "" {
+		expectedKey = "RAAHI_ADMIN_2026"
+	}
+
+	if body.SecretKey != expectedKey {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid admin secret key"})
 		return
 	}
@@ -116,9 +153,9 @@ func PromoteAdmin(c *gin.Context) {
 	)
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to promote to admin"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to promote user to admin"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Promoted to admin successfully"})
+	c.JSON(http.StatusOK, gin.H{"message": "Successfully promoted to admin"})
 }
