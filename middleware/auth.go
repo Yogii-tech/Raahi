@@ -49,3 +49,26 @@ func AuthMiddleware() gin.HandlerFunc {
 		c.Next()
 	}
 }
+
+func AdminOnlyMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userId, exists := c.Get("userId")
+		if !exists {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+
+		var user struct {
+			Role string `bson:"role"`
+		}
+		err := config.Database.Collection("users").FindOne(c.Request.Context(), bson.M{"_id": userId}).Decode(&user)
+		if err != nil || user.Role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}

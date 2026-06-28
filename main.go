@@ -16,8 +16,7 @@ import (
 func main() {
 	// Initialize Sentry
 	err := sentry.Init(sentry.ClientOptions{
-		// Replace with your actual Sentry DSN
-		Dsn:              "https://08643806a6b5a3818e9508d0b2849b38@o4508492061245440.ingest.us.sentry.io/4508492067799040",
+		Dsn:              os.Getenv("SENTRY_DSN"),
 		EnableTracing:    true,
 		TracesSampleRate: 1.0,
 		Environment:      os.Getenv("APP_ENV"),

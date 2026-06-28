@@ -138,7 +138,8 @@ func PromoteAdmin(c *gin.Context) {
 
 	expectedKey := os.Getenv("ADMIN_SECRET_KEY")
 	if expectedKey == "" {
-		expectedKey = "RAAHI_ADMIN_2026"
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Admin promotion not configured"})
+		return
 	}
 
 	if body.SecretKey != expectedKey {
