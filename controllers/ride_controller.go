@@ -900,7 +900,7 @@ func CompleteRide(c *gin.Context) {
 	// Also mark all accepted bookings as completed
 	bookingCollection.UpdateMany(
 		context.Background(),
-		bson.M{"rideId": rideIdHex, "status": "accepted"},
+		bson.M{"rideId": rideId, "status": "accepted"},
 		bson.M{"$set": bson.M{"status": "completed", "completedAt": time.Now()}},
 	)
 
