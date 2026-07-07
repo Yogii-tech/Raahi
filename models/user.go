@@ -1,6 +1,9 @@
 package models
 
-import "go.mongodb.org/mongo-driver/bson/primitive"
+import (
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"time"
+)
 
 type Contact struct {
 	Name  string `bson:"name" json:"name"`
@@ -25,7 +28,8 @@ type User struct {
 	ID              primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	PhoneNumber     string             `bson:"phone_number" json:"phone_number"`
 	Name            string             `bson:"name" json:"name"`
-	OTP             string             `bson:"otp" json:"otp"`
+	OTP             string             `bson:"otp" json:"-"` // never expose hash to clients
+	OTPExpiry       time.Time          `bson:"otp_expiry" json:"-"` // OTP valid for 10 minutes
 	TrustedContacts []Contact          `bson:"trusted_contacts" json:"trusted_contacts"`
 	Role            string             `bson:"role" json:"role"`
 	Vehicle         *Vehicle           `bson:"vehicle,omitempty" json:"vehicle"`

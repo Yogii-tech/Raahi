@@ -55,7 +55,7 @@ func InitializeIndexes() {
 	// Users: Phone number unique + Role search
 	Database.Collection("users").Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{
-			Keys:    bson.D{{Key: "phoneNumber", Value: 1}},
+			Keys:    bson.D{{Key: "phone_number", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 		{Keys: bson.D{{Key: "role", Value: 1}}},

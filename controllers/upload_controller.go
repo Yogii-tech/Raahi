@@ -3,7 +3,6 @@ package controllers
 import (
 	"fmt"
 	"net/http"
-<<<<<<< HEAD
 	"os"
 	"path/filepath"
 	"strings"

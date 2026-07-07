@@ -528,7 +528,7 @@ func BookRide(c *gin.Context) {
 		CreatedAt:     time.Now(),
 	}
 
-	_, err := bookingCollection.InsertOne(context.Background(), booking)
+	result, err := bookingCollection.InsertOne(context.Background(), booking)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store booking"})
 		return
@@ -539,7 +539,7 @@ func BookRide(c *gin.Context) {
 		msg = "Parcel pickup request sent to driver"
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"message": msg, "bookingId": rideIdHex}) // Using rideIdHex as temporary ID for simple UI matching
+	c.JSON(http.StatusCreated, gin.H{"message": msg, "bookingId": result.InsertedID})
 }
 
 func GetDriverRequests(c *gin.Context) {
@@ -638,9 +638,9 @@ func SaveRecentRide(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var body struct {
-		Pickup   string `json:"pickup"`
-		Dropoff  string `json:"dropoff"`
-		RideType string `json:"rideType"`
+		Pickup   string `json:"pickup" binding:"required,max=200"`
+		Dropoff  string `json:"dropoff" binding:"required,max=200"`
+		RideType string `json:"rideType" binding:"required,oneof=seat parcel"`
 	}
 
 	if err := c.BindJSON(&body); err != nil {
@@ -671,7 +671,7 @@ func UpdateBookingStatus(c *gin.Context) {
 	bookingId, _ := primitive.ObjectIDFromHex(bookingIdHex)
 
 	var body struct {
-		Status string `json:"status"` // "accepted" or "rejected"
+		Status string `json:"status" binding:"required,oneof=accepted rejected"` // strictly validated
 	}
 
 	if err := c.BindJSON(&body); err != nil {

@@ -15,12 +15,21 @@ import (
 
 func main() {
 	// Initialize Sentry
+	sentryDsn := os.Getenv("SENTRY_DSN")
+	if sentryDsn == "" {
+		sentryDsn = "https://08643806a6b5a3818e9508d0b2849b38@o4508492061245440.ingest.us.sentry.io/4508492067799040"
+	}
+	appEnv := os.Getenv("APP_ENV")
+	tracesSampleRate := 1.0
+	if appEnv == "production" {
+		tracesSampleRate = 0.1
+	}
+
 	err := sentry.Init(sentry.ClientOptions{
-		// Replace with your actual Sentry DSN
-		Dsn:              "https://08643806a6b5a3818e9508d0b2849b38@o4508492061245440.ingest.us.sentry.io/4508492067799040",
+		Dsn:              sentryDsn,
 		EnableTracing:    true,
-		TracesSampleRate: 1.0,
-		Environment:      os.Getenv("APP_ENV"),
+		TracesSampleRate: tracesSampleRate,
+		Environment:      appEnv,
 	})
 	if err != nil {
 		fmt.Printf("Sentry initialization failed: %v\n", err)
@@ -30,6 +39,10 @@ func main() {
 	controllers.InitializeAuthCollection()
 	controllers.InitializeRideCollection()
 	controllers.InitializeUserController()
+
+	if appEnv == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 	r := gin.Default()
 
 	// Sentry middleware to capture panics and errors

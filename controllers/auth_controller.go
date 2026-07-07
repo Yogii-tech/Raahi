@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"time"
 
 	"raahi-backend/config"
 	"raahi-backend/models"
@@ -48,10 +49,12 @@ func SendOTP(c *gin.Context) {
 		return
 	}
 
+	// Set OTP with 10-minute expiry
+	otpExpiry := time.Now().Add(10 * time.Minute)
 	_, err = userCollection.UpdateOne(
 		context.Background(),
 		bson.M{"phone_number": body.PhoneNumber},
-		bson.M{"$set": bson.M{"otp": string(hashedOTP)}},
+		bson.M{"$set": bson.M{"otp": string(hashedOTP), "otp_expiry": otpExpiry}},
 		nil,
 	)
 
@@ -70,6 +73,7 @@ func SendOTP(c *gin.Context) {
 					ID:          primitive.NewObjectID(),
 					PhoneNumber: body.PhoneNumber,
 					OTP:         string(hashedOTP),
+					OTPExpiry:   otpExpiry,
 				}
 				userCollection.InsertOne(context.Background(), newUser)
 			} else {
@@ -108,6 +112,12 @@ func VerifyOTP(c *gin.Context) {
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.OTP), []byte(body.OTP)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid OTP"})
+		return
+	}
+
+	// Check OTP expiry (10 minutes)
+	if !user.OTPExpiry.IsZero() && time.Now().After(user.OTPExpiry) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "OTP has expired. Please request a new one."})
 		return
 	}
 

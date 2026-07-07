@@ -70,7 +70,7 @@ func UpdateProfile(c *gin.Context) {
 
 	var body struct {
 		Name    string          `json:"name" binding:"required,min=2,max=100"`
-		Role    string          `json:"role" binding:"required,oneof=passenger driver admin parceller"`
+		Role    string          `json:"role" binding:"required,oneof=passenger driver parceller"` // admin role only via /promote-admin
 		Vehicle *models.Vehicle `json:"vehicle"`
 	}
 	if err := c.BindJSON(&body); err != nil {

@@ -38,4 +38,4 @@ jobs:
           --region asia-south2 \
           --platform managed \
           --allow-unauthenticated \
-          --set-env-vars="JWT_SECRET=${{ secrets.JWT_SECRET }},MSG91_AUTH_KEY=${{ secrets.MSG91_AUTH_KEY }},MSG91_TEMPLATE_ID=${{ secrets.MSG91_TEMPLATE_ID }},ADMIN_SECRET_KEY=${{ secrets.ADMIN_SECRET_KEY }}"
+          --set-env-vars="JWT_SECRET=${{ secrets.JWT_SECRET }},MSG91_AUTH_KEY=${{ secrets.MSG91_AUTH_KEY }},MSG91_TEMPLATE_ID=${{ secrets.MSG91_TEMPLATE_ID }},ADMIN_SECRET_KEY=${{ secrets.ADMIN_SECRET_KEY }},SENTRY_DSN=${{ secrets.SENTRY_DSN }},APP_ENV=production"
