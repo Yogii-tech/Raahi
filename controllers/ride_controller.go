@@ -872,3 +872,73 @@ func ToggleBlockSeat(c *gin.Context) {
 		"manualBlockedSeats": newBlocked,
 	})
 }
+
+func CompleteRide(c *gin.Context) {
+	userId := c.MustGet("userId").(primitive.ObjectID)
+	rideIdHex := c.Param("rideId")
+
+	rideId, err := primitive.ObjectIDFromHex(rideIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ride ID"})
+		return
+	}
+
+	filter := bson.M{"_id": rideId, "driverId": userId}
+	update := bson.M{
+		"$set": bson.M{
+			"status":      "completed",
+			"completedAt": time.Now(),
+		},
+	}
+
+	result, err := rideCollection.UpdateOne(context.Background(), filter, update)
+	if err != nil || result.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found or unauthorized"})
+		return
+	}
+
+	// Also mark all accepted bookings as completed
+	bookingCollection.UpdateMany(
+		context.Background(),
+		bson.M{"rideId": rideIdHex, "status": "accepted"},
+		bson.M{"$set": bson.M{"status": "completed", "completedAt": time.Now()}},
+	)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Ride marked as completed"})
+}
+
+func CompleteBooking(c *gin.Context) {
+	userId := c.MustGet("userId").(primitive.ObjectID)
+	bookingIdHex := c.Param("bookingId")
+
+	bookingId, err := primitive.ObjectIDFromHex(bookingIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid booking ID"})
+		return
+	}
+
+	var booking models.Booking
+	err = bookingCollection.FindOne(context.Background(), bson.M{"_id": bookingId}).Decode(&booking)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
+		return
+	}
+
+	rideId, _ := primitive.ObjectIDFromHex(booking.RideID.Hex()) // Convert rideId to ObjectId properly to verify
+
+	var ride models.Ride
+	err = rideCollection.FindOne(context.Background(), bson.M{"_id": rideId, "driverId": userId}).Decode(&ride)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized to complete this passenger's booking"})
+		return
+	}
+
+	update := bson.M{"$set": bson.M{"status": "completed", "completedAt": time.Now()}}
+	_, err = bookingCollection.UpdateOne(context.Background(), bson.M{"_id": bookingId}, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update booking"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Booking marked as completed"})
+}

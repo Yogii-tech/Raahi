@@ -32,6 +32,8 @@ func RegisterRoutes(r *gin.Engine) {
 		rides.GET("/recent", controllers.GetRecentRides)
 		rides.POST("/viewed", controllers.MarkNotificationsViewed)
 		rides.POST("/:rideId/block-seat", controllers.ToggleBlockSeat)
+		rides.PUT("/:rideId/complete", controllers.CompleteRide)
+		rides.PUT("/bookings/:bookingId/complete", controllers.CompleteBooking)
 	}
 
 	user := api.Group("/user")
