@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"os"
@@ -58,9 +59,12 @@ func SendOTP(c *gin.Context) {
 		nil,
 	)
 
-	// Send OTP via MSG91 (falls back to console log if not configured)
+	// Send OTP via MSG91 SMS
+	smsSent := false
 	if smsErr := utils.SendOTPviaMSG91(body.PhoneNumber, otp); smsErr != nil {
-		fmt.Printf("[WARN] Failed to send SMS: %v\n", smsErr)
+		log.Printf("[WARN] Failed to send SMS: %v", smsErr)
+	} else {
+		smsSent = true
 	}
 
 	// If user doesn't exist, create it
@@ -83,6 +87,14 @@ func SendOTP(c *gin.Context) {
 		}
 	} else {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+
+	// In dev (SMS not configured), return OTP in response for testing.
+	// In production, OTP is delivered only via SMS — never exposed in API.
+	appEnv := os.Getenv("APP_ENV")
+	if !smsSent && (appEnv == "development" || appEnv == "") {
+		c.JSON(http.StatusOK, gin.H{"message": "OTP sent", "otp": otp})
 		return
 	}
 
@@ -148,7 +160,8 @@ func PromoteAdmin(c *gin.Context) {
 
 	expectedKey := os.Getenv("ADMIN_SECRET_KEY")
 	if expectedKey == "" {
-		expectedKey = "RAAHI_ADMIN_2026"
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Admin promotion is not configured"})
+		return
 	}
 
 	if body.SecretKey != expectedKey {

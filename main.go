@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"raahi-backend/config"
 	"raahi-backend/controllers"
@@ -14,20 +15,21 @@ import (
 )
 
 func main() {
-	// Initialize Sentry
+	appEnv := os.Getenv("APP_ENV")
+	isDev := appEnv == "development" || appEnv == ""
+
+	// Initialize Sentry — DSN must be set as environment variable
 	sentryDsn := os.Getenv("SENTRY_DSN")
 	if sentryDsn == "" {
-		sentryDsn = "https://08643806a6b5a3818e9508d0b2849b38@o4508492061245440.ingest.us.sentry.io/4508492067799040"
+		log.Println("[WARN] SENTRY_DSN not set — error tracking disabled")
 	}
-	appEnv := os.Getenv("APP_ENV")
-	tracesSampleRate := 1.0
-	if appEnv == "production" {
-		tracesSampleRate = 0.1
+	tracesSampleRate := 0.1 // 10% sampling in production
+	if isDev {
+		tracesSampleRate = 1.0 // 100% in dev
 	}
-
 	err := sentry.Init(sentry.ClientOptions{
 		Dsn:              sentryDsn,
-		EnableTracing:    true,
+		EnableTracing:    sentryDsn != "",
 		TracesSampleRate: tracesSampleRate,
 		Environment:      appEnv,
 	})
@@ -40,7 +42,10 @@ func main() {
 	controllers.InitializeRideCollection()
 	controllers.InitializeUserController()
 
-	if appEnv == "production" {
+	// Always run in release mode unless explicitly in development
+	if isDev {
+		gin.SetMode(gin.DebugMode)
+	} else {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.Default()
@@ -50,16 +55,23 @@ func main() {
 		Repanic: true,
 	}))
 
-	// Add CORS middleware
-	corsConfig := cors.DefaultConfig()
-	corsConfig.AllowOrigins = []string{
+	// CORS — only allow known production and local dev origins
+	allowedOrigins := []string{
 		"http://localhost:3000",
 		"http://127.0.0.1:3000",
 		"http://localhost:5173",
-		"http://192.168.0.107:3000",
 		"https://goraahi.in",
+		"https://www.goraahi.in",
 		"https://raahi-web-v2.web.app",
 	}
+	// Allow LAN IP only during development
+	if isDev {
+		if lanIP := os.Getenv("DEV_LAN_ORIGIN"); lanIP != "" {
+			allowedOrigins = append(allowedOrigins, lanIP)
+		}
+	}
+	corsConfig := cors.DefaultConfig()
+	corsConfig.AllowOrigins = allowedOrigins
 	corsConfig.AllowCredentials = true
 	corsConfig.AllowHeaders = append(corsConfig.AllowHeaders, "Authorization", "Content-Type")
 	corsConfig.AllowMethods = append(corsConfig.AllowMethods, "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS")
