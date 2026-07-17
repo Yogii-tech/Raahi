@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"raahi-backend/config"
 	"raahi-backend/models"
@@ -23,7 +24,10 @@ func GetTrustedContacts(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var user models.User
-	err := userProfileCollection.FindOne(context.Background(), bson.M{"_id": userId}).Decode(&user)
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	err := userProfileCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&user)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
@@ -51,8 +55,11 @@ func UpdateTrustedContacts(c *gin.Context) {
 		contacts = contacts[:2]
 	}
 
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
 	_, err := userProfileCollection.UpdateOne(
-		context.Background(),
+		dbCtx,
 		bson.M{"_id": userId},
 		bson.M{"$set": bson.M{"trusted_contacts": contacts}},
 	)
@@ -85,8 +92,11 @@ func UpdateProfile(c *gin.Context) {
 		},
 	}
 
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
 	_, err := userProfileCollection.UpdateOne(
-		context.Background(),
+		dbCtx,
 		bson.M{"_id": userId},
 		update,
 	)
@@ -103,7 +113,10 @@ func GetProfile(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var user models.User
-	err := userProfileCollection.FindOne(context.Background(), bson.M{"_id": userId}).Decode(&user)
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	err := userProfileCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&user)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
@@ -115,8 +128,11 @@ func Logout(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	// Increment TokenVersion to invalidate all existing tokens
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
 	_, err := userProfileCollection.UpdateOne(
-		context.Background(),
+		dbCtx,
 		bson.M{"_id": userId},
 		bson.M{"$inc": bson.M{"token_version": 1}},
 	)

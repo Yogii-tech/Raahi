@@ -51,8 +51,11 @@ func SendOTP(c *gin.Context) {
 
 	// Set OTP with 10-minute expiry
 	otpExpiry := time.Now().Add(10 * time.Minute)
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
 	_, err = userCollection.UpdateOne(
-		context.Background(),
+		dbCtx,
 		bson.M{"phone_number": body.PhoneNumber},
 		bson.M{"$set": bson.M{"otp": string(hashedOTP), "otp_expiry": otpExpiry}},
 		nil,
@@ -66,7 +69,9 @@ func SendOTP(c *gin.Context) {
 	// If user doesn't exist, create it
 	if err == nil {
 		var user models.User
-		err = userCollection.FindOne(context.Background(), bson.M{"phone_number": body.PhoneNumber}).Decode(&user)
+		dbCtx2, cancel2 := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel2()
+		err = userCollection.FindOne(dbCtx2, bson.M{"phone_number": body.PhoneNumber}).Decode(&user)
 		if err != nil {
 			if err == mongo.ErrNoDocuments {
 				newUser := models.User{
@@ -75,7 +80,9 @@ func SendOTP(c *gin.Context) {
 					OTP:         string(hashedOTP),
 					OTPExpiry:   otpExpiry,
 				}
-				userCollection.InsertOne(context.Background(), newUser)
+				dbCtx3, cancel3 := context.WithTimeout(c.Request.Context(), 5*time.Second)
+				defer cancel3()
+				userCollection.InsertOne(dbCtx3, newUser)
 			} else {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 				return
@@ -100,8 +107,11 @@ func VerifyOTP(c *gin.Context) {
 	}
 
 	var user models.User
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
 	err := userCollection.FindOne(
-		context.Background(),
+		dbCtx,
 		bson.M{"phone_number": body.PhoneNumber},
 	).Decode(&user)
 
@@ -124,9 +134,11 @@ func VerifyOTP(c *gin.Context) {
 	// Create JWT token
 	token, _ := utils.GenerateJWT(user.ID, user.TokenVersion)
 
-	// Optionally clear OTP after verification
+	// Option to clear OTP after verification
+	dbCtx2, cancel2 := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel2()
 	userCollection.UpdateOne(
-		context.Background(),
+		dbCtx2,
 		bson.M{"_id": user.ID},
 		bson.M{"$set": bson.M{"otp": ""}},
 	)
@@ -148,7 +160,8 @@ func PromoteAdmin(c *gin.Context) {
 
 	expectedKey := os.Getenv("ADMIN_SECRET_KEY")
 	if expectedKey == "" {
-		expectedKey = "RAAHI_ADMIN_2026"
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Admin promotion is currently unavailable"})
+		return
 	}
 
 	if body.SecretKey != expectedKey {
@@ -156,8 +169,11 @@ func PromoteAdmin(c *gin.Context) {
 		return
 	}
 
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
 	_, err := userCollection.UpdateOne(
-		context.Background(),
+		dbCtx,
 		bson.M{"_id": userId},
 		bson.M{"$set": bson.M{"role": "admin"}},
 	)

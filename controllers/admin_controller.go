@@ -18,7 +18,8 @@ import (
 
 // AdminStats returns aggregated dashboard KPIs computed from real collections.
 func AdminStats(c *gin.Context) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 
 	// --- Rides ---
 	totalRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{})
@@ -106,7 +107,8 @@ func AdminStats(c *gin.Context) {
 
 // AdminParcels returns a list of all parcel bookings for the admin dashboard.
 func AdminParcels(c *gin.Context) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 
 	cursor, err := config.Database.Collection("bookings").Find(
 		ctx,
@@ -163,7 +165,8 @@ func AdminParcels(c *gin.Context) {
 
 // AdminUsersList returns all registered users with role, join date and ride count.
 func AdminUsersList(c *gin.Context) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 
 	cursor, err := config.Database.Collection("users").Find(
 		ctx,
@@ -214,7 +217,8 @@ func AdminUsersList(c *gin.Context) {
 // AdminReports generates and streams a CSV report for the given type.
 func AdminReports(c *gin.Context) {
 	reportType := c.Param("type")
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 	c.Header("Content-Type", "text/csv")
 
 	switch reportType {
@@ -276,7 +280,8 @@ func fmtFloat(f float64) string   { return fmt.Sprintf("%.2f", f) }
 
 // Restoring the missing functions
 func AdminBookings(c *gin.Context) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 	cursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(100))
 	var bookings []models.Booking
 	cursor.All(ctx, &bookings)
@@ -305,7 +310,8 @@ func AdminBookings(c *gin.Context) {
 }
 
 func AdminDrivers(c *gin.Context) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 	cursor, _ := config.Database.Collection("users").Find(ctx, bson.M{"role": "driver"})
 	var drivers []models.User
 	cursor.All(ctx, &drivers)
@@ -336,7 +342,8 @@ func AdminDrivers(c *gin.Context) {
 }
 
 func AdminRidesList(c *gin.Context) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 	cursor, _ := config.Database.Collection("rides").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(50))
 	var rides []models.Ride
 	cursor.All(ctx, &rides)
@@ -363,7 +370,8 @@ func AdminRidesList(c *gin.Context) {
 }
 
 func AdminRoutesAnalytics(c *gin.Context) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 	pipeline := mongo.Pipeline{{{Key: "$group", Value: bson.M{"_id": bson.M{"pickup": "$pickup", "dropoff": "$dropoff"}, "totalRides": bson.M{"$sum": 1}, "topDriver": bson.M{"$first": "$driverName"}, "avgPrice": bson.M{"$avg": "$pricePerSeat"}}}}}
 	cursor, _ := config.Database.Collection("rides").Aggregate(ctx, pipeline)
 	var raw []bson.M

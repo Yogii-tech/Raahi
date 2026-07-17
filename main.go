@@ -16,9 +16,6 @@ import (
 func main() {
 	// Initialize Sentry
 	sentryDsn := os.Getenv("SENTRY_DSN")
-	if sentryDsn == "" {
-		sentryDsn = "https://08643806a6b5a3818e9508d0b2849b38@o4508492061245440.ingest.us.sentry.io/4508492067799040"
-	}
 	appEnv := os.Getenv("APP_ENV")
 	tracesSampleRate := 1.0
 	if appEnv == "production" {
@@ -65,7 +62,6 @@ func main() {
 	corsConfig.AllowMethods = append(corsConfig.AllowMethods, "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS")
 	r.Use(cors.New(corsConfig))
 
-	r.Static("/uploads", "./uploads")
 	routes.RegisterRoutes(r)
 
 	port := os.Getenv("PORT")

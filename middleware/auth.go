@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func AuthMiddleware() gin.HandlerFunc {
@@ -46,6 +47,41 @@ func AuthMiddleware() gin.HandlerFunc {
 		}
 
 		c.Set("userId", userId)
+		c.Next()
+	}
+}
+
+func AdminOnlyMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userIdVal, exists := c.Get("userId")
+		if !exists {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		userId, ok := userIdVal.(primitive.ObjectID)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+
+		var user struct {
+			Role string `bson:"role"`
+		}
+		err := config.Database.Collection("users").FindOne(c.Request.Context(), bson.M{"_id": userId}).Decode(&user)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+			c.Abort()
+			return
+		}
+
+		if user.Role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Requires Admin role"})
+			c.Abort()
+			return
+		}
+
 		c.Next()
 	}
 }

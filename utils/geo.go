@@ -17,6 +17,17 @@ var (
 	geoCacheMutex sync.RWMutex
 )
 
+// CacheGeocode allows external controllers to seed the geocode cache
+func CacheGeocode(location string, lat, lon float64) {
+	cleanLoc := strings.ToLower(strings.TrimSpace(location))
+	if cleanLoc == "" {
+		return
+	}
+	geoCacheMutex.Lock()
+	geoCache[cleanLoc] = [2]float64{lat, lon}
+	geoCacheMutex.Unlock()
+}
+
 // HaversineKm calculates the distance between two points in kilometers
 func HaversineKm(lat1, lon1, lat2, lon2 float64) float64 {
 	const R = 6371.0 // Earth's radius in km
@@ -34,7 +45,8 @@ func GetRouteFromOSRM(startLat, startLon, endLat, endLon float64) ([][2]float64,
 	osrmURL := fmt.Sprintf("http://router.project-osrm.org/route/v1/driving/%.6f,%.6f;%.6f,%.6f?overview=full&geometries=polyline",
 		startLon, startLat, endLon, endLat)
 
-	resp, err := http.Get(osrmURL)
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(osrmURL)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -189,7 +201,7 @@ func Geocode(location string) (float64, float64, error) {
 	req, _ := http.NewRequest("GET", nominatimURL, nil)
 	req.Header.Set("User-Agent", "RaahiApp/1.0 (contact@raahi.com)")
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, 0, err
