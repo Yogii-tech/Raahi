@@ -12,7 +12,7 @@ func RegisterRoutes(r *gin.Engine) {
 
 	auth := api.Group("/auth")
 	{
-		auth.POST("/otp/send", controllers.SendOTP)
+		auth.POST("/otp/send", middleware.OTPRateLimiter(), controllers.SendOTP)
 		auth.POST("/otp/verify", controllers.VerifyOTP)
 		auth.POST("/promote-admin", middleware.AuthMiddleware(), controllers.PromoteAdmin)
 	}
@@ -54,7 +54,7 @@ func RegisterRoutes(r *gin.Engine) {
 	api.POST("/upload", middleware.AuthMiddleware(), controllers.UploadFile)
 
 	admin := api.Group("/admin")
-	admin.Use(middleware.AuthMiddleware())
+	admin.Use(middleware.AuthMiddleware(), middleware.AdminOnlyMiddleware())
 	{
 		admin.GET("/stats", controllers.AdminStats)
 		admin.GET("/bookings", controllers.AdminBookings)

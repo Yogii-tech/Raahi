@@ -76,7 +76,7 @@ out center;`, lat, lon, lat, lon, lat, lon, lat, lon)
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", "RaahiApp/1.0 (contact@raahi.com)")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -165,8 +165,8 @@ func GetVillagesAlongRoute(coords [][2]float64) ([]Landmark, error) {
 	// 1. Pick sample points every few KM to build the Overpass search union
 	var aroundQueries []string
 	step := 1
-	if len(coords) > 30 {
-		step = len(coords) / 15 // Sample ~15 points along the path
+	if len(coords) > 20 {
+		step = len(coords) / 8 // Sample ~8 points along the path to keep Overpass queries fast and light
 	}
 	for i := 0; i < len(coords); i += step {
 		aroundQueries = append(aroundQueries, fmt.Sprintf(`node(around:1500, %f, %f)[place~"^(village|town|hamlet|suburb)$"];`, coords[i][0], coords[i][1]))
@@ -178,7 +178,8 @@ func GetVillagesAlongRoute(coords [][2]float64) ([]Landmark, error) {
 	unionStr := strings.Join(aroundQueries, "\n  ")
 
 	// 2. Build Overpass query with union of around results
-	query := fmt.Sprintf(`[out:json][timeout:30];
+	// Set query execution limit on Overpass server side to 5s to avoid blocking their server if stuck
+	query := fmt.Sprintf(`[out:json][timeout:5];
 (
   %s
 );
@@ -192,7 +193,8 @@ out body;`, unionStr)
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", "RaahiApp/1.0 (contact@raahi.com)")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	// Short client timeout to fail fast if Overpass is overloaded/down
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

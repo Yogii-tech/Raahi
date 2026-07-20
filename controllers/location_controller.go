@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -46,19 +47,12 @@ func SearchLocations(c *gin.Context) {
 		return
 	}
 
-	// Append context if not present
-	fullQuery := query
-	if !strconv.CanBackquote(query) || !strconv.CanBackquote("Uttarakhand") { // dummy check
-	}
-	// We'll let the frontend provide the full query or append locally
-	searchURL := "https://nominatim.openstreetmap.org/search?format=json&limit=5&q=" + strconv.Quote(fullQuery)
-	// Actually better to use fmt.Sprintf
-	searchURL = "https://nominatim.openstreetmap.org/search?format=json&limit=8&q=" + strings.ReplaceAll(fullQuery, " ", "+")
+	searchURL := "https://nominatim.openstreetmap.org/search?format=json&limit=8&q=" + strings.ReplaceAll(query, " ", "+")
 
 	req, _ := http.NewRequest("GET", searchURL, nil)
 	req.Header.Set("User-Agent", "RaahiApp/1.0 (contact@raahi.com)")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 4 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Geocoding service unavailable"})
@@ -66,10 +60,32 @@ func SearchLocations(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	var results []interface{}
+	var results []map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse geocoding results"})
 		return
+	}
+
+	// Cache geography coordinate results to prevent subsequent slow Nominatim api duplicate queries
+	for _, res := range results {
+		latStr, okLat := res["lat"].(string)
+		lonStr, okLon := res["lon"].(string)
+		displayStr, okDisp := res["display_name"].(string)
+		if okLat && okLon && okDisp {
+			var lat, lon float64
+			if _, errLat := fmt.Sscanf(latStr, "%f", &lat); errLat == nil {
+				if _, errLon := fmt.Sscanf(lonStr, "%f", &lon); errLon == nil {
+					// Cache full display name
+					utils.CacheGeocode(displayStr, lat, lon)
+
+					// Cache first element of display name (e.g. "Haldwani")
+					parts := strings.Split(displayStr, ",")
+					if len(parts) > 0 {
+						utils.CacheGeocode(parts[0], lat, lon)
+					}
+				}
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, results)
