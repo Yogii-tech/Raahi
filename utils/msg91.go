@@ -21,9 +21,9 @@ func SendOTPviaMSG91(phone string, otp string) error {
 	templateID := os.Getenv("MSG91_TEMPLATE_ID")
 
 	if authKey == "" || templateID == "" {
-		// Fall back to console log if keys are missing (development mode)
+		// Keys not configured — log to console and return error so caller knows
 		fmt.Printf("\n[MSG91 NOT CONFIGURED] OTP for %s: %s\n\n", phone, otp)
-		return nil
+		return fmt.Errorf("MSG91 not configured")
 	}
 
 	// MSG91 requires mobile in international format (91 + 10 digit number)

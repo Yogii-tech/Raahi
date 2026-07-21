@@ -12,7 +12,8 @@ import (
 func getJwtSecret() []byte {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
-		panic("JWT_SECRET environment variable is not set")
+		// Use a fixed dev secret — in production JWT_SECRET must be set
+		secret = "raahi-dev-secret-do-not-use-in-production-32chars"
 	}
 	return []byte(secret)
 }

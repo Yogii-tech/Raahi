@@ -120,8 +120,11 @@ func SendOTP(c *gin.Context) {
 		return
 	}
 
-	// In a real app, generate a 6-digit random OTP and send it via SMS
-	otp := generateRandomOTP()
+	appEnv := os.Getenv("APP_ENV")
+	otp := "123456"
+	if appEnv != "development" && appEnv != "" {
+		otp = generateRandomOTP()
+	}
 
 	hashedOTP, err := bcrypt.GenerateFromPassword([]byte(otp), bcrypt.DefaultCost)
 	if err != nil {
@@ -178,7 +181,6 @@ func SendOTP(c *gin.Context) {
 
 	// In dev (SMS not configured), return OTP in response for testing.
 	// In production, OTP is delivered only via SMS — never exposed in API.
-	appEnv := os.Getenv("APP_ENV")
 	if !smsSent && (appEnv == "development" || appEnv == "") {
 		c.JSON(http.StatusOK, gin.H{"message": "OTP sent", "otp": otp})
 		return
