@@ -31,11 +31,22 @@ jobs:
         docker build -t asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }} .
         docker push asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }}
 
-    - name: Deploy to Cloud Run
+    - name: Create Env File & Deploy to Cloud Run
       run: |-
+        cat << 'EOF' > env.yaml
+        MONGO_URI: "${{ secrets.MONGO_URI }}"
+        JWT_SECRET: "${{ secrets.JWT_SECRET }}"
+        MSG91_AUTH_KEY: "${{ secrets.MSG91_AUTH_KEY }}"
+        MSG91_TEMPLATE_ID: "${{ secrets.MSG91_TEMPLATE_ID }}"
+        ADMIN_SECRET_KEY: "${{ secrets.ADMIN_SECRET_KEY }}"
+        SENTRY_DSN: "${{ secrets.SENTRY_DSN }}"
+        APP_ENV: "production"
+        GCS_BUCKET_NAME: "${{ secrets.GCS_BUCKET_NAME }}"
+        EOF
+
         gcloud run deploy raahi-api \
           --image asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }} \
           --region asia-south2 \
           --platform managed \
           --allow-unauthenticated \
-          --set-env-vars="^@^MONGO_URI=${{ secrets.MONGO_URI }}@JWT_SECRET=${{ secrets.JWT_SECRET }}@MSG91_AUTH_KEY=${{ secrets.MSG91_AUTH_KEY }}@MSG91_TEMPLATE_ID=${{ secrets.MSG91_TEMPLATE_ID }}@ADMIN_SECRET_KEY=${{ secrets.ADMIN_SECRET_KEY }}@SENTRY_DSN=${{ secrets.SENTRY_DSN }}@APP_ENV=production@GCS_BUCKET_NAME=${{ secrets.GCS_BUCKET_NAME }}"
+          --env-vars-file env.yaml
