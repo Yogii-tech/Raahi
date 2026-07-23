@@ -33,19 +33,23 @@ func ConnectDB() {
 
 	client, err := mongo.Connect(ctx, clientOptions)
 	if err != nil {
-		log.Fatal("MongoDB connection error:", err)
+		log.Println("❌ MongoDB connection error:", err)
+		return
 	}
 
 	// Ping DB
 	if err = client.Ping(ctx, nil); err != nil {
-		log.Fatal("MongoDB ping failed:", err)
+		log.Println("⚠️ MongoDB ping warning (container will remain running):", err)
+	} else {
+		log.Println("✅ MongoDB connected successfully")
 	}
 
 	DB = client
 	Database = client.Database("Raahi")
-	log.Println("✅ MongoDB connected successfully")
 
-	InitializeIndexes()
+	if err == nil {
+		InitializeIndexes()
+	}
 }
 
 func InitializeIndexes() {
