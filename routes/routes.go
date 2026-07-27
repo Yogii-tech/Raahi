@@ -20,17 +20,19 @@ func RegisterRoutes(r *gin.Engine) {
 	rides := api.Group("/rides")
 	rides.Use(middleware.AuthMiddleware())
 	{
+		// Static routes MUST come before wildcard /:rideId to avoid shadowing
 		rides.POST("/create", controllers.CreateRide)
 		rides.GET("/available", controllers.GetAvailableRides)
 		rides.GET("/route-preview", controllers.RoutePreview)
-		rides.GET("/:rideId", controllers.GetRideDetails)
-		rides.POST("/:rideId/book", controllers.BookRide)
 		rides.GET("/requests", controllers.GetDriverRequests)
 		rides.GET("/bookings", controllers.GetPassengerBookings)
 		rides.PUT("/bookings/:bookingId", controllers.UpdateBookingStatus)
 		rides.POST("/recent", controllers.SaveRecentRide)
 		rides.GET("/recent", controllers.GetRecentRides)
 		rides.POST("/viewed", controllers.MarkNotificationsViewed)
+		// Wildcard routes come LAST
+		rides.GET("/:rideId", controllers.GetRideDetails)
+		rides.POST("/:rideId/book", controllers.BookRide)
 		rides.POST("/:rideId/block-seat", controllers.ToggleBlockSeat)
 	}
 
@@ -52,6 +54,14 @@ func RegisterRoutes(r *gin.Engine) {
 	}
 
 	api.POST("/upload", middleware.AuthMiddleware(), controllers.UploadFile)
+
+	chat := api.Group("/chat")
+	chat.Use(middleware.AuthMiddleware())
+	{
+		chat.GET("/:bookingId", controllers.GetMessages)
+		chat.POST("/:bookingId", controllers.SendMessage)
+		chat.POST("/:bookingId/read", controllers.MarkMessagesRead)
+	}
 
 	admin := api.Group("/admin")
 	admin.Use(middleware.AuthMiddleware(), middleware.AdminOnlyMiddleware())
