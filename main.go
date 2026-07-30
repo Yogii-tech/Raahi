@@ -12,9 +12,15 @@ import (
 	sentrygin "github.com/getsentry/sentry-go/gin"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// Load .env file for local development (ignored in production where vars are injected by Cloud Run)
+	if err := godotenv.Load(); err != nil {
+		log.Println("[INFO] No .env file found — using system environment variables")
+	}
+
 	appEnv := os.Getenv("APP_ENV")
 	isDev := appEnv == "development" || appEnv == ""
 
