@@ -1,6 +1,9 @@
 # Use the official Golang image as the base image
 FROM golang:1.24-alpine AS builder
 
+# Enable toolchain download if required by dependencies
+ENV GOTOOLCHAIN=auto
+
 # Set the working directory inside the container
 WORKDIR /app
 
