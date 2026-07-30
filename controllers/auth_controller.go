@@ -2,13 +2,9 @@ package controllers
 
 import (
 	"context"
-	"crypto/rand"
-	"fmt"
 	"log"
-	"math/big"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"raahi-backend/config"
@@ -24,81 +20,7 @@ import (
 
 var (
 	userCollection *mongo.Collection
-	otpLimitsMu    sync.Mutex
-	phoneOTPLimits = make(map[string]*rateLimitEntry)
-	ipOTPLimits    = make(map[string]*rateLimitEntry)
-	checkCount     int
 )
-
-type rateLimitEntry struct {
-	Count     int
-	ResetTime time.Time
-}
-
-func checkRateLimit(phone string, ip string) error {
-	otpLimitsMu.Lock()
-	defer otpLimitsMu.Unlock()
-
-	now := time.Now()
-
-	// Clean up old entries to prevent memory growth
-	checkCount++
-	if checkCount%100 == 0 {
-		for k, v := range ipOTPLimits {
-			if now.After(v.ResetTime) {
-				delete(ipOTPLimits, k)
-			}
-		}
-		for k, v := range phoneOTPLimits {
-			if now.After(v.ResetTime) {
-				delete(phoneOTPLimits, k)
-			}
-		}
-	}
-
-	// 1. Check IP rate limit
-	if entry, exists := ipOTPLimits[ip]; exists {
-		if now.Before(entry.ResetTime) {
-			if entry.Count >= 5 {
-				return fmt.Errorf("too many requests from this IP. Please try again later")
-			}
-			entry.Count++
-		} else {
-			entry.Count = 1
-			entry.ResetTime = now.Add(5 * time.Minute)
-		}
-	} else {
-		ipOTPLimits[ip] = &rateLimitEntry{
-			Count:     1,
-			ResetTime: now.Add(5 * time.Minute),
-		}
-	}
-
-	// 2. Check Phone number rate limit
-	if entry, exists := phoneOTPLimits[phone]; exists {
-		if now.Before(entry.ResetTime) {
-			if entry.Count >= 3 {
-				return fmt.Errorf("too many OTP requests for this phone number. Please try again in 5 minutes")
-			}
-			entry.Count++
-		} else {
-			entry.Count = 1
-			entry.ResetTime = now.Add(5 * time.Minute)
-		}
-	} else {
-		phoneOTPLimits[phone] = &rateLimitEntry{
-			Count:     1,
-			ResetTime: now.Add(5 * time.Minute),
-		}
-	}
-
-	return nil
-}
-
-func generateRandomOTP() string {
-	n, _ := rand.Int(rand.Reader, big.NewInt(900000))
-	return fmt.Sprintf("%06d", n.Int64()+100000)
-}
 
 func InitializeAuthCollection() {
 	userCollection = config.Database.Collection("users")
@@ -113,13 +35,7 @@ func SendOTP(c *gin.Context) {
 		return
 	}
 
-	// Apply Rate Limiting
-	clientIP := c.ClientIP()
-	if err := checkRateLimit(body.PhoneNumber, clientIP); err != nil {
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
-		return
-	}
-
+	// Rate limiting is handled by OTPRateLimiter middleware on the route
 	otp := "123456"
 
 	hashedOTP, err := bcrypt.GenerateFromPassword([]byte(otp), bcrypt.DefaultCost)

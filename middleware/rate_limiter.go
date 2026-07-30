@@ -29,14 +29,14 @@ func OTPRateLimiter() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		
+
 		// Restore body so next handlers can read it
 		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 		var req struct {
 			PhoneNumber string `json:"phone_number"`
 		}
-		
+
 		if err := json.Unmarshal(bodyBytes, &req); err != nil || req.PhoneNumber == "" {
 			c.Next()
 			return
@@ -48,7 +48,7 @@ func OTPRateLimiter() gin.HandlerFunc {
 
 		otpLimiter.mu.Lock()
 		requests := otpLimiter.limits[phone]
-		
+
 		// Filter out requests older than 10 minutes
 		var activeRequests []time.Time
 		for _, t := range requests {
@@ -57,7 +57,7 @@ func OTPRateLimiter() gin.HandlerFunc {
 			}
 		}
 
-		if len(activeRequests) >= 3 {
+		if len(activeRequests) >= 10 {
 			otpLimiter.mu.Unlock()
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many OTP requests. Please try again after 10 minutes."})
 			c.Abort()
