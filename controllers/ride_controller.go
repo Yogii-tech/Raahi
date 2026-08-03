@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -49,6 +50,31 @@ func CreateRide(c *gin.Context) {
 		return
 	}
 
+	// 10-minute gap rule check: Prevent same driver from posting rides within 10 minutes
+	findLastCtx, findLastCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer findLastCancel()
+
+	var lastRide models.Ride
+	err := rideCollection.FindOne(findLastCtx, bson.M{"driverId": userId}, options.FindOne().SetSort(bson.D{{Key: "createdAt", Value: -1}})).Decode(&lastRide)
+	if err == nil {
+		timeSinceLastRide := time.Since(lastRide.CreatedAt)
+		if timeSinceLastRide < 10*time.Minute {
+			remaining := (10 * time.Minute) - timeSinceLastRide
+			mins := int(remaining.Minutes())
+			if int(remaining.Seconds())%60 > 0 {
+				mins++
+			}
+			if mins < 1 {
+				mins = 1
+			}
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error":            fmt.Sprintf("Please wait 10 minutes between posting rides. You can post a new ride in %d minute(s).", mins),
+				"remainingSeconds": int(remaining.Seconds()),
+			})
+			return
+		}
+	}
+
 	findCtx, findCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer findCancel()
 
@@ -56,7 +82,7 @@ func CreateRide(c *gin.Context) {
 	var driver struct {
 		Name string `bson:"name"`
 	}
-	err := config.Database.Collection("users").FindOne(findCtx, bson.M{"_id": userId}).Decode(&driver)
+	err = config.Database.Collection("users").FindOne(findCtx, bson.M{"_id": userId}).Decode(&driver)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver info"})
 		return
