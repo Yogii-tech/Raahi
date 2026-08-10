@@ -478,6 +478,9 @@ func GetAvailableRides(c *gin.Context) {
 	var results []RideResponse
 	for _, ride := range matchedRides {
 		ride.TakenSeats = getTakenSeats(dbCtx, ride, pickup, dropoff)
+		if len(ride.TakenSeats) >= ride.SeatsTotal {
+			continue
+		}
 		response := RideResponse{Ride: ride}
 
 		if pickup != "" && dropoff != "" {
