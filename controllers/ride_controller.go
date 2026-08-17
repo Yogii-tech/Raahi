@@ -635,8 +635,9 @@ func GetDriverRequests(c *gin.Context) {
 		rideIds = append(rideIds, ride.ID)
 	}
 
-	// Filter bookings for those rideIds
-	cursor, err = bookingCollection.Find(dbCtx, bson.M{"rideId": bson.M{"$in": rideIds}})
+	// Filter bookings for those rideIds (newest first)
+	opts := options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}})
+	cursor, err = bookingCollection.Find(dbCtx, bson.M{"rideId": bson.M{"$in": rideIds}}, opts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch requests"})
 		return
@@ -658,6 +659,7 @@ func GetPassengerBookings(c *gin.Context) {
 
 	pipeline := []bson.M{
 		{"$match": bson.M{"passengerId": passengerId}},
+		{"$sort": bson.M{"createdAt": -1}},
 		{"$lookup": bson.M{
 			"from":         "rides",
 			"localField":   "rideId",
