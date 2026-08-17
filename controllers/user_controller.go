@@ -88,6 +88,7 @@ func UpdateProfile(c *gin.Context) {
 	update := bson.M{
 		"$set": bson.M{
 			"name":    body.Name,
+			"role":    body.Role,
 			"vehicle": body.Vehicle,
 		},
 	}

@@ -84,6 +84,8 @@ func main() {
 	corsConfig.AllowMethods = append(corsConfig.AllowMethods, "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS")
 	r.Use(cors.New(corsConfig))
 
+	r.Static("/uploads", "./uploads")
+
 	routes.RegisterRoutes(r)
 
 	port := os.Getenv("PORT")

@@ -24,8 +24,8 @@ var allowedExtensions = map[string]bool{
 	".pdf":  true,
 }
 
-// UploadFile handles file uploads by streaming them to Google Cloud Storage.
-// Requires GCS_BUCKET_NAME and GOOGLE_APPLICATION_CREDENTIALS (or workload identity on Cloud Run).
+// UploadFile handles file uploads by streaming them to Google Cloud Storage (if configured)
+// or falling back to local file storage.
 func UploadFile(c *gin.Context) {
 	if err := c.Request.ParseMultipartForm(maxUploadSize); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "File size exceeds 10MB limit"})
@@ -47,44 +47,61 @@ func UploadFile(c *gin.Context) {
 	}
 
 	bucketName := os.Getenv("GCS_BUCKET_NAME")
-	if bucketName == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "File storage is not configured"})
+	if bucketName != "" {
+		objectName := fmt.Sprintf("uploads/%d-%s", time.Now().UnixNano(), filepath.Base(header.Filename))
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+		defer cancel()
+
+		storageClient, err := storage.NewClient(ctx)
+		if err == nil {
+			wc := storageClient.Bucket(bucketName).Object(objectName).NewWriter(ctx)
+			wc.ContentType = header.Header.Get("Content-Type")
+			wc.PredefinedACL = "publicRead"
+
+			if _, copyErr := io.Copy(wc, file); copyErr == nil {
+				if closeErr := wc.Close(); closeErr == nil {
+					storageClient.Close()
+					fileURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", bucketName, objectName)
+					c.JSON(http.StatusOK, gin.H{
+						"url":      fileURL,
+						"filename": objectName,
+					})
+					return
+				}
+			}
+			storageClient.Close()
+		}
+	}
+
+	// Local file storage fallback
+	if err := os.MkdirAll("./uploads", os.ModePerm); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create local upload directory"})
 		return
 	}
 
-	// Create a unique object name to avoid collisions
-	objectName := fmt.Sprintf("uploads/%d-%s", time.Now().UnixNano(), filepath.Base(header.Filename))
+	filename := fmt.Sprintf("%d-%s", time.Now().UnixNano(), filepath.Base(header.Filename))
+	dstPath := filepath.Join("./uploads", filename)
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
-	defer cancel()
-
-	storageClient, err := storage.NewClient(ctx)
+	out, err := os.Create(dstPath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize storage client"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file locally"})
 		return
 	}
-	defer storageClient.Close()
+	defer out.Close()
 
-	wc := storageClient.Bucket(bucketName).Object(objectName).NewWriter(ctx)
-	wc.ContentType = header.Header.Get("Content-Type")
-	// Make the object publicly readable so frontend can render the URL
-	wc.PredefinedACL = "publicRead"
-
-	if _, err = io.Copy(wc, file); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload file"})
+	if _, err = io.Copy(out, file); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write file content"})
 		return
 	}
 
-	if err = wc.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to finalize upload"})
-		return
+	scheme := "http"
+	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+		scheme = "https"
 	}
-
-	// Return the public GCS URL
-	fileURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", bucketName, objectName)
+	fileURL := fmt.Sprintf("%s://%s/uploads/%s", scheme, c.Request.Host, filename)
 
 	c.JSON(http.StatusOK, gin.H{
 		"url":      fileURL,
-		"filename": objectName,
+		"filename": filename,
 	})
 }
