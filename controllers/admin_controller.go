@@ -74,6 +74,7 @@ func AdminStats(c *gin.Context) {
 		monthlyTrend[5-i] = map[string]interface{}{
 			"month": monthStart.Format("Jan"),
 			"count": count,
+			"rides": count,
 		}
 	}
 
@@ -100,8 +101,9 @@ func AdminStats(c *gin.Context) {
 			"drivers":    totalDrivers,
 			"passengers": totalPassengers,
 		},
-		"routes": routeCount,
-		"trends": monthlyTrend,
+		"routes":       routeCount,
+		"trends":       monthlyTrend,
+		"monthlyTrend": monthlyTrend,
 	})
 }
 
@@ -464,17 +466,35 @@ func AdminRoutesAnalytics(c *gin.Context) {
 	var raw []bson.M
 	cursor.All(ctx, &raw)
 	type RouteRow struct {
-		ID        string  `json:"id"`
-		Route     string  `json:"route"`
-		Bookings  int32   `json:"bookings"`
-		TopDriver string  `json:"topDriver"`
-		AvgPrice  float64 `json:"avgPrice"`
-		Status    string  `json:"status"`
+		ID            string  `json:"id"`
+		Route         string  `json:"route"`
+		Bookings      int32   `json:"bookings"`
+		Cancellations int32   `json:"cancellations"`
+		TopDriver     string  `json:"topDriver"`
+		AvgPrice      float64 `json:"avgPrice"`
+		Status        string  `json:"status"`
 	}
 	var result []RouteRow
 	for _, r := range raw {
 		idMap, _ := r["_id"].(primitive.M)
-		result = append(result, RouteRow{ID: "RT-" + primitive.NewObjectID().Hex()[:4], Route: idMap["pickup"].(string) + " ⇄ " + idMap["dropoff"].(string), Bookings: r["totalRides"].(int32), TopDriver: r["topDriver"].(string), AvgPrice: r["avgPrice"].(float64), Status: "Active"})
+		pickup := idMap["pickup"].(string)
+		dropoff := idMap["dropoff"].(string)
+
+		cancelledCount, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{
+			"pickup":  pickup,
+			"dropoff": dropoff,
+			"status":  "cancelled",
+		})
+
+		result = append(result, RouteRow{
+			ID:            "RT-" + primitive.NewObjectID().Hex()[:4],
+			Route:         pickup + " ⇄ " + dropoff,
+			Bookings:      r["totalRides"].(int32),
+			Cancellations: int32(cancelledCount),
+			TopDriver:     r["topDriver"].(string),
+			AvgPrice:      r["avgPrice"].(float64),
+			Status:        "Active",
+		})
 	}
 	if result == nil {
 		result = []RouteRow{}
