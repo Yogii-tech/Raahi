@@ -85,12 +85,19 @@ func UpdateProfile(c *gin.Context) {
 		return
 	}
 
+	setMap := bson.M{
+		"name":    body.Name,
+		"role":    body.Role,
+		"vehicle": body.Vehicle,
+	}
+
+	if body.Role == "driver" {
+		setMap["verification_status"] = "pending"
+		setMap["submitted_at"] = time.Now()
+	}
+
 	update := bson.M{
-		"$set": bson.M{
-			"name":    body.Name,
-			"role":    body.Role,
-			"vehicle": body.Vehicle,
-		},
+		"$set": setMap,
 	}
 
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)

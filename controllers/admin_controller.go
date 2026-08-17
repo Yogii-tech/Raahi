@@ -312,33 +312,120 @@ func AdminBookings(c *gin.Context) {
 func AdminDrivers(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	cursor, _ := config.Database.Collection("users").Find(ctx, bson.M{"role": "driver"})
+	cursor, _ := config.Database.Collection("users").Find(ctx, bson.M{"role": "driver"}, options.Find().SetSort(bson.D{{Key: "submitted_at", Value: -1}}))
 	var drivers []models.User
 	cursor.All(ctx, &drivers)
+
 	type DriverRow struct {
-		ID            string `json:"id"`
-		Name          string `json:"name"`
-		Phone         string `json:"phone"`
-		VehicleName   string `json:"vehicleName"`
-		VehicleNumber string `json:"vehicleNumber"`
-		VehicleType   string `json:"vehicleType"`
-		Seats         int    `json:"seats"`
-		TotalRides    int64  `json:"totalRides"`
-		CurrentRide   string `json:"currentRide"`
+		ID                 string `json:"id"`
+		Name               string `json:"name"`
+		Phone              string `json:"phone"`
+		Location           string `json:"location"`
+		VerificationStatus string `json:"verificationStatus"`
+		RejectionReason    string `json:"rejectionReason"`
+		SubmittedAt        string `json:"submittedAt"`
+		VehicleName        string `json:"vehicleName"`
+		VehicleNumber      string `json:"vehicleNumber"`
+		VehicleType        string `json:"vehicleType"`
+		Seats              int    `json:"seats"`
+		SeatingLayout      string `json:"seatingLayout"`
+		DLUrl              string `json:"dlUrl"`
+		RCUrl              string `json:"rcUrl"`
+		PollutionUrl       string `json:"pollutionUrl"`
+		VehicleImageUrl    string `json:"vehicleImageUrl"`
+		OwnershipUrl       string `json:"ownershipUrl"`
+		TotalRides         int64  `json:"totalRides"`
+		CurrentRide        string `json:"currentRide"`
 	}
+
 	var result []DriverRow
 	for _, d := range drivers {
 		totalRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"driverId": d.ID})
-		row := DriverRow{ID: d.ID.Hex(), Name: d.Name, Phone: d.PhoneNumber, TotalRides: totalRides}
-		if d.Vehicle != nil {
-			row.VehicleName, row.VehicleNumber, row.VehicleType, row.Seats = d.Vehicle.VehicleName, d.Vehicle.VehicleNumber, d.Vehicle.VehicleType, d.Vehicle.Seats
+
+		status := d.VerificationStatus
+		if status == "" {
+			status = "pending"
 		}
+
+		location := d.Location
+		if location == "" {
+			location = "Bageshwar"
+		}
+
+		submittedAtStr := ""
+		if !d.SubmittedAt.IsZero() {
+			submittedAtStr = d.SubmittedAt.Format("02 Jan 2006, 03:04 PM")
+		} else {
+			submittedAtStr = "Recent"
+		}
+
+		row := DriverRow{
+			ID:                 d.ID.Hex(),
+			Name:               d.Name,
+			Phone:              d.PhoneNumber,
+			Location:           location,
+			VerificationStatus: status,
+			RejectionReason:    d.RejectionReason,
+			SubmittedAt:        submittedAtStr,
+			TotalRides:         totalRides,
+		}
+
+		if d.Vehicle != nil {
+			row.VehicleName = d.Vehicle.VehicleName
+			row.VehicleNumber = d.Vehicle.VehicleNumber
+			row.VehicleType = d.Vehicle.VehicleType
+			row.Seats = d.Vehicle.Seats
+			row.SeatingLayout = d.Vehicle.SeatingLayout
+			row.DLUrl = d.Vehicle.DLUrl
+			row.RCUrl = d.Vehicle.RCUrl
+			row.PollutionUrl = d.Vehicle.PollutionUrl
+			row.VehicleImageUrl = d.Vehicle.VehicleImageUrl
+			row.OwnershipUrl = d.Vehicle.OwnershipUrl
+		}
+
 		result = append(result, row)
 	}
+
 	if result == nil {
 		result = []DriverRow{}
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+func AdminVerifyDriver(c *gin.Context) {
+	driverIdHex := c.Param("driverId")
+	driverId, err := primitive.ObjectIDFromHex(driverIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid driver ID"})
+		return
+	}
+
+	var body struct {
+		Status string `json:"status" binding:"required,oneof=verified rejected pending"`
+		Reason string `json:"reason"`
+	}
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid verification status"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	update := bson.M{
+		"$set": bson.M{
+			"verification_status": body.Status,
+			"rejection_reason":    body.Reason,
+		},
+	}
+
+	res, err := config.Database.Collection("users").UpdateOne(ctx, bson.M{"_id": driverId}, update)
+	if err != nil || res.MatchedCount == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update driver verification status"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Driver verification status updated", "status": body.Status})
 }
 
 func AdminRidesList(c *gin.Context) {

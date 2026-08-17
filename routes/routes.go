@@ -69,6 +69,7 @@ func RegisterRoutes(r *gin.Engine) {
 		admin.GET("/stats", controllers.AdminStats)
 		admin.GET("/bookings", controllers.AdminBookings)
 		admin.GET("/drivers", controllers.AdminDrivers)
+		admin.POST("/drivers/:driverId/verify", controllers.AdminVerifyDriver)
 		admin.GET("/rides", controllers.AdminRidesList)
 		admin.GET("/routes", controllers.AdminRoutesAnalytics)
 		admin.GET("/parcels", controllers.AdminParcels)
