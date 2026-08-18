@@ -796,13 +796,25 @@ func UpdateBookingStatus(c *gin.Context) {
 		return
 	}
 
-	// If accepted, update ride's seatsBooked
+	// Keep seatsBooked counter in sync: increment on accept, decrement on reject.
 	if body.Status == "accepted" {
 		rideCollection.UpdateOne(
 			dbCtx,
 			bson.M{"_id": booking.RideID},
 			bson.M{"$inc": bson.M{"seatsBooked": booking.SeatsRequested}},
 		)
+	} else if body.Status == "rejected" {
+		// Only decrement if the booking was previously accepted
+		var currentBooking models.Booking
+		if lookupErr := bookingCollection.FindOne(dbCtx, bson.M{"_id": bookingId}).Decode(&currentBooking); lookupErr == nil {
+			if currentBooking.Status == "accepted" {
+				rideCollection.UpdateOne(
+					dbCtx,
+					bson.M{"_id": booking.RideID},
+					bson.M{"$inc": bson.M{"seatsBooked": -booking.SeatsRequested}},
+				)
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Booking status updated"})
@@ -837,6 +849,9 @@ func GetRecentRides(c *gin.Context) {
 		}
 		for i := range rides {
 			rides[i].TakenSeats = getTakenSeats(dbCtx, rides[i], "", "")
+			// Always override the stored seatsBooked with the live accurate count
+			// to prevent stale DB counters from showing wrong values in production.
+			rides[i].SeatsBooked = len(rides[i].TakenSeats)
 		}
 		c.JSON(http.StatusOK, rides)
 		return

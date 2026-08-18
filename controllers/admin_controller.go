@@ -436,6 +436,20 @@ func AdminRidesList(c *gin.Context) {
 	cursor, _ := config.Database.Collection("rides").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(50))
 	var rides []models.Ride
 	cursor.All(ctx, &rides)
+
+	// Fetch all accepted bookings in one query for efficiency
+	bookingCursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
+	var allBookings []models.Booking
+	bookingCursor.All(ctx, &allBookings)
+
+	// Build a map: rideId -> count of accepted booked seats (from actual SeatLayout)
+	bookedSeatCount := make(map[primitive.ObjectID]int)
+	for _, b := range allBookings {
+		for range b.SeatLayout {
+			bookedSeatCount[b.RideID]++
+		}
+	}
+
 	type RideRow struct {
 		ID         string  `json:"id"`
 		Driver     string  `json:"driver"`
@@ -450,7 +464,9 @@ func AdminRidesList(c *gin.Context) {
 	}
 	var result []RideRow
 	for _, r := range rides {
-		result = append(result, RideRow{ID: r.ID.Hex(), Driver: r.DriverName, Route: r.Pickup + " → " + r.Dropoff, Date: r.Date, Time: r.DepartureTime, Seats: r.SeatsTotal, Booked: r.SeatsBooked, Price: r.PricePerSeat, Status: r.Status, DistanceKm: r.TotalDistanceM / 1000})
+		// Use live count from bookings instead of the potentially stale seatsBooked field
+		liveBooked := bookedSeatCount[r.ID]
+		result = append(result, RideRow{ID: r.ID.Hex(), Driver: r.DriverName, Route: r.Pickup + " → " + r.Dropoff, Date: r.Date, Time: r.DepartureTime, Seats: r.SeatsTotal, Booked: liveBooked, Price: r.PricePerSeat, Status: r.Status, DistanceKm: r.TotalDistanceM / 1000})
 	}
 	if result == nil {
 		result = []RideRow{}
