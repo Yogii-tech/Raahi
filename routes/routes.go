@@ -34,6 +34,7 @@ func RegisterRoutes(r *gin.Engine) {
 		rides.GET("/:rideId", controllers.GetRideDetails)
 		rides.POST("/:rideId/book", controllers.BookRide)
 		rides.POST("/:rideId/block-seat", controllers.ToggleBlockSeat)
+		rides.PUT("/:rideId/complete", controllers.CompleteRide)
 	}
 
 	user := api.Group("/user")

@@ -881,6 +881,51 @@ func GetRecentRides(c *gin.Context) {
 	c.JSON(http.StatusOK, recent)
 }
 
+func CompleteRide(c *gin.Context) {
+	rideIdHex := c.Param("rideId")
+	rideId, err := primitive.ObjectIDFromHex(rideIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ride ID"})
+		return
+	}
+
+	userId := c.MustGet("userId").(primitive.ObjectID)
+
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	var ride models.Ride
+	err = rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&ride)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+		return
+	}
+
+	if ride.DriverID != userId {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only the driver can complete this ride"})
+		return
+	}
+
+	_, err = rideCollection.UpdateOne(
+		dbCtx,
+		bson.M{"_id": rideId},
+		bson.M{"$set": bson.M{"status": "completed"}},
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete ride"})
+		return
+	}
+
+	// Also mark all accepted bookings for this ride as completed
+	bookingCollection.UpdateMany(
+		dbCtx,
+		bson.M{"rideId": rideId, "status": "accepted"},
+		bson.M{"$set": bson.M{"status": "completed"}},
+	)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Ride completed successfully"})
+}
+
 func MarkNotificationsViewed(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	role := c.Query("role") // "driver" or "passenger"
