@@ -78,13 +78,19 @@ func CreateRide(c *gin.Context) {
 	findCtx, findCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer findCancel()
 
-	// Fetch driver Name
+	// Fetch driver Name and VerificationStatus
 	var driver struct {
-		Name string `bson:"name"`
+		Name               string `bson:"name"`
+		VerificationStatus string `bson:"verification_status"`
 	}
 	err = config.Database.Collection("users").FindOne(findCtx, bson.M{"_id": userId}).Decode(&driver)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver info"})
+		return
+	}
+
+	if driver.VerificationStatus != "verified" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only verified drivers can post rides"})
 		return
 	}
 
@@ -782,6 +788,16 @@ func UpdateBookingStatus(c *gin.Context) {
 	err = rideCollection.FindOne(dbCtx, bson.M{"_id": booking.RideID}).Decode(&ride)
 	if err != nil || ride.DriverID != driverId {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized"})
+		return
+	}
+
+	// Check driver verification status
+	var driver struct {
+		VerificationStatus string `bson:"verification_status"`
+	}
+	err = config.Database.Collection("users").FindOne(dbCtx, bson.M{"_id": driverId}).Decode(&driver)
+	if err == nil && body.Status == "accepted" && driver.VerificationStatus != "verified" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only verified drivers can accept rides"})
 		return
 	}
 
