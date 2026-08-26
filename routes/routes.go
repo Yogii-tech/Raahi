@@ -37,6 +37,13 @@ func RegisterRoutes(r *gin.Engine) {
 		rides.PUT("/:rideId/complete", controllers.CompleteRide)
 	}
 
+	notifs := api.Group("/notifications")
+	notifs.Use(middleware.AuthMiddleware())
+	{
+		notifs.GET("/", controllers.GetMyNotifications)
+		notifs.PUT("/:id/read", controllers.MarkNotificationRead)
+	}
+
 	user := api.Group("/user")
 	user.Use(middleware.AuthMiddleware())
 	{

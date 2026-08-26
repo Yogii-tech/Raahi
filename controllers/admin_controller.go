@@ -427,6 +427,19 @@ func AdminVerifyDriver(c *gin.Context) {
 		return
 	}
 
+	// Send Notification to Driver
+	var title, msg string
+	if body.Status == "verified" {
+		title = "Documents Approved"
+		msg = "Your documents have been verified. You can now post rides and accept bookings!"
+	} else if body.Status == "rejected" {
+		title = "Documents Rejected"
+		msg = "Your documents were rejected. Reason: " + body.Reason
+	}
+	if title != "" {
+		CreateNotification(driverId, title, msg, "document_verification")
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "Driver verification status updated", "status": body.Status})
 }
 

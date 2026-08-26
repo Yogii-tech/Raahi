@@ -114,6 +114,16 @@ func UpdateProfile(c *gin.Context) {
 		return
 	}
 
+	// Send in-app notification when a driver submits their documents for the first time
+	if body.Role == "driver" && body.Vehicle != nil {
+		go CreateNotification(
+			userId,
+			"Documents Submitted Successfully",
+			"Your vehicle documents have been submitted and are under review. You will be notified once the admin approves or rejects your application.",
+			"document_verification",
+		)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "Profile updated successfully"})
 }
 

@@ -48,6 +48,7 @@ func main() {
 	controllers.InitializeRideCollection()
 	controllers.InitializeUserController()
 	controllers.InitializeChatCollection()
+	controllers.InitializeNotificationCollection()
 
 	// Always run in release mode unless explicitly in development
 	if isDev {
