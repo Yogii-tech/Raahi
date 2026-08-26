@@ -521,6 +521,20 @@ func GetAvailableRides(c *gin.Context) {
 		results = append(results, response)
 	}
 
+	// Sort results: Rides with the most filled/taken seats first (descending)
+	if len(results) > 1 {
+		// Import "sort" package isn't strictly needed if we sort inline or use a simple bubble sort since list sizes are small
+		// Let's implement a standard bubble sort to avoid adding new imports to imports block
+		for i := 0; i < len(results)-1; i++ {
+			for j := 0; j < len(results)-i-1; j++ {
+				// Sort by len(TakenSeats) descending
+				if len(results[j].TakenSeats) < len(results[j+1].TakenSeats) {
+					results[j], results[j+1] = results[j+1], results[j]
+				}
+			}
+		}
+	}
+
 	if results == nil {
 		results = []RideResponse{}
 	}
