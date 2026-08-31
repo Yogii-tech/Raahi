@@ -44,10 +44,16 @@ func GetMyNotifications(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	// Auto-expire: only return notifications from the last 24 hours
+	cutoff := time.Now().Add(-24 * time.Hour)
+
 	var notifications []models.Notification
 	opts := options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}})
 	
-	cursor, err := notificationCollection.Find(ctx, bson.M{"userId": userId}, opts)
+	cursor, err := notificationCollection.Find(ctx, bson.M{
+		"userId": userId,
+		"createdAt": bson.M{"$gte": cutoff},
+	}, opts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch notifications"})
 		return
@@ -89,4 +95,19 @@ func MarkNotificationRead(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Marked read"})
+}
+
+func ClearAllNotifications(c *gin.Context) {
+	userId := c.MustGet("userId").(primitive.ObjectID)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	_, err := notificationCollection.DeleteMany(ctx, bson.M{"userId": userId})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear notifications"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "All notifications cleared"})
 }
