@@ -23,11 +23,13 @@ import (
 var rideCollection *mongo.Collection
 var bookingCollection *mongo.Collection
 var recentRoutesCollection *mongo.Collection
+var usersCollection *mongo.Collection
 
 func InitializeRideCollection() {
 	rideCollection = config.Database.Collection("rides")
 	bookingCollection = config.Database.Collection("bookings")
 	recentRoutesCollection = config.Database.Collection("recent_routes")
+	usersCollection = config.Database.Collection("users")
 }
 
 func CreateRide(c *gin.Context) {
@@ -650,9 +652,12 @@ func GetDriverRequests(c *gin.Context) {
 		return
 	}
 
+	// Build rideId → ride map for enrichment
+	rideMap := make(map[primitive.ObjectID]models.Ride)
 	var rideIds []primitive.ObjectID
 	for _, ride := range rides {
 		rideIds = append(rideIds, ride.ID)
+		rideMap[ride.ID] = ride
 	}
 
 	// Filter bookings for those rideIds (newest first)
@@ -669,7 +674,31 @@ func GetDriverRequests(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, bookings)
+	// Enrich each booking with passenger name, phone, and ride details
+	type EnrichedBooking struct {
+		models.Booking
+		PassengerName  string     `json:"passengerName"`
+		PassengerPhone string     `json:"passengerPhone"`
+		Ride           models.Ride `json:"ride"`
+	}
+
+	var enriched []EnrichedBooking
+	for _, b := range bookings {
+		var passenger models.User
+		_ = usersCollection.FindOne(dbCtx, bson.M{"_id": b.PassengerID}).Decode(&passenger)
+		ride := rideMap[b.RideID]
+		enriched = append(enriched, EnrichedBooking{
+			Booking:        b,
+			PassengerName:  passenger.Name,
+			PassengerPhone: passenger.PhoneNumber,
+			Ride:           ride,
+		})
+	}
+
+	if enriched == nil {
+		enriched = []EnrichedBooking{}
+	}
+	c.JSON(http.StatusOK, enriched)
 }
 
 func GetPassengerBookings(c *gin.Context) {
@@ -707,20 +736,28 @@ func GetPassengerBookings(c *gin.Context) {
 
 	type BookingResponse struct {
 		models.Booking
-		Ride models.Ride `json:"ride"`
+		Ride        models.Ride `json:"ride"`
+		DriverPhone string      `json:"driverPhone"`
 	}
 
 	var response []BookingResponse
 	for _, res := range results {
 		ride := models.Ride{}
+		driverPhone := ""
 		if len(res.RideDetails) > 0 {
 			ride = res.RideDetails[0]
 			// Populate real-time taken seats for THIS booking's segment
 			ride.TakenSeats = getTakenSeats(dbCtx, ride, res.Booking.Pickup, res.Booking.Dropoff)
+			// Fetch driver phone
+			var driver models.User
+			if err := usersCollection.FindOne(dbCtx, bson.M{"_id": ride.DriverID}).Decode(&driver); err == nil {
+				driverPhone = driver.PhoneNumber
+			}
 		}
 		response = append(response, BookingResponse{
-			Booking: res.Booking,
-			Ride:    ride,
+			Booking:     res.Booking,
+			Ride:        ride,
+			DriverPhone: driverPhone,
 		})
 	}
 
