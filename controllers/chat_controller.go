@@ -135,6 +135,21 @@ func SendMessage(c *gin.Context) {
 	}
 
 	msg.ID = result.InsertedID.(primitive.ObjectID)
+
+	// Send notification to recipient
+	var recipientID primitive.ObjectID
+	if role == "driver" {
+		recipientID = booking.PassengerID
+	} else {
+		recipientID = ride.DriverID
+	}
+	// Note: We use a short snippet of the text to keep the notification clean
+	notifText := body.Text
+	if len(notifText) > 40 {
+		notifText = notifText[:37] + "..."
+	}
+	CreateNotification(recipientID, "New Message", "💬 "+notifText, "chat")
+
 	c.JSON(http.StatusCreated, msg)
 }
 
