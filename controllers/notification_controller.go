@@ -38,6 +38,28 @@ func CreateNotification(userId primitive.ObjectID, title, message, notifType str
 	return err
 }
 
+// NotifyAdmins sends a notification to all users with the "admin" role
+func NotifyAdmins(title, message, notifType string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	userColl := config.Database.Collection("users")
+	cursor, err := userColl.Find(ctx, bson.M{"role": "admin"})
+	if err != nil {
+		return
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var admin struct {
+			ID primitive.ObjectID `bson:"_id"`
+		}
+		if err := cursor.Decode(&admin); err == nil {
+			CreateNotification(admin.ID, title, message, notifType)
+		}
+	}
+}
+
 func GetMyNotifications(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 

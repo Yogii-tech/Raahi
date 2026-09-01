@@ -85,25 +85,53 @@ func UpdateProfile(c *gin.Context) {
 		return
 	}
 
-	setMap := bson.M{
-		"name":    body.Name,
-		"role":    body.Role,
-		"vehicle": body.Vehicle,
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	var currentUser models.User
+	err := userProfileCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&currentUser)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
 	}
 
-	if body.Role == "driver" {
-		setMap["verification_status"] = "pending"
-		setMap["submitted_at"] = time.Now()
+	// Prevent role change if it's already set to something else
+	// (Except if admin is somehow updating profile, but /profile is standard user endpoint)
+	if currentUser.Role != "" && currentUser.Role != "admin" && currentUser.Role != body.Role {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Roles cannot be changed after registering it one time"})
+		return
+	}
+
+	setMap := bson.M{
+		"name": body.Name,
+		"role": body.Role,
+	}
+
+	if body.Vehicle != nil {
+		setMap["vehicle"] = body.Vehicle
+	}
+
+	isFirstSubmission := false
+	isResubmission := false
+
+	if body.Role == "driver" && body.Vehicle != nil {
+		if currentUser.VerificationStatus == "" {
+			setMap["verification_status"] = "pending"
+			setMap["submitted_at"] = time.Now()
+			isFirstSubmission = true
+		} else if currentUser.VerificationStatus == "rejected" {
+			setMap["verification_status"] = "pending"
+			setMap["submitted_at"] = time.Now()
+			isResubmission = true
+		}
+		// If verification_status is already "pending" or "verified", we do not reset it just because they update profile.
 	}
 
 	update := bson.M{
 		"$set": setMap,
 	}
 
-	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	_, err := userProfileCollection.UpdateOne(
+	_, err = userProfileCollection.UpdateOne(
 		dbCtx,
 		bson.M{"_id": userId},
 		update,
@@ -114,13 +142,31 @@ func UpdateProfile(c *gin.Context) {
 		return
 	}
 
-	// Send in-app notification when a driver submits their documents for the first time
-	if body.Role == "driver" && body.Vehicle != nil {
+	if isFirstSubmission {
 		go CreateNotification(
 			userId,
 			"Documents Submitted Successfully",
 			"Your vehicle documents have been submitted and are under review. You will be notified once the admin approves or rejects your application.",
 			"document_verification",
+		)
+		
+		go NotifyAdmins(
+			"New Driver Application",
+			"A new driver ("+body.Name+") has submitted their documents for review.",
+			"admin_alert",
+		)
+	} else if isResubmission {
+		go CreateNotification(
+			userId,
+			"Documents Resubmitted",
+			"Your vehicle documents have been resubmitted and are under review.",
+			"document_verification",
+		)
+		
+		go NotifyAdmins(
+			"Driver Resubmitted Documents",
+			"Driver ("+body.Name+") has resubmitted their documents for review after a previous rejection.",
+			"admin_alert",
 		)
 	}
 
