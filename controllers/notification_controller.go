@@ -7,6 +7,7 @@ import (
 
 	"raahi-backend/config"
 	"raahi-backend/models"
+	"raahi-backend/utils"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
@@ -21,7 +22,7 @@ func InitializeNotificationCollection() {
 	notificationCollection = config.Database.Collection("notifications")
 }
 
-// CreateNotification is a helper to be used internally by other controllers
+// CreateNotification stores a notification in DB and sends an FCM push to the user's device.
 func CreateNotification(userId primitive.ObjectID, title, message, notifType string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -35,10 +36,27 @@ func CreateNotification(userId primitive.ObjectID, title, message, notifType str
 		CreatedAt: time.Now(),
 	}
 	_, err := notificationCollection.InsertOne(ctx, notif)
+
+	// Fetch user's FCM token and send push notification (fire-and-forget)
+	go func() {
+		tokenCtx, tokenCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer tokenCancel()
+
+		var user struct {
+			FCMToken string `bson:"fcm_token"`
+		}
+		if e := config.Database.Collection("users").FindOne(tokenCtx, bson.M{"_id": userId}).Decode(&user); e == nil && user.FCMToken != "" {
+			utils.SendPushNotification(user.FCMToken, title, message, map[string]string{
+				"type": notifType,
+			})
+		}
+	}()
+
 	return err
 }
 
-// NotifyAdmins sends a notification to all users with the "admin" role
+
+// NotifyAdmins sends a notification to all users with the "admin" role via DB + FCM push.
 func NotifyAdmins(title, message, notifType string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -50,13 +68,23 @@ func NotifyAdmins(title, message, notifType string) {
 	}
 	defer cursor.Close(ctx)
 
+	var fcmTokens []string
 	for cursor.Next(ctx) {
 		var admin struct {
-			ID primitive.ObjectID `bson:"_id"`
+			ID       primitive.ObjectID `bson:"_id"`
+			FCMToken string             `bson:"fcm_token"`
 		}
 		if err := cursor.Decode(&admin); err == nil {
 			CreateNotification(admin.ID, title, message, notifType)
+			if admin.FCMToken != "" {
+				fcmTokens = append(fcmTokens, admin.FCMToken)
+			}
 		}
+	}
+
+	// Send FCM multicast to all admins at once
+	if len(fcmTokens) > 0 {
+		utils.SendMulticastPush(fcmTokens, title, message, map[string]string{"type": notifType})
 	}
 }
 

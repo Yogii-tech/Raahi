@@ -25,3 +25,7 @@ go.work.sum
 # Cloud Run / Docker temporary files
 .gcloudignore
 .scannerwork/
+
+# Firebase service account key — NEVER commit this file
+serviceAccountKey.json
+*.json.key

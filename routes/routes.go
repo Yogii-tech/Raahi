@@ -54,6 +54,7 @@ func RegisterRoutes(r *gin.Engine) {
 		user.GET("/trusted-contacts", controllers.GetTrustedContacts)
 		user.PUT("/trusted-contacts", controllers.UpdateTrustedContacts)
 		user.POST("/logout", controllers.Logout)
+		user.PUT("/fcm-token", controllers.UpdateFCMToken)
 	}
 
 	location := api.Group("/location")

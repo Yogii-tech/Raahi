@@ -7,6 +7,7 @@ import (
 	"raahi-backend/config"
 	"raahi-backend/controllers"
 	"raahi-backend/routes"
+	"raahi-backend/utils"
 
 	"github.com/getsentry/sentry-go"
 	sentrygin "github.com/getsentry/sentry-go/gin"
@@ -44,6 +45,7 @@ func main() {
 	}
 
 	config.ConnectDB()
+	utils.InitFCM()
 	controllers.InitializeAuthCollection()
 	controllers.InitializeRideCollection()
 	controllers.InitializeUserController()

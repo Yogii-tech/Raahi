@@ -631,6 +631,31 @@ func BookRide(c *gin.Context) {
 		msg = "Parcel pickup request sent to driver"
 	}
 
+	// Notify the driver via FCM push (fire-and-forget)
+	go func() {
+		fcmCtx, fcmCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer fcmCancel()
+		var ride models.Ride
+		if err := rideCollection.FindOne(fcmCtx, bson.M{"_id": rideId}).Decode(&ride); err == nil {
+			var driver struct {
+				FCMToken string `bson:"fcm_token"`
+				Name     string `bson:"name"`
+			}
+			if err2 := usersCollection.FindOne(fcmCtx, bson.M{"_id": ride.DriverID}).Decode(&driver); err2 == nil && driver.FCMToken != "" {
+				title := "🚗 New Booking Request"
+				body := "A passenger wants to book your ride from " + booking.Pickup + " to " + booking.Dropoff
+				if bookingType == "parcel" {
+					title = "📦 New Parcel Request"
+					body = "A new parcel pickup request has been received."
+				}
+				utils.SendPushNotification(driver.FCMToken, title, body, map[string]string{
+					"type":      "booking_request",
+					"bookingId": result.InsertedID.(primitive.ObjectID).Hex(),
+				})
+			}
+		}
+	}()
+
 	c.JSON(http.StatusCreated, gin.H{"message": msg, "bookingId": result.InsertedID})
 }
 
@@ -884,6 +909,33 @@ func UpdateBookingStatus(c *gin.Context) {
 		}
 	}
 
+	// Capture status before goroutine so the closure doesn't race on body
+	capturedStatus := body.Status
+
+	// Notify passenger of the decision via FCM (fire-and-forget)
+	go func() {
+		fcmCtx, fcmCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer fcmCancel()
+		var passenger struct {
+			FCMToken string `bson:"fcm_token"`
+		}
+		if err2 := usersCollection.FindOne(fcmCtx, bson.M{"_id": booking.PassengerID}).Decode(&passenger); err2 == nil && passenger.FCMToken != "" {
+			var pushTitle, pushBody string
+			if capturedStatus == "accepted" {
+				pushTitle = "✅ Booking Accepted!"
+				pushBody = "Your ride from " + booking.Pickup + " to " + booking.Dropoff + " has been accepted by the driver."
+			} else {
+				pushTitle = "❌ Booking Declined"
+				pushBody = "Sorry, the driver declined your booking from " + booking.Pickup + " to " + booking.Dropoff + "."
+			}
+			utils.SendPushNotification(passenger.FCMToken, pushTitle, pushBody, map[string]string{
+				"type":      "booking_status",
+				"bookingId": bookingId.Hex(),
+				"status":    capturedStatus,
+			})
+		}
+	}()
+
 	c.JSON(http.StatusOK, gin.H{"message": "Booking status updated"})
 }
 
@@ -990,6 +1042,31 @@ func CompleteRide(c *gin.Context) {
 		bson.M{"$set": bson.M{"status": "completed"}},
 	)
 
+	// Notify all accepted passengers that the ride is complete (fire-and-forget)
+	go func(completedRideId primitive.ObjectID, ridePickup, rideDropoff string) {
+		notifCtx, notifCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer notifCancel()
+		cursor, err := bookingCollection.Find(notifCtx, bson.M{"rideId": completedRideId, "status": "completed"})
+		if err != nil {
+			return
+		}
+		defer cursor.Close(notifCtx)
+		for cursor.Next(notifCtx) {
+			var b models.Booking
+			if cursor.Decode(&b) != nil {
+				continue
+			}
+			var p struct {
+				FCMToken string `bson:"fcm_token"`
+			}
+			if err2 := usersCollection.FindOne(notifCtx, bson.M{"_id": b.PassengerID}).Decode(&p); err2 == nil && p.FCMToken != "" {
+				utils.SendPushNotification(p.FCMToken, "🏁 Ride Completed!",
+					"Your ride from "+ridePickup+" to "+rideDropoff+" is complete. Tap to rate your experience.",
+					map[string]string{"type": "ride_completed", "rideId": completedRideId.Hex()})
+			}
+		}
+	}(rideId, ride.Pickup, ride.Dropoff)
+
 	c.JSON(http.StatusOK, gin.H{"message": "Ride completed successfully"})
 }
 
@@ -1027,6 +1104,31 @@ func StartRide(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start ride"})
 		return
 	}
+
+	// Notify all accepted passengers that the ride has started (fire-and-forget)
+	go func(startedRideId primitive.ObjectID, ridePickup, rideDropoff string) {
+		notifCtx, notifCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer notifCancel()
+		cursor, err := bookingCollection.Find(notifCtx, bson.M{"rideId": startedRideId, "status": "accepted"})
+		if err != nil {
+			return
+		}
+		defer cursor.Close(notifCtx)
+		for cursor.Next(notifCtx) {
+			var b models.Booking
+			if cursor.Decode(&b) != nil {
+				continue
+			}
+			var p struct {
+				FCMToken string `bson:"fcm_token"`
+			}
+			if err2 := usersCollection.FindOne(notifCtx, bson.M{"_id": b.PassengerID}).Decode(&p); err2 == nil && p.FCMToken != "" {
+				utils.SendPushNotification(p.FCMToken, "🚀 Your Ride Has Started!",
+					"Your ride from "+ridePickup+" to "+rideDropoff+" is now on the way!",
+					map[string]string{"type": "ride_started", "rideId": startedRideId.Hex()})
+			}
+		}
+	}(rideId, ride.Pickup, ride.Dropoff)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Ride started successfully"})
 }

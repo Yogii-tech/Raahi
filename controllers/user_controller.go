@@ -208,3 +208,33 @@ func Logout(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "Logged out and all sessions revoked successfully"})
 }
+
+// UpdateFCMToken stores or refreshes the user's FCM device push token in the database.
+// Called by the app after login and whenever the FCM token is refreshed.
+func UpdateFCMToken(c *gin.Context) {
+	userId := c.MustGet("userId").(primitive.ObjectID)
+
+	var body struct {
+		FCMToken string `json:"fcmToken" binding:"required"`
+	}
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "fcmToken is required"})
+		return
+	}
+
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	_, err := userProfileCollection.UpdateOne(
+		dbCtx,
+		bson.M{"_id": userId},
+		bson.M{"$set": bson.M{"fcm_token": body.FCMToken}},
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update FCM token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "FCM token updated"})
+}
+
