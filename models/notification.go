@@ -12,6 +12,7 @@ type Notification struct {
 	Title     string             `bson:"title" json:"title"`
 	Message   string             `bson:"message" json:"message"`
 	Type      string             `bson:"type" json:"type"` // e.g. "document_verification"
+	RelatedId string             `bson:"relatedId,omitempty" json:"relatedId,omitempty"` // Booking ID for chats
 	Read      bool               `bson:"read" json:"read"`
 	CreatedAt time.Time          `bson:"createdAt" json:"createdAt"`
 }

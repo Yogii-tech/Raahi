@@ -437,7 +437,7 @@ func AdminVerifyDriver(c *gin.Context) {
 		msg = "Your documents were rejected. Reason: " + body.Reason
 	}
 	if title != "" {
-		CreateNotification(driverId, title, msg, "document_verification")
+		CreateNotification(driverId, title, msg, "document_verification", "")
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Driver verification status updated", "status": body.Status})

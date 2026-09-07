@@ -4,10 +4,13 @@ import (
 	"context"
 	"log"
 	"os"
+	"time"
 
 	firebase "firebase.google.com/go/v4"
 	"firebase.google.com/go/v4/messaging"
+	"go.mongodb.org/mongo-driver/bson"
 	"google.golang.org/api/option"
+	"raahi-backend/config"
 )
 
 var fcmClient *messaging.Client
@@ -37,6 +40,26 @@ func InitFCM() {
 
 	fcmClient = client
 	log.Println("[FCM] Firebase Cloud Messaging initialized successfully")
+}
+
+// removeFCMToken cleans up stale tokens from the database when a user uninstalls the app
+func removeFCMToken(token string) {
+	if config.Database == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := config.Database.Collection("users").UpdateMany(
+		ctx,
+		bson.M{"fcm_token": token},
+		bson.M{"$unset": bson.M{"fcm_token": ""}},
+	)
+	if err != nil {
+		log.Printf("[FCM] Failed to remove stale token from DB: %v", err)
+	} else {
+		log.Printf("[FCM] Successfully removed stale token from DB")
+	}
 }
 
 // SendPushNotification sends a push notification to a single FCM device token.
@@ -69,15 +92,45 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 				},
 			},
 		},
+		Webpush: &messaging.WebpushConfig{
+			Headers: map[string]string{
+				"Urgency": "high",
+			},
+			Notification: &messaging.WebpushNotification{
+				RequireInteraction: true,
+				Icon:               "/logo192.png",
+			},
+		},
 	}
 
 	ctx := context.Background()
-	resp, err := fcmClient.Send(ctx, msg)
-	if err != nil {
-		log.Printf("[FCM] Failed to send push: %v", err)
-		return
+	var err error
+	var resp string
+
+	// Simple 2-attempt retry loop for transient network issues
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, err = fcmClient.Send(ctx, msg)
+		if err == nil {
+			log.Printf("[FCM] Push sent successfully: %s", resp)
+			return
+		}
+		
+		if messaging.IsUnregistered(err) {
+			log.Printf("[FCM] Token is unregistered. Cleaning up DB...")
+			go removeFCMToken(fcmToken)
+			return
+		}
+
+		if messaging.IsUnavailable(err) || messaging.IsInternal(err) {
+			log.Printf("[FCM] Transient error on attempt %d: %v. Retrying...", attempt, err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		break // Break on non-transient errors
 	}
-	log.Printf("[FCM] Push sent successfully: %s", resp)
+
+	log.Printf("[FCM] Failed to send push after retries: %v", err)
 }
 
 // SendMulticastPush sends the same notification to multiple FCM tokens (e.g. admin broadcast).
@@ -118,6 +171,15 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 				},
 			},
 		},
+		Webpush: &messaging.WebpushConfig{
+			Headers: map[string]string{
+				"Urgency": "high",
+			},
+			Notification: &messaging.WebpushNotification{
+				RequireInteraction: true,
+				Icon:               "/logo192.png",
+			},
+		},
 	}
 
 	ctx := context.Background()
@@ -127,6 +189,37 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 		return
 	}
 	log.Printf("[FCM] Multicast push: %d success, %d failure", resp.SuccessCount, resp.FailureCount)
+
+	// Clean up any stale tokens in bulk
+	if resp.FailureCount > 0 {
+		var staleTokens []string
+		for i, response := range resp.Responses {
+			if response.Error != nil && messaging.IsUnregistered(response.Error) {
+				staleTokens = append(staleTokens, validTokens[i])
+			}
+		}
+
+		if len(staleTokens) > 0 {
+			go func(tokensToRemove []string) {
+				if config.Database == nil {
+					return
+				}
+				ctxCleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+
+				_, cleanupErr := config.Database.Collection("users").UpdateMany(
+					ctxCleanup,
+					bson.M{"fcm_token": bson.M{"$in": tokensToRemove}},
+					bson.M{"$unset": bson.M{"fcm_token": ""}},
+				)
+				if cleanupErr != nil {
+					log.Printf("[FCM] Failed to bulk remove stale tokens: %v", cleanupErr)
+				} else {
+					log.Printf("[FCM] Successfully removed %d stale tokens", len(tokensToRemove))
+				}
+			}(staleTokens)
+		}
+	}
 }
 
 func intPtr(i int) *int {

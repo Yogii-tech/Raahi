@@ -12,7 +12,12 @@ import (
 func getJwtSecret() []byte {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
-		// Use a fixed dev secret — in production JWT_SECRET must be set
+		if os.Getenv("APP_ENV") == "production" {
+			// CRITICAL SECURITY FIX: Never use a fallback secret in production.
+			// The application must crash if the secret is missing to prevent token forging.
+			panic("CRITICAL ERROR: JWT_SECRET environment variable is not set in production!")
+		}
+		// Use a fixed dev secret only in development
 		secret = "raahi-dev-secret-do-not-use-in-production-32chars"
 	}
 	return []byte(secret)

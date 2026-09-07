@@ -87,6 +87,11 @@ func main() {
 	corsConfig.AllowCredentials = true
 	corsConfig.AllowHeaders = append(corsConfig.AllowHeaders, "Authorization", "Content-Type")
 	corsConfig.AllowMethods = append(corsConfig.AllowMethods, "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS")
+	// In development the webpack-dev-server proxy forwards requests to the backend
+	// without an Origin header (or with Origin: null). gin-cors rejects these as 403.
+	// We allow no-origin requests locally so proxied API calls work correctly.
+	// In production this flag is false so the origin whitelist is strictly enforced.
+	corsConfig.AllowBrowserExtensions = isDev
 	r.Use(cors.New(corsConfig))
 
 	r.Static("/uploads", "./uploads")

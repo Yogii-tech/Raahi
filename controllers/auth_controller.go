@@ -168,8 +168,16 @@ func PromoteAdmin(c *gin.Context) {
 	providedKey := strings.Trim(strings.TrimSpace(body.SecretKey), "\"'")
 	expectedEnvKey := strings.Trim(strings.TrimSpace(os.Getenv("ADMIN_SECRET_KEY")), "\"'")
 	defaultKey := "RAAHI_ADMIN_2026"
+	isProd := os.Getenv("APP_ENV") == "production"
 
-	isValid := (providedKey == defaultKey) || (expectedEnvKey != "" && providedKey == expectedEnvKey)
+	// Only allow the fallback default key if we are NOT in production.
+	// In production, the environment variable MUST be set and match exactly.
+	isValid := false
+	if isProd {
+		isValid = (expectedEnvKey != "" && providedKey == expectedEnvKey)
+	} else {
+		isValid = (providedKey == defaultKey) || (expectedEnvKey != "" && providedKey == expectedEnvKey)
+	}
 
 	if !isValid {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid admin secret key"})
