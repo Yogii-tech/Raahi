@@ -41,10 +41,11 @@ jobs:
         SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         APP_ENV: production
         GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+        FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SA_KEY }}
       run: |-
         python3 -c '
         import json, os
-        env_keys = ["MONGO_URI", "JWT_SECRET", "MSG91_AUTH_KEY", "MSG91_TEMPLATE_ID", "ADMIN_SECRET_KEY", "SENTRY_DSN", "APP_ENV", "GCS_BUCKET_NAME"]
+        env_keys = ["MONGO_URI", "JWT_SECRET", "MSG91_AUTH_KEY", "MSG91_TEMPLATE_ID", "ADMIN_SECRET_KEY", "SENTRY_DSN", "APP_ENV", "GCS_BUCKET_NAME", "FIREBASE_SERVICE_ACCOUNT_JSON"]
         env_vars = {k: os.environ[k] for k in env_keys if k in os.environ}
         with open("env.json", "w") as f:
             json.dump(env_vars, f)
