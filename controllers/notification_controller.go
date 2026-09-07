@@ -155,3 +155,26 @@ func ClearAllNotifications(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "All notifications cleared"})
 }
+
+// TestPushNotification triggers a test FCM push notification to the logged in user
+func TestPushNotification(c *gin.Context) {
+	userId := c.MustGet("userId").(primitive.ObjectID)
+
+	tokenCtx, tokenCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer tokenCancel()
+
+	var user struct {
+		FCMToken string `bson:"fcm_token"`
+	}
+	err := config.Database.Collection("users").FindOne(tokenCtx, bson.M{"_id": userId}).Decode(&user)
+	if err != nil || user.FCMToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No FCM token stored for this user in DB. Log out and log back in."})
+		return
+	}
+
+	utils.SendPushNotification(user.FCMToken, "🔔 GoRaahi Test Notification", "If you see this banner, FCM Push Notifications are working 100%!", map[string]string{
+		"type": "test",
+	})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Test push notification sent successfully!"})
+}

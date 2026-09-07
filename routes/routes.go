@@ -44,6 +44,7 @@ func RegisterRoutes(r *gin.Engine) {
 		notifs.GET("/", controllers.GetMyNotifications)
 		notifs.PUT("/:id/read", controllers.MarkNotificationRead)
 		notifs.DELETE("/clear", controllers.ClearAllNotifications)
+		notifs.POST("/test-push", controllers.TestPushNotification)
 	}
 
 	user := api.Group("/user")
