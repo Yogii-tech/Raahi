@@ -24,8 +24,9 @@ FROM alpine:latest
 
 WORKDIR /root/
 
-# Copy the binary from the builder stage
+# Copy the binary and serviceAccountKey.json from the builder stage
 COPY --from=builder /app/main .
+COPY --from=builder /app/serviceAccountKey.json* ./
 
 # Expose the port the app runs on
 EXPOSE 8080

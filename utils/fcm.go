@@ -15,24 +15,67 @@ import (
 
 var fcmClient *messaging.Client
 
-// InitFCM initializes the Firebase Admin SDK using the service account credentials file.
-// Set FIREBASE_CREDENTIALS_FILE env var to the path of your serviceAccountKey.json.
-// If the variable is empty, FCM is silently disabled (pushes will be skipped).
+// InitFCM initializes the Firebase Admin SDK using available credentials.
+// It tries the following in order:
+// 1. FIREBASE_CREDENTIALS_FILE environment variable (path to JSON file)
+// 2. FIREBASE_SERVICE_ACCOUNT_JSON environment variable (raw JSON string)
+// 3. "serviceAccountKey.json" in the current working directory
+// 4. Google Application Default Credentials (ADC) on Cloud Run/GCP
 func InitFCM() {
-	credFile := os.Getenv("FIREBASE_CREDENTIALS_FILE")
-	if credFile == "" {
-		log.Println("[FCM] FIREBASE_CREDENTIALS_FILE not set — push notifications disabled")
-		return
+	var app *firebase.App
+	var err error
+	ctx := context.Background()
+
+	fbConfig := &firebase.Config{
+		ProjectID: "project-4e312d2c-0d4c-4929-860",
 	}
 
-	opt := option.WithCredentialsFile(credFile)
-	app, err := firebase.NewApp(context.Background(), nil, opt)
-	if err != nil {
+	credFile := os.Getenv("FIREBASE_CREDENTIALS_FILE")
+	serviceAccountJSON := os.Getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+
+	if credFile != "" {
+		if _, statErr := os.Stat(credFile); statErr == nil {
+			opt := option.WithCredentialsFile(credFile)
+			app, err = firebase.NewApp(ctx, fbConfig, opt)
+			if err == nil {
+				log.Printf("[FCM] Initialized using FIREBASE_CREDENTIALS_FILE (%s)", credFile)
+			}
+		}
+	}
+
+	if app == nil && serviceAccountJSON != "" {
+		opt := option.WithCredentialsJSON([]byte(serviceAccountJSON))
+		app, err = firebase.NewApp(ctx, fbConfig, opt)
+		if err == nil {
+			log.Println("[FCM] Initialized using FIREBASE_SERVICE_ACCOUNT_JSON env var")
+		}
+	}
+
+	if app == nil {
+		defaultKeyPath := "serviceAccountKey.json"
+		if _, statErr := os.Stat(defaultKeyPath); statErr == nil {
+			opt := option.WithCredentialsFile(defaultKeyPath)
+			app, err = firebase.NewApp(ctx, fbConfig, opt)
+			if err == nil {
+				log.Println("[FCM] Initialized using local serviceAccountKey.json")
+			}
+		}
+	}
+
+	if app == nil {
+		// Fallback to Application Default Credentials (ADC) on Google Cloud Run
+		app, err = firebase.NewApp(ctx, fbConfig)
+		if err == nil {
+			log.Println("[FCM] Initialized using Google Application Default Credentials (ADC)")
+		}
+	}
+
+	if err != nil || app == nil {
 		log.Printf("[FCM] Failed to initialize Firebase app: %v", err)
 		return
 	}
 
-	client, err := app.Messaging(context.Background())
+	client, err := app.Messaging(ctx)
 	if err != nil {
 		log.Printf("[FCM] Failed to get FCM client: %v", err)
 		return
