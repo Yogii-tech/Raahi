@@ -59,7 +59,6 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 			Priority: "high",
 			Notification: &messaging.AndroidNotification{
 				Sound:       "default",
-				ClickAction: "FLUTTER_NOTIFICATION_CLICK",
 			},
 		},
 		APNS: &messaging.APNSConfig{
