@@ -641,18 +641,26 @@ func BookRide(c *gin.Context) {
 				FCMToken string `bson:"fcm_token"`
 				Name     string `bson:"name"`
 			}
-			if err2 := usersCollection.FindOne(fcmCtx, bson.M{"_id": ride.DriverID}).Decode(&driver); err2 == nil && driver.FCMToken != "" {
+			err2 := usersCollection.FindOne(fcmCtx, bson.M{"_id": ride.DriverID}).Decode(&driver)
+			if err2 != nil {
+				log.Printf("[FCM] Driver lookup error for ride %s (DriverID %s): %v", rideId.Hex(), ride.DriverID.Hex(), err2)
+			} else if driver.FCMToken == "" {
+				log.Printf("[FCM] Driver %s has no FCM token stored in DB", ride.DriverID.Hex())
+			} else {
 				title := "🚗 New Booking Request"
 				body := "A passenger wants to book your ride from " + booking.Pickup + " to " + booking.Dropoff
 				if bookingType == "parcel" {
 					title = "📦 New Parcel Request"
 					body = "A new parcel pickup request has been received."
 				}
+				log.Printf("[FCM] Sending booking request push to driver %s...", ride.DriverID.Hex())
 				utils.SendPushNotification(driver.FCMToken, title, body, map[string]string{
 					"type":      "booking_request",
 					"bookingId": result.InsertedID.(primitive.ObjectID).Hex(),
 				})
 			}
+		} else {
+			log.Printf("[FCM] Ride lookup error for ride %s: %v", rideId.Hex(), err)
 		}
 	}()
 
@@ -919,7 +927,12 @@ func UpdateBookingStatus(c *gin.Context) {
 		var passenger struct {
 			FCMToken string `bson:"fcm_token"`
 		}
-		if err2 := usersCollection.FindOne(fcmCtx, bson.M{"_id": booking.PassengerID}).Decode(&passenger); err2 == nil && passenger.FCMToken != "" {
+		err2 := usersCollection.FindOne(fcmCtx, bson.M{"_id": booking.PassengerID}).Decode(&passenger)
+		if err2 != nil {
+			log.Printf("[FCM] Passenger lookup error for booking %s: %v", bookingId.Hex(), err2)
+		} else if passenger.FCMToken == "" {
+			log.Printf("[FCM] Passenger %s has no FCM token stored in DB", booking.PassengerID.Hex())
+		} else {
 			var pushTitle, pushBody string
 			if capturedStatus == "accepted" {
 				pushTitle = "✅ Booking Accepted!"
@@ -928,6 +941,7 @@ func UpdateBookingStatus(c *gin.Context) {
 				pushTitle = "❌ Booking Declined"
 				pushBody = "Sorry, the driver declined your booking from " + booking.Pickup + " to " + booking.Dropoff + "."
 			}
+			log.Printf("[FCM] Sending booking status push to passenger %s...", booking.PassengerID.Hex())
 			utils.SendPushNotification(passenger.FCMToken, pushTitle, pushBody, map[string]string{
 				"type":      "booking_status",
 				"bookingId": bookingId.Hex(),

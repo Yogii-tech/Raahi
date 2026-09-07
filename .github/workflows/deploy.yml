@@ -41,25 +41,20 @@ jobs:
         SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         APP_ENV: production
         GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+        FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SA_KEY }}
       run: |-
         python3 -c '
         import json, os
-        env_keys = ["MONGO_URI", "JWT_SECRET", "MSG91_AUTH_KEY", "MSG91_TEMPLATE_ID", "ADMIN_SECRET_KEY", "SENTRY_DSN", "APP_ENV", "GCS_BUCKET_NAME"]
+        env_keys = ["MONGO_URI", "JWT_SECRET", "MSG91_AUTH_KEY", "MSG91_TEMPLATE_ID", "ADMIN_SECRET_KEY", "SENTRY_DSN", "APP_ENV", "GCS_BUCKET_NAME", "FIREBASE_SERVICE_ACCOUNT_JSON"]
         env_vars = {k: os.environ[k] for k in env_keys if k in os.environ}
         with open("env.json", "w") as f:
             json.dump(env_vars, f)
         '
-
-        # FIREBASE_SERVICE_ACCOUNT_JSON is a nested JSON object that gets corrupted
-        # when written into env.json and read by --env-vars-file. Pass it separately
-        # via --set-env-vars as a compact single-line JSON string.
-        SA_JSON=$(echo '${{ secrets.GCP_SA_KEY }}' | tr -d '\n')
 
         gcloud run deploy raahi-api \
           --image asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }} \
           --region asia-south2 \
           --platform managed \
           --allow-unauthenticated \
-          --env-vars-file env.json \
-          --set-env-vars "^##^FIREBASE_SERVICE_ACCOUNT_JSON=${SA_JSON}"
+          --env-vars-file env.json
 
