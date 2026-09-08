@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -957,12 +958,22 @@ func GetRecentRides(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	role := c.Query("role") // "driver" or "passenger"
 
-	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
+	limit := 5
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit >= 0 {
+			limit = parsedLimit
+		}
+	}
+
 	opts := options.Find().
-		SetSort(bson.D{{Key: "createdAt", Value: -1}}).
-		SetLimit(5)
+		SetSort(bson.D{{Key: "createdAt", Value: -1}})
+
+	if limit > 0 {
+		opts.SetLimit(int64(limit))
+	}
 
 	// Drivers: return their own posted rides from `rides` collection
 	if role == "driver" {
@@ -975,18 +986,60 @@ func GetRecentRides(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch rides"})
 			return
 		}
-		rides := []models.Ride{}
-		if err := cursor.All(dbCtx, &rides); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse rides"})
+		defer cursor.Close(dbCtx)
+
+		var rides []models.Ride
+		for cursor.Next(dbCtx) {
+			var ride models.Ride
+			if err := cursor.Decode(&ride); err == nil {
+				rides = append(rides, ride)
+			} else {
+				log.Printf("[GetRecentRides] Skipping unparseable ride doc: %v", err)
+			}
+		}
+
+		if rides == nil {
+			rides = []models.Ride{}
+		}
+
+		// Enrich rides with bookings and takenSeats for driver view
+		type EnrichedDriverRide struct {
+			models.Ride
+			Bookings []models.Booking `json:"bookings"`
+		}
+
+		var enrichedRides []EnrichedDriverRide
+		for _, r := range rides {
+			r.TakenSeats = getTakenSeats(dbCtx, r, "", "")
+			r.SeatsBooked = len(r.TakenSeats)
+
+			// Fetch bookings for this ride
+			bCursor, bErr := bookingCollection.Find(dbCtx, bson.M{"rideId": r.ID})
+			var rideBookings []models.Booking
+			if bErr == nil {
+				for bCursor.Next(dbCtx) {
+					var b models.Booking
+					if bErr2 := bCursor.Decode(&b); bErr2 == nil {
+						rideBookings = append(rideBookings, b)
+					}
+				}
+				bCursor.Close(dbCtx)
+			}
+			if rideBookings == nil {
+				rideBookings = []models.Booking{}
+			}
+
+			enrichedRides = append(enrichedRides, EnrichedDriverRide{
+				Ride:     r,
+				Bookings: rideBookings,
+			})
+		}
+
+		if enrichedRides == nil {
+			c.JSON(http.StatusOK, []EnrichedDriverRide{})
 			return
 		}
-		for i := range rides {
-			rides[i].TakenSeats = getTakenSeats(dbCtx, rides[i], "", "")
-			// Always override the stored seatsBooked with the live accurate count
-			// to prevent stale DB counters from showing wrong values in production.
-			rides[i].SeatsBooked = len(rides[i].TakenSeats)
-		}
-		c.JSON(http.StatusOK, rides)
+		c.JSON(http.StatusOK, enrichedRides)
 		return
 	}
 
@@ -1000,11 +1053,14 @@ func GetRecentRides(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recent rides"})
 		return
 	}
+	defer cursor.Close(dbCtx)
 
 	var recent []bson.M
-	if err := cursor.All(dbCtx, &recent); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse recent rides"})
-		return
+	for cursor.Next(dbCtx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err == nil {
+			recent = append(recent, doc)
+		}
 	}
 
 	if recent == nil {
