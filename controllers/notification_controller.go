@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -172,9 +173,13 @@ func TestPushNotification(c *gin.Context) {
 		return
 	}
 
-	utils.SendPushNotification(user.FCMToken, "🔔 GoRaahi Test Notification", "If you see this banner, FCM Push Notifications are working 100%!", map[string]string{
+	sendErr := utils.SendPushNotification(user.FCMToken, "🔔 GoRaahi Test Notification", "If you see this banner, FCM Push Notifications are working 100%!", map[string]string{
 		"type": "test",
 	})
+	if sendErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("FCM push failed: %v", sendErr)})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Test push notification sent successfully!"})
 }

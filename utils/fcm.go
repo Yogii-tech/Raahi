@@ -2,6 +2,7 @@ package utils
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -109,9 +110,13 @@ func removeFCMToken(token string) {
 // The notification block makes the OS display it on the lock screen even when the app is closed.
 // The data block carries extra key-value pairs for deep-linking inside the app.
 // If fcmToken is empty or FCM is not initialized, this is a no-op.
-func SendPushNotification(fcmToken, title, body string, data map[string]string) {
-	if fcmClient == nil || fcmToken == "" {
-		return
+func SendPushNotification(fcmToken, title, body string, data map[string]string) error {
+	if fcmClient == nil {
+		log.Printf("[FCM] Error: FCM client is nil!")
+		return fmt.Errorf("FCM client is not initialized on server")
+	}
+	if fcmToken == "" {
+		return fmt.Errorf("FCM token is empty")
 	}
 
 	msg := &messaging.Message{
@@ -124,7 +129,7 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 		Android: &messaging.AndroidConfig{
 			Priority: "high",
 			Notification: &messaging.AndroidNotification{
-				Sound:       "default",
+				Sound: "default",
 			},
 		},
 		APNS: &messaging.APNSConfig{
@@ -150,18 +155,17 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 	var err error
 	var resp string
 
-	// Simple 2-attempt retry loop for transient network issues
 	for attempt := 1; attempt <= 2; attempt++ {
 		resp, err = fcmClient.Send(ctx, msg)
 		if err == nil {
 			log.Printf("[FCM] Push sent successfully: %s", resp)
-			return
+			return nil
 		}
 		
 		if messaging.IsUnregistered(err) {
 			log.Printf("[FCM] Token is unregistered. Cleaning up DB...")
 			go removeFCMToken(fcmToken)
-			return
+			return fmt.Errorf("FCM token is unregistered/invalid: %v", err)
 		}
 
 		if messaging.IsUnavailable(err) || messaging.IsInternal(err) {
@@ -170,10 +174,11 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 			continue
 		}
 
-		break // Break on non-transient errors
+		break
 	}
 
 	log.Printf("[FCM] Failed to send push after retries: %v", err)
+	return err
 }
 
 // SendMulticastPush sends the same notification to multiple FCM tokens (e.g. admin broadcast).
