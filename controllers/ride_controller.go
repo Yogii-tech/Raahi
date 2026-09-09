@@ -1043,7 +1043,60 @@ func GetRecentRides(c *gin.Context) {
 		return
 	}
 
-	// Passengers (default): return search history from `recent_routes`
+	// Passengers (default): first fetch actual booked rides from `bookings` collection
+	pipeline := []bson.M{
+		{"$match": bson.M{"passengerId": userId}},
+		{"$sort": bson.M{"createdAt": -1}},
+		{"$limit": int64(limit)},
+		{"$lookup": bson.M{
+			"from":         "rides",
+			"localField":   "rideId",
+			"foreignField": "_id",
+			"as":           "rideDetails",
+		}},
+	}
+
+	bCursor, bErr := bookingCollection.Aggregate(dbCtx, pipeline)
+	if bErr == nil {
+		var results []struct {
+			models.Booking `bson:",inline"`
+			RideDetails    []models.Ride `bson:"rideDetails"`
+		}
+		if err := bCursor.All(dbCtx, &results); err == nil && len(results) > 0 {
+			bCursor.Close(dbCtx)
+			var passengerRecent []bson.M
+			for _, res := range results {
+				pickup := res.Booking.Pickup
+				dropoff := res.Booking.Dropoff
+				date := ""
+				depTime := ""
+				if len(res.RideDetails) > 0 {
+					if pickup == "" {
+						pickup = res.RideDetails[0].Pickup
+					}
+					if dropoff == "" {
+						dropoff = res.RideDetails[0].Dropoff
+					}
+					date = res.RideDetails[0].Date
+					depTime = res.RideDetails[0].DepartureTime
+				}
+				passengerRecent = append(passengerRecent, bson.M{
+					"pickup":        pickup,
+					"dropoff":       dropoff,
+					"date":          date,
+					"departureTime": depTime,
+					"createdAt":     res.Booking.CreatedAt,
+				})
+			}
+			c.JSON(http.StatusOK, passengerRecent)
+			return
+		}
+		if bCursor != nil {
+			bCursor.Close(dbCtx)
+		}
+	}
+
+	// Fallback for passengers with no bookings: return search history from `recent_routes`
 	cursor, err := recentRoutesCollection.Find(
 		dbCtx,
 		bson.M{"userId": userId},
