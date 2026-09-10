@@ -28,6 +28,20 @@ func CreateNotification(userId primitive.ObjectID, title, message, notifType, re
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Deduplication safeguard: prevent duplicate notifications for the same user within 3 seconds
+	dupCheckCtx, dupCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer dupCancel()
+	recentCount, err := notificationCollection.CountDocuments(dupCheckCtx, bson.M{
+		"userId":    userId,
+		"title":     title,
+		"message":   message,
+		"type":      notifType,
+		"createdAt": bson.M{"$gte": time.Now().Add(-3 * time.Second)},
+	})
+	if err == nil && recentCount > 0 {
+		return nil
+	}
+
 	notif := models.Notification{
 		UserID:    userId,
 		Title:     title,
@@ -37,7 +51,7 @@ func CreateNotification(userId primitive.ObjectID, title, message, notifType, re
 		Read:      false,
 		CreatedAt: time.Now(),
 	}
-	_, err := notificationCollection.InsertOne(ctx, notif)
+	_, err = notificationCollection.InsertOne(ctx, notif)
 
 	// Fetch user's FCM token and send push notification (fire-and-forget)
 	go func() {

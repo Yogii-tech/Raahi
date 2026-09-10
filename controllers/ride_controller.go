@@ -650,15 +650,15 @@ func BookRide(c *gin.Context) {
 			} else {
 				title := "🚗 New Booking Request"
 				body := "A passenger wants to book your ride from " + booking.Pickup + " to " + booking.Dropoff
+				if booking.SeatsRequested > 1 {
+					body = fmt.Sprintf("A passenger requested %d seats on your ride from %s to %s", booking.SeatsRequested, booking.Pickup, booking.Dropoff)
+				}
 				if bookingType == "parcel" {
 					title = "📦 New Parcel Request"
 					body = "A new parcel pickup request has been received."
 				}
 				log.Printf("[FCM] Sending booking request push to driver %s...", ride.DriverID.Hex())
-				utils.SendPushNotification(driver.FCMToken, title, body, map[string]string{
-					"type":      "booking_request",
-					"bookingId": result.InsertedID.(primitive.ObjectID).Hex(),
-				})
+				CreateNotification(ride.DriverID, title, body, "booking_request", result.InsertedID.(primitive.ObjectID).Hex())
 			}
 		} else {
 			log.Printf("[FCM] Ride lookup error for ride %s: %v", rideId.Hex(), err)
@@ -921,34 +921,26 @@ func UpdateBookingStatus(c *gin.Context) {
 	// Capture status before goroutine so the closure doesn't race on body
 	capturedStatus := body.Status
 
-	// Notify passenger of the decision via FCM (fire-and-forget)
+	// Notify passenger of decision via DB notification + FCM Push
 	go func() {
-		fcmCtx, fcmCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer fcmCancel()
-		var passenger struct {
-			FCMToken string `bson:"fcm_token"`
-		}
-		err2 := usersCollection.FindOne(fcmCtx, bson.M{"_id": booking.PassengerID}).Decode(&passenger)
-		if err2 != nil {
-			log.Printf("[FCM] Passenger lookup error for booking %s: %v", bookingId.Hex(), err2)
-		} else if passenger.FCMToken == "" {
-			log.Printf("[FCM] Passenger %s has no FCM token stored in DB", booking.PassengerID.Hex())
-		} else {
-			var pushTitle, pushBody string
-			if capturedStatus == "accepted" {
-				pushTitle = "✅ Booking Accepted!"
-				pushBody = "Your ride from " + booking.Pickup + " to " + booking.Dropoff + " has been accepted by the driver."
+		var pushTitle, pushBody string
+		if capturedStatus == "accepted" {
+			pushTitle = "✅ Booking Accepted!"
+			if booking.SeatsRequested > 1 {
+				pushBody = fmt.Sprintf("Your booking for %d seats from %s to %s has been accepted by the driver.", booking.SeatsRequested, booking.Pickup, booking.Dropoff)
 			} else {
-				pushTitle = "❌ Booking Declined"
+				pushBody = "Your ride from " + booking.Pickup + " to " + booking.Dropoff + " has been accepted by the driver."
+			}
+		} else {
+			pushTitle = "❌ Booking Declined"
+			if booking.SeatsRequested > 1 {
+				pushBody = fmt.Sprintf("Sorry, the driver declined your booking for %d seats from %s to %s.", booking.SeatsRequested, booking.Pickup, booking.Dropoff)
+			} else {
 				pushBody = "Sorry, the driver declined your booking from " + booking.Pickup + " to " + booking.Dropoff + "."
 			}
-			log.Printf("[FCM] Sending booking status push to passenger %s...", booking.PassengerID.Hex())
-			utils.SendPushNotification(passenger.FCMToken, pushTitle, pushBody, map[string]string{
-				"type":      "booking_status",
-				"bookingId": bookingId.Hex(),
-				"status":    capturedStatus,
-			})
 		}
+		log.Printf("[FCM] Creating booking status notification & push for passenger %s...", booking.PassengerID.Hex())
+		CreateNotification(booking.PassengerID, pushTitle, pushBody, "booking_status", bookingId.Hex())
 	}()
 
 	c.JSON(http.StatusOK, gin.H{"message": "Booking status updated"})
@@ -1148,10 +1140,11 @@ func CompleteRide(c *gin.Context) {
 		return
 	}
 
+	now := time.Now()
 	_, err = rideCollection.UpdateOne(
 		dbCtx,
 		bson.M{"_id": rideId},
-		bson.M{"$set": bson.M{"status": "completed"}},
+		bson.M{"$set": bson.M{"status": "completed", "completedAt": now}},
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete ride"})
@@ -1159,24 +1152,21 @@ func CompleteRide(c *gin.Context) {
 	}
 
 	// Also mark all accepted bookings for this ride as completed
-	// Collect accepted passenger FCM tokens BEFORE updating status to avoid a race condition:
-	// a goroutine querying for "completed" bookings may run before UpdateMany finishes.
-	var completedPassengerTokens []string
+	// Collect accepted passenger IDs BEFORE updating status
+	var completedPassengerIDs []primitive.ObjectID
 	{
 		collectCtx, collectCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer collectCancel()
 		pcursor, pcursorErr := bookingCollection.Find(collectCtx, bson.M{"rideId": rideId, "status": "accepted"})
 		if pcursorErr == nil {
+			seen := make(map[primitive.ObjectID]bool)
 			for pcursor.Next(collectCtx) {
 				var b models.Booking
-				if pcursor.Decode(&b) != nil {
-					continue
-				}
-				var p struct {
-					FCMToken string `bson:"fcm_token"`
-				}
-				if err2 := usersCollection.FindOne(collectCtx, bson.M{"_id": b.PassengerID}).Decode(&p); err2 == nil && p.FCMToken != "" {
-					completedPassengerTokens = append(completedPassengerTokens, p.FCMToken)
+				if pcursor.Decode(&b) == nil {
+					if !seen[b.PassengerID] {
+						seen[b.PassengerID] = true
+						completedPassengerIDs = append(completedPassengerIDs, b.PassengerID)
+					}
 				}
 			}
 			pcursor.Close(collectCtx)
@@ -1186,15 +1176,15 @@ func CompleteRide(c *gin.Context) {
 	bookingCollection.UpdateMany(
 		dbCtx,
 		bson.M{"rideId": rideId, "status": "accepted"},
-		bson.M{"$set": bson.M{"status": "completed"}},
+		bson.M{"$set": bson.M{"status": "completed", "completedAt": now}},
 	)
 
-	// Notify all accepted passengers that the ride is complete (fire-and-forget, one goroutine per push)
-	for _, token := range completedPassengerTokens {
-		token := token // capture loop var
-		go utils.SendPushNotification(token, "🏁 Ride Completed!",
+	// Notify all accepted passengers that the ride is complete (DB notif + FCM push)
+	for _, passengerID := range completedPassengerIDs {
+		pid := passengerID // capture loop var
+		go CreateNotification(pid, "🏁 Ride Completed!",
 			"Your ride from "+ride.Pickup+" to "+ride.Dropoff+" is complete. Tap to rate your experience.",
-			map[string]string{"type": "ride_completed", "rideId": rideId.Hex()})
+			"ride_completed", rideId.Hex())
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Ride completed successfully"})
@@ -1235,8 +1225,7 @@ func StartRide(c *gin.Context) {
 		return
 	}
 
-	// Notify all accepted passengers that the ride has started.
-	// Fan out one goroutine per passenger to avoid sequential blocking on FCM round-trips.
+	// Notify all accepted passengers that the ride has started (DB notif + FCM push)
 	go func(startedRideId primitive.ObjectID, ridePickup, rideDropoff string) {
 		notifCtx, notifCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer notifCancel()
@@ -1245,19 +1234,16 @@ func StartRide(c *gin.Context) {
 			return
 		}
 		defer cursor.Close(notifCtx)
+		notifiedPassengers := make(map[primitive.ObjectID]bool)
 		for cursor.Next(notifCtx) {
 			var b models.Booking
-			if cursor.Decode(&b) != nil {
-				continue
-			}
-			var p struct {
-				FCMToken string `bson:"fcm_token"`
-			}
-			if err2 := usersCollection.FindOne(notifCtx, bson.M{"_id": b.PassengerID}).Decode(&p); err2 == nil && p.FCMToken != "" {
-				token := p.FCMToken // capture loop var
-				go utils.SendPushNotification(token, "🚀 Your Ride Has Started!",
-					"Your ride from "+ridePickup+" to "+rideDropoff+" is now on the way!",
-					map[string]string{"type": "ride_started", "rideId": startedRideId.Hex()})
+			if cursor.Decode(&b) == nil {
+				if !notifiedPassengers[b.PassengerID] {
+					notifiedPassengers[b.PassengerID] = true
+					go CreateNotification(b.PassengerID, "🚀 Your Ride Has Started!",
+						"Your ride from "+ridePickup+" to "+rideDropoff+" is now on the way!",
+						"ride_started", startedRideId.Hex())
+				}
 			}
 		}
 	}(rideId, ride.Pickup, ride.Dropoff)

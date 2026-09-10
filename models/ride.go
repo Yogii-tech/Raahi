@@ -33,6 +33,7 @@ type Ride struct {
 	ManualBlockedSeats []int              `bson:"manualBlockedSeats" json:"manualBlockedSeats"`
 	DriverName         string             `bson:"driverName" json:"driverName"`
 	Status             string             `bson:"status" json:"status"` // "available", "completed", "cancelled"
+	CompletedAt        time.Time          `bson:"completedAt,omitempty" json:"completedAt,omitempty"`
 	CreatedAt          time.Time          `bson:"createdAt" json:"createdAt"`
 }
 
@@ -57,5 +58,6 @@ type Booking struct {
 	Status            string             `bson:"status" json:"status"` // "pending", "accepted", "rejected"
 	ViewedByPassenger bool               `bson:"viewedByPassenger" json:"viewedByPassenger"`
 	ViewedByDriver    bool               `bson:"viewedByDriver" json:"viewedByDriver"`
+	CompletedAt       time.Time          `bson:"completedAt,omitempty" json:"completedAt,omitempty"`
 	CreatedAt         time.Time          `bson:"createdAt" json:"createdAt"`
 }
