@@ -8,6 +8,7 @@ import (
 	"time"
 
 	firebase "firebase.google.com/go/v4"
+	"firebase.google.com/go/v4/auth"
 	"firebase.google.com/go/v4/messaging"
 	"go.mongodb.org/mongo-driver/bson"
 	"google.golang.org/api/option"
@@ -15,6 +16,7 @@ import (
 )
 
 var fcmClient *messaging.Client
+var firebaseAuthClient *auth.Client
 
 // InitFCM initializes the Firebase Admin SDK using available credentials.
 // It tries the following in order:
@@ -79,11 +81,22 @@ func InitFCM() {
 	client, err := app.Messaging(ctx)
 	if err != nil {
 		log.Printf("[FCM] Failed to get FCM client: %v", err)
-		return
+	} else {
+		fcmClient = client
+		log.Println("[FCM] Firebase Cloud Messaging initialized successfully")
 	}
 
-	fcmClient = client
-	log.Println("[FCM] Firebase Cloud Messaging initialized successfully")
+	aClient, aErr := app.Auth(ctx)
+	if aErr != nil {
+		log.Printf("[Firebase Auth] Failed to get Auth client: %v", aErr)
+	} else {
+		firebaseAuthClient = aClient
+		log.Println("[Firebase Auth] Firebase Auth client initialized successfully")
+	}
+}
+
+func GetFirebaseAuth() *auth.Client {
+	return firebaseAuthClient
 }
 
 // removeFCMToken cleans up stale tokens from the database when a user uninstalls the app

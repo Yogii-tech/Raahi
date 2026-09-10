@@ -16,7 +16,6 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
-	"golang.org/x/crypto/bcrypt"
 )
 
 var (
@@ -27,130 +26,95 @@ func InitializeAuthCollection() {
 	userCollection = config.Database.Collection("users")
 }
 
-func SendOTP(c *gin.Context) {
+func VerifyFirebaseToken(c *gin.Context) {
 	var body struct {
-		PhoneNumber string `json:"phone_number" binding:"required,min=10,max=15"`
+		IDToken     string `json:"id_token"`
+		PhoneNumber string `json:"phone_number"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
 		return
 	}
 
-	// Rate limiting is handled by OTPRateLimiter middleware on the route
-	otp := "123456"
+	phoneNum := strings.TrimSpace(body.PhoneNumber)
+	fbAuth := utils.GetFirebaseAuth()
 
-	hashedOTP, err := bcrypt.GenerateFromPassword([]byte(otp), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process OTP"})
+	if fbAuth == nil {
+		log.Println("[Firebase Auth] Warning: Firebase Auth client is not initialized")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Firebase Auth client not initialized on server"})
 		return
 	}
 
-	// Set OTP with 10-minute expiry
-	otpExpiry := time.Now().Add(10 * time.Minute)
+	if body.IDToken == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Firebase ID Token is required for verification"})
+		return
+	}
+
+	token, err := fbAuth.VerifyIDToken(c.Request.Context(), body.IDToken)
+	if err != nil {
+		log.Printf("[Firebase Auth] Token verification failed: %v", err)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired Firebase verification token"})
+		return
+	}
+
+	if claimPhone, ok := token.Claims["phone_number"].(string); ok && claimPhone != "" {
+		phoneNum = claimPhone
+	}
+
+	cleanPhone := strings.TrimPrefix(phoneNum, "+91")
+	cleanPhone = strings.TrimPrefix(cleanPhone, "+")
+	if len(cleanPhone) > 10 && strings.HasPrefix(cleanPhone, "91") {
+		cleanPhone = cleanPhone[2:]
+	}
+
+	if cleanPhone == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Phone number missing or invalid"})
+		return
+	}
+
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-
-	_, err = userCollection.UpdateOne(
-		dbCtx,
-		bson.M{"phone_number": body.PhoneNumber},
-		bson.M{"$set": bson.M{"otp": string(hashedOTP), "otp_expiry": otpExpiry}},
-		nil,
-	)
-
-	// Send OTP via MSG91 SMS
-	smsSent := false
-	if smsErr := utils.SendOTPviaMSG91(body.PhoneNumber, otp); smsErr != nil {
-		log.Printf("[WARN] Failed to send SMS: %v", smsErr)
-	} else {
-		smsSent = true
-	}
-
-	// If user doesn't exist, create it
-	if err == nil {
-		var user models.User
-		dbCtx2, cancel2 := context.WithTimeout(c.Request.Context(), 5*time.Second)
-		defer cancel2()
-		err = userCollection.FindOne(dbCtx2, bson.M{"phone_number": body.PhoneNumber}).Decode(&user)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				newUser := models.User{
-					ID:          primitive.NewObjectID(),
-					PhoneNumber: body.PhoneNumber,
-					OTP:         string(hashedOTP),
-					OTPExpiry:   otpExpiry,
-				}
-				dbCtx3, cancel3 := context.WithTimeout(c.Request.Context(), 5*time.Second)
-				defer cancel3()
-				userCollection.InsertOne(dbCtx3, newUser)
-			} else {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-				return
-			}
-		}
-	} else {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-		return
-	}
-
-	appEnv := os.Getenv("APP_ENV")
-	if !smsSent && (appEnv == "development" || appEnv == "") {
-		c.JSON(http.StatusOK, gin.H{"message": "OTP sent", "otp": otp})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "OTP sent"})
-}
-
-func VerifyOTP(c *gin.Context) {
-	var body struct {
-		PhoneNumber string `json:"phone_number" binding:"required,min=10,max=15"`
-		OTP         string `json:"otp" binding:"required,len=6"`
-	}
-	if err := c.BindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
-		return
-	}
 
 	var user models.User
-	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	err := userCollection.FindOne(
-		dbCtx,
-		bson.M{"phone_number": body.PhoneNumber},
-	).Decode(&user)
+	err = userCollection.FindOne(dbCtx, bson.M{
+		"$or": []bson.M{
+			{"phone_number": cleanPhone},
+			{"phone_number": phoneNum},
+			{"phone_number": "+91" + cleanPhone},
+		},
+	}).Decode(&user)
 
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid phone number or OTP"})
-		return
-	}
-
-	if body.OTP != "123456" {
-		if err := bcrypt.CompareHashAndPassword([]byte(user.OTP), []byte(body.OTP)); err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid OTP"})
+		if err == mongo.ErrNoDocuments {
+			newUser := models.User{
+				ID:          primitive.NewObjectID(),
+				PhoneNumber: cleanPhone,
+				SubmittedAt: time.Now(),
+			}
+			dbCtx2, cancel2 := context.WithTimeout(c.Request.Context(), 5*time.Second)
+			defer cancel2()
+			_, insertErr := userCollection.InsertOne(dbCtx2, newUser)
+			if insertErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user record"})
+				return
+			}
+			user = newUser
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database query error"})
 			return
 		}
 	}
 
-	// Check OTP expiry (10 minutes)
-	if !user.OTPExpiry.IsZero() && time.Now().After(user.OTPExpiry) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "OTP has expired. Please request a new one."})
+	jwtToken, err := utils.GenerateJWT(user.ID, user.TokenVersion)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate session token"})
 		return
 	}
 
-	// Create JWT token
-	token, _ := utils.GenerateJWT(user.ID, user.TokenVersion)
-
-	// Option to clear OTP after verification
-	dbCtx2, cancel2 := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel2()
-	userCollection.UpdateOne(
-		dbCtx2,
-		bson.M{"_id": user.ID},
-		bson.M{"$set": bson.M{"otp": ""}},
-	)
-
-	c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
+	c.JSON(http.StatusOK, gin.H{
+		"token": jwtToken,
+		"user":  user,
+	})
 }
 
 func PromoteAdmin(c *gin.Context) {
