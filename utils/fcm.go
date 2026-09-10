@@ -133,20 +133,37 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 			},
 		},
 		APNS: &messaging.APNSConfig{
+			Headers: map[string]string{
+				"apns-priority":  "10",
+				"apns-push-type": "alert",
+			},
 			Payload: &messaging.APNSPayload{
 				Aps: &messaging.Aps{
-					Sound: "default",
-					Badge: intPtr(1),
+					Alert: &messaging.ApsAlert{
+						Title: title,
+						Body:  body,
+					},
+					Sound:            "default",
+					Badge:            intPtr(1),
+					MutableContent:   true,
+					ContentAvailable: true,
 				},
 			},
 		},
 		Webpush: &messaging.WebpushConfig{
 			Headers: map[string]string{
 				"Urgency": "high",
+				"TTL":     "86400",
 			},
 			Notification: &messaging.WebpushNotification{
+				Title:              title,
+				Body:               body,
 				RequireInteraction: true,
 				Icon:               "/logo192.png",
+				Badge:              "/logo192.png",
+			},
+			FCMOptions: &messaging.WebpushFCMOptions{
+				Link: "/",
 			},
 		},
 	}
@@ -212,20 +229,37 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 			},
 		},
 		APNS: &messaging.APNSConfig{
+			Headers: map[string]string{
+				"apns-priority":  "10",
+				"apns-push-type": "alert",
+			},
 			Payload: &messaging.APNSPayload{
 				Aps: &messaging.Aps{
-					Sound: "default",
-					Badge: intPtr(1),
+					Alert: &messaging.ApsAlert{
+						Title: title,
+						Body:  body,
+					},
+					Sound:            "default",
+					Badge:            intPtr(1),
+					MutableContent:   true,
+					ContentAvailable: true,
 				},
 			},
 		},
 		Webpush: &messaging.WebpushConfig{
 			Headers: map[string]string{
 				"Urgency": "high",
+				"TTL":     "86400",
 			},
 			Notification: &messaging.WebpushNotification{
+				Title:              title,
+				Body:               body,
 				RequireInteraction: true,
 				Icon:               "/logo192.png",
+				Badge:              "/logo192.png",
+			},
+			FCMOptions: &messaging.WebpushFCMOptions{
+				Link: "/",
 			},
 		},
 	}
