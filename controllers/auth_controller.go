@@ -50,12 +50,14 @@ func VerifyFirebaseToken(c *gin.Context) {
 		return
 	}
 
+	clientIP := c.ClientIP()
 	token, err := fbAuth.VerifyIDToken(c.Request.Context(), body.IDToken)
 	if err != nil {
-		log.Printf("[Firebase Auth] Token verification failed: %v", err)
+		log.Printf("[Firebase Auth] Token verification failed for IP %s: %v", clientIP, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired Firebase verification token"})
 		return
 	}
+	log.Printf("[Firebase Auth SUCCESS] IP: %s | Verified token for phone: %s", clientIP, phoneNum)
 
 	if claimPhone, ok := token.Claims["phone_number"].(string); ok && claimPhone != "" {
 		phoneNum = claimPhone

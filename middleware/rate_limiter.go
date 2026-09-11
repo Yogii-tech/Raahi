@@ -4,69 +4,114 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-type PhoneLimiter struct {
-	mu     sync.Mutex
-	limits map[string][]time.Time
+type OTPRateLimiterStore struct {
+	mu          sync.Mutex
+	phoneLimits map[string][]time.Time
+	ipLimits    map[string][]time.Time
 }
 
-var otpLimiter = &PhoneLimiter{
-	limits: make(map[string][]time.Time),
+var limiterStore = &OTPRateLimiterStore{
+	phoneLimits: make(map[string][]time.Time),
+	ipLimits:    make(map[string][]time.Time),
+}
+
+func maskPhoneNumber(phone string) string {
+	clean := strings.TrimSpace(phone)
+	if len(clean) <= 4 {
+		return "****"
+	}
+	return clean[:2] + "******" + clean[len(clean)-2:]
 }
 
 func OTPRateLimiter() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Read body to extract phone number
-		bodyBytes, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
-			c.Abort()
-			return
-		}
+		clientIP := c.ClientIP()
 
-		// Restore body so next handlers can read it
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		// Read body to extract phone number if present
+		var bodyBytes []byte
+		if c.Request.Body != nil {
+			bodyBytes, _ = io.ReadAll(c.Request.Body)
+			// Restore body so downstream handlers can read it
+			c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
 
 		var req struct {
 			PhoneNumber string `json:"phone_number"`
 		}
-
-		if err := json.Unmarshal(bodyBytes, &req); err != nil || req.PhoneNumber == "" {
-			c.Next()
-			return
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
 		}
 
-		phone := req.PhoneNumber
+		phone := strings.TrimSpace(req.PhoneNumber)
 		now := time.Now()
 		tenMinsAgo := now.Add(-10 * time.Minute)
 
-		otpLimiter.mu.Lock()
-		requests := otpLimiter.limits[phone]
+		limiterStore.mu.Lock()
+		defer limiterStore.mu.Unlock()
 
-		// Filter out requests older than 10 minutes
-		var activeRequests []time.Time
-		for _, t := range requests {
+		// 1. IP Address Rate Limiting (max 5 requests per 10 minutes)
+		ipRequests := limiterStore.ipLimits[clientIP]
+		var activeIPRequests []time.Time
+		for _, t := range ipRequests {
 			if t.After(tenMinsAgo) {
-				activeRequests = append(activeRequests, t)
+				activeIPRequests = append(activeIPRequests, t)
 			}
 		}
 
-		if len(activeRequests) >= 10 {
-			otpLimiter.mu.Unlock()
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many OTP requests. Please try again after 10 minutes."})
+		if len(activeIPRequests) >= 5 {
+			log.Printf("[OTP RATE LIMIT EXCEEDED] IP: %s | Path: %s | Exceeded IP limit (5 per 10 mins)", clientIP, c.Request.URL.Path)
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error":       "Too many OTP requests from your IP address. Please try again after 10 minutes.",
+				"retry_after": 600,
+			})
 			c.Abort()
 			return
 		}
 
-		activeRequests = append(activeRequests, now)
-		otpLimiter.limits[phone] = activeRequests
-		otpLimiter.mu.Unlock()
+		// 2. Phone Number Rate Limiting (max 3 requests per 10 minutes)
+		if phone != "" {
+			phoneRequests := limiterStore.phoneLimits[phone]
+			var activePhoneRequests []time.Time
+			for _, t := range phoneRequests {
+				if t.After(tenMinsAgo) {
+					activePhoneRequests = append(activePhoneRequests, t)
+				}
+			}
+
+			if len(activePhoneRequests) >= 3 {
+				masked := maskPhoneNumber(phone)
+				log.Printf("[OTP RATE LIMIT EXCEEDED] IP: %s | Phone: %s | Path: %s | Exceeded Phone limit (3 per 10 mins)", clientIP, masked, c.Request.URL.Path)
+				c.JSON(http.StatusTooManyRequests, gin.H{
+					"error":       "Too many OTP requests for this phone number. Please try again after 10 minutes.",
+					"retry_after": 600,
+				})
+				c.Abort()
+				return
+			}
+
+			activePhoneRequests = append(activePhoneRequests, now)
+			limiterStore.phoneLimits[phone] = activePhoneRequests
+		}
+
+		activeIPRequests = append(activeIPRequests, now)
+		limiterStore.ipLimits[clientIP] = activeIPRequests
+
+		// Audit Log
+		masked := "N/A"
+		if phone != "" {
+			masked = maskPhoneNumber(phone)
+		}
+		log.Printf("[OTP API LOG] Time: %s | IP: %s | Phone: %s | Path: %s | UserAgent: %s",
+			now.Format("2006-01-02 15:04:05"), clientIP, masked, c.Request.URL.Path, c.Request.UserAgent())
 
 		c.Next()
 	}
