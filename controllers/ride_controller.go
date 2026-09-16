@@ -548,12 +548,16 @@ func GetRideDetails(c *gin.Context) {
 	defer cancel()
 
 	rideIdHex := c.Param("rideId")
-	rideId, _ := primitive.ObjectIDFromHex(rideIdHex)
+	rideId, err := primitive.ObjectIDFromHex(rideIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ride ID"})
+		return
+	}
 	pickup := c.Query("pickup")
 	dropoff := c.Query("dropoff")
 
 	var ride models.Ride
-	err := rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&ride)
+	err = rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&ride)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
 		return
@@ -566,7 +570,11 @@ func GetRideDetails(c *gin.Context) {
 func BookRide(c *gin.Context) {
 	passengerId := c.MustGet("userId").(primitive.ObjectID)
 	rideIdHex := c.Param("rideId")
-	rideId, _ := primitive.ObjectIDFromHex(rideIdHex)
+	rideId, err := primitive.ObjectIDFromHex(rideIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ride ID"})
+		return
+	}
 
 	var body struct {
 		Type           string `json:"type" binding:"required,oneof=seat parcel"`
@@ -594,6 +602,30 @@ func BookRide(c *gin.Context) {
 	bookingType := body.Type
 	if bookingType == "" {
 		bookingType = "seat" // dynamic default for backward compatibility
+	}
+
+	// SECURITY: Prevent driver from booking their own ride
+	checkCtx, checkCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer checkCancel()
+	var rideForCheck models.Ride
+	if err := rideCollection.FindOne(checkCtx, bson.M{"_id": rideId}).Decode(&rideForCheck); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+		return
+	}
+	if passengerId == rideForCheck.DriverID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You cannot book your own ride"})
+		return
+	}
+
+	// SECURITY: Prevent duplicate bookings — one pending/accepted booking per user per ride
+	existingCount, _ := bookingCollection.CountDocuments(checkCtx, bson.M{
+		"rideId":      rideId,
+		"passengerId": passengerId,
+		"status":      bson.M{"$in": []string{"pending", "accepted"}},
+	})
+	if existingCount > 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "You already have an active booking for this ride"})
+		return
 	}
 
 	booking := models.Booking{
@@ -838,7 +870,11 @@ func SaveRecentRide(c *gin.Context) {
 
 func UpdateBookingStatus(c *gin.Context) {
 	bookingIdHex := c.Param("bookingId")
-	bookingId, _ := primitive.ObjectIDFromHex(bookingIdHex)
+	bookingId, err := primitive.ObjectIDFromHex(bookingIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid booking ID"})
+		return
+	}
 
 	var body struct {
 		Status string `json:"status" binding:"required,oneof=accepted rejected"` // strictly validated
@@ -856,7 +892,7 @@ func UpdateBookingStatus(c *gin.Context) {
 
 	// Get the booking to find the rideId and seatsRequested
 	var booking models.Booking
-	err := bookingCollection.FindOne(dbCtx, bson.M{"_id": bookingId}).Decode(&booking)
+	err = bookingCollection.FindOne(dbCtx, bson.M{"_id": bookingId}).Decode(&booking)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
 		return
@@ -1254,10 +1290,20 @@ func StartRide(c *gin.Context) {
 
 func MarkNotificationsViewed(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
-	role := c.Query("role") // "driver" or "passenger"
 
+	// SECURITY: Derive role from database, not from user-controlled query parameter
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
+
+	var userInfo struct {
+		Role string `bson:"role"`
+	}
+	err := usersCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&userInfo)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+		return
+	}
+	role := userInfo.Role
 
 	var filter bson.M
 	var update bson.M
@@ -1286,7 +1332,11 @@ func MarkNotificationsViewed(c *gin.Context) {
 func ToggleBlockSeat(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 	rideIdHex := c.Param("rideId")
-	rideId, _ := primitive.ObjectIDFromHex(rideIdHex)
+	rideId, err := primitive.ObjectIDFromHex(rideIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ride ID"})
+		return
+	}
 
 	var body struct {
 		SeatIndex int `json:"seatIndex"`
@@ -1301,7 +1351,7 @@ func ToggleBlockSeat(c *gin.Context) {
 	defer cancel()
 
 	var ride models.Ride
-	err := rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&ride)
+	err = rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&ride)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
 		return

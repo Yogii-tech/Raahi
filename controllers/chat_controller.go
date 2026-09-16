@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"raahi-backend/config"
@@ -120,11 +121,15 @@ func SendMessage(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: Sanitize HTML to prevent stored XSS
+	sanitizedText := strings.ReplaceAll(body.Text, "<", "&lt;")
+	sanitizedText = strings.ReplaceAll(sanitizedText, ">", "&gt;")
+
 	msg := models.ChatMessage{
 		BookingID: bookingID,
 		SenderID:  callerID,
 		Role:      role,
-		Text:      body.Text,
+		Text:      sanitizedText,
 		CreatedAt: time.Now(),
 	}
 

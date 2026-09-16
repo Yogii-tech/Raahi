@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"raahi-backend/config"
 	"raahi-backend/controllers"
@@ -60,6 +61,32 @@ func main() {
 	}
 	r := gin.Default()
 
+	// SECURITY: Set request body size limit (1MB for JSON, uploads have their own limit)
+	r.MaxMultipartMemory = 10 << 20 // 10 MB for file uploads
+
+	// SECURITY: Global security headers middleware
+	r.Use(func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("X-XSS-Protection", "1; mode=block")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		if !isDev {
+			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		c.Next()
+	})
+
+	// SECURITY: Global request body size limiter (1MB for non-upload JSON endpoints)
+	r.Use(func(c *gin.Context) {
+		// Skip size limit for upload endpoint (it has its own 10MB limit)
+		if c.Request.URL.Path == "/api/upload" {
+			c.Next()
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20) // 1MB
+		c.Next()
+	})
+
 	// Sentry middleware to capture panics and errors
 	r.Use(sentrygin.New(sentrygin.Options{
 		Repanic: true,
@@ -94,7 +121,19 @@ func main() {
 	corsConfig.AllowBrowserExtensions = isDev
 	r.Use(cors.New(corsConfig))
 
-	r.Static("/uploads", "./uploads")
+	// SECURITY: Serve uploads with security headers and no directory listing.
+	// Files are served as attachments to prevent inline script execution.
+	r.GET("/uploads/:filename", func(c *gin.Context) {
+		filename := c.Param("filename")
+		// Prevent path traversal
+		if filename == "" || filename[0] == '.' || len(filename) > 255 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid filename"})
+			return
+		}
+		c.Header("Content-Disposition", "attachment; filename=\""+filename+"\"")
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.File("./uploads/" + filename)
+	})
 
 	routes.RegisterRoutes(r)
 

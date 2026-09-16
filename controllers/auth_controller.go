@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/subtle"
 	"log"
 	"net/http"
 	"os"
@@ -131,21 +132,18 @@ func PromoteAdmin(c *gin.Context) {
 		return
 	}
 
-	providedKey := strings.Trim(strings.TrimSpace(body.SecretKey), "\"'")
-	expectedEnvKey := strings.Trim(strings.TrimSpace(os.Getenv("ADMIN_SECRET_KEY")), "\"'")
-	defaultKey := "RAAHI_ADMIN_2026"
-	isProd := os.Getenv("APP_ENV") == "production"
+	providedKey := strings.TrimSpace(body.SecretKey)
+	expectedKey := strings.TrimSpace(os.Getenv("ADMIN_SECRET_KEY"))
 
-	// Only allow the fallback default key if we are NOT in production.
-	// In production, the environment variable MUST be set and match exactly.
-	isValid := false
-	if isProd {
-		isValid = (expectedEnvKey != "" && providedKey == expectedEnvKey)
-	} else {
-		isValid = (providedKey == defaultKey) || (expectedEnvKey != "" && providedKey == expectedEnvKey)
+	// SECURITY: ADMIN_SECRET_KEY must always be set. No hardcoded fallback.
+	if expectedKey == "" {
+		log.Println("[SECURITY] ADMIN_SECRET_KEY environment variable is not set — blocking admin promotion")
+		c.JSON(http.StatusForbidden, gin.H{"error": "Admin promotion is not configured on this server"})
+		return
 	}
 
-	if !isValid {
+	// SECURITY: Use constant-time comparison to prevent timing side-channel attacks
+	if subtle.ConstantTimeCompare([]byte(providedKey), []byte(expectedKey)) != 1 {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid admin secret key"})
 		return
 	}

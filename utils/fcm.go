@@ -29,8 +29,12 @@ func InitFCM() {
 	var err error
 	ctx := context.Background()
 
+	fbProjectID := os.Getenv("FIREBASE_PROJECT_ID")
+	if fbProjectID == "" {
+		fbProjectID = "project-4e312d2c-0d4c-4929-860" // fallback for backward compat
+	}
 	fbConfig := &firebase.Config{
-		ProjectID: "project-4e312d2c-0d4c-4929-860",
+		ProjectID: fbProjectID,
 	}
 
 	credFile := os.Getenv("FIREBASE_CREDENTIALS_FILE")

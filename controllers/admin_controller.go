@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"raahi-backend/config"
@@ -275,8 +276,18 @@ func AdminReports(c *gin.Context) {
 	}
 }
 
-// SanitizeCSV and other helpers
-func sanitizeCSV(s string) string { return "\"" + s + "\"" }
+// sanitizeCSV prevents CSV injection attacks by escaping dangerous cell prefixes.
+// If a cell starts with =, +, -, @, tab, or carriage return, Excel may interpret
+// it as a formula — prepend a single quote to neutralise it.
+func sanitizeCSV(s string) string {
+	if len(s) > 0 {
+		switch s[0] {
+		case '=', '+', '-', '@', '\t', '\r':
+			s = "'" + s
+		}
+	}
+	return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
+}
 func itoa(v int) string           { return fmt.Sprintf("%d", v) }
 func fmtFloat(f float64) string   { return fmt.Sprintf("%.2f", f) }
 

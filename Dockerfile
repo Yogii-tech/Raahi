@@ -19,14 +19,22 @@ COPY . .
 # Build the application statically for Alpine
 RUN CGO_ENABLED=0 GOOS=linux go build -o main .
 
-# Use a minimal alpine image for the final stage
-FROM alpine:latest
+# SECURITY: Use a pinned Alpine version (not :latest) for reproducible builds
+FROM alpine:3.20
 
-WORKDIR /root/
+# SECURITY: Create and switch to a non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
 
 # Copy the binary and serviceAccountKey.json from the builder stage
 COPY --from=builder /app/main .
 COPY --from=builder /app/serviceAccountKey.json* ./
+
+# SECURITY: Set ownership to non-root user
+RUN chown -R appuser:appgroup /app
+
+USER appuser
 
 # Expose the port the app runs on
 EXPOSE 8080

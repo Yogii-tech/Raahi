@@ -24,6 +24,45 @@ var limiterStore = &OTPRateLimiterStore{
 	ipLimits:    make(map[string][]time.Time),
 }
 
+// SECURITY: Cleanup goroutine to evict expired rate limiter entries (prevents memory leak)
+func init() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			limiterStore.mu.Lock()
+			cutoff := time.Now().Add(-10 * time.Minute)
+			for k, times := range limiterStore.phoneLimits {
+				var active []time.Time
+				for _, t := range times {
+					if t.After(cutoff) {
+						active = append(active, t)
+					}
+				}
+				if len(active) == 0 {
+					delete(limiterStore.phoneLimits, k)
+				} else {
+					limiterStore.phoneLimits[k] = active
+				}
+			}
+			for k, times := range limiterStore.ipLimits {
+				var active []time.Time
+				for _, t := range times {
+					if t.After(cutoff) {
+						active = append(active, t)
+					}
+				}
+				if len(active) == 0 {
+					delete(limiterStore.ipLimits, k)
+				} else {
+					limiterStore.ipLimits[k] = active
+				}
+			}
+			limiterStore.mu.Unlock()
+		}
+	}()
+}
+
 func maskPhoneNumber(phone string) string {
 	clean := strings.TrimSpace(phone)
 	if len(clean) <= 4 {
@@ -112,6 +151,86 @@ func OTPRateLimiter() gin.HandlerFunc {
 		}
 		log.Printf("[OTP API LOG] Time: %s | IP: %s | Phone: %s | Path: %s | UserAgent: %s",
 			now.Format("2006-01-02 15:04:05"), clientIP, masked, c.Request.URL.Path, c.Request.UserAgent())
+
+		c.Next()
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// SECURITY: Global per-user rate limiter for authenticated API endpoints
+// ──────────────────────────────────────────────────────────────────────
+
+type userRateLimiterStore struct {
+	mu      sync.Mutex
+	buckets map[string][]time.Time
+}
+
+var globalLimiterStore = &userRateLimiterStore{
+	buckets: make(map[string][]time.Time),
+}
+
+// Cleanup goroutine for the global limiter
+func init() {
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			globalLimiterStore.mu.Lock()
+			cutoff := time.Now().Add(-1 * time.Minute)
+			for k, times := range globalLimiterStore.buckets {
+				var active []time.Time
+				for _, t := range times {
+					if t.After(cutoff) {
+						active = append(active, t)
+					}
+				}
+				if len(active) == 0 {
+					delete(globalLimiterStore.buckets, k)
+				} else {
+					globalLimiterStore.buckets[k] = active
+				}
+			}
+			globalLimiterStore.mu.Unlock()
+		}
+	}()
+}
+
+// GlobalRateLimiter limits authenticated users to maxRequests per window.
+// It keys on the "userId" set by AuthMiddleware. If userId is not set
+// (unauthenticated route), it falls back to client IP.
+func GlobalRateLimiter(maxRequests int, window time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Prefer userId (set by AuthMiddleware); fall back to IP
+		key := c.ClientIP()
+		if uid, exists := c.Get("userId"); exists {
+			key = "user:" + uid.(interface{ Hex() string }).Hex()
+		}
+
+		now := time.Now()
+		cutoff := now.Add(-window)
+
+		globalLimiterStore.mu.Lock()
+		requests := globalLimiterStore.buckets[key]
+		var active []time.Time
+		for _, t := range requests {
+			if t.After(cutoff) {
+				active = append(active, t)
+			}
+		}
+
+		if len(active) >= maxRequests {
+			globalLimiterStore.mu.Unlock()
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error":       "Rate limit exceeded. Please slow down.",
+				"retry_after": int(window.Seconds()),
+			})
+			c.Abort()
+			return
+		}
+
+		active = append(active, now)
+		globalLimiterStore.buckets[key] = active
+		globalLimiterStore.mu.Unlock()
 
 		c.Next()
 	}

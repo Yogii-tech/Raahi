@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -47,7 +48,14 @@ func SearchLocations(c *gin.Context) {
 		return
 	}
 
-	searchURL := "https://nominatim.openstreetmap.org/search?format=json&limit=8&q=" + strings.ReplaceAll(query, " ", "+")
+	// SECURITY: Limit query length to prevent abuse
+	if len(query) > 200 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Search query too long"})
+		return
+	}
+
+	// SECURITY: Use url.QueryEscape to prevent URL injection
+	searchURL := "https://nominatim.openstreetmap.org/search?format=json&limit=8&q=" + url.QueryEscape(query)
 
 	req, _ := http.NewRequest("GET", searchURL, nil)
 	req.Header.Set("User-Agent", "RaahiApp/1.0 (contact@raahi.com)")

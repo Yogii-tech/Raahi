@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"time"
+
 	"raahi-backend/controllers"
 	"raahi-backend/middleware"
 
@@ -19,7 +21,7 @@ func RegisterRoutes(r *gin.Engine) {
 	}
 
 	rides := api.Group("/rides")
-	rides.Use(middleware.AuthMiddleware())
+	rides.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(60, 1*time.Minute))
 	{
 		// Static routes MUST come before wildcard /:rideId to avoid shadowing
 		rides.POST("/create", controllers.CreateRide)
@@ -40,7 +42,7 @@ func RegisterRoutes(r *gin.Engine) {
 	}
 
 	notifs := api.Group("/notifications")
-	notifs.Use(middleware.AuthMiddleware())
+	notifs.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(60, 1*time.Minute))
 	{
 		notifs.GET("/", controllers.GetMyNotifications)
 		notifs.PUT("/:id/read", controllers.MarkNotificationRead)
@@ -49,7 +51,7 @@ func RegisterRoutes(r *gin.Engine) {
 	}
 
 	user := api.Group("/user")
-	user.Use(middleware.AuthMiddleware())
+	user.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(60, 1*time.Minute))
 	{
 		user.GET("/profile", controllers.GetProfile)
 		user.PUT("/profile", controllers.UpdateProfile)
@@ -60,16 +62,16 @@ func RegisterRoutes(r *gin.Engine) {
 	}
 
 	location := api.Group("/location")
-	location.Use(middleware.AuthMiddleware())
+	location.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(30, 1*time.Minute))
 	{
 		location.GET("/landmarks", controllers.GetNearbyLandmarks)
 		location.GET("/search", controllers.SearchLocations)
 	}
 
-	api.POST("/upload", middleware.AuthMiddleware(), controllers.UploadFile)
+	api.POST("/upload", middleware.AuthMiddleware(), middleware.GlobalRateLimiter(10, 1*time.Minute), controllers.UploadFile)
 
 	chat := api.Group("/chat")
-	chat.Use(middleware.AuthMiddleware())
+	chat.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(60, 1*time.Minute))
 	{
 		chat.GET("/:bookingId", controllers.GetMessages)
 		chat.POST("/:bookingId", controllers.SendMessage)
@@ -77,7 +79,7 @@ func RegisterRoutes(r *gin.Engine) {
 	}
 
 	admin := api.Group("/admin")
-	admin.Use(middleware.AuthMiddleware(), middleware.AdminOnlyMiddleware())
+	admin.Use(middleware.AuthMiddleware(), middleware.AdminOnlyMiddleware(), middleware.GlobalRateLimiter(30, 1*time.Minute))
 	{
 		admin.GET("/stats", controllers.AdminStats)
 		admin.GET("/bookings", controllers.AdminBookings)

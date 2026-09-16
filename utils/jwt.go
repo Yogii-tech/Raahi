@@ -2,6 +2,7 @@ package utils
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"time"
 
@@ -37,6 +38,11 @@ func GenerateJWT(userId primitive.ObjectID, tokenVersion int) (string, error) {
 
 func ValidateJWT(tokenString string) (primitive.ObjectID, int, error) {
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		// SECURITY: Reject any algorithm that is not HMAC (HS256/HS384/HS512).
+		// Prevents "none" algorithm bypass and RS256-to-HS256 key confusion attacks.
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
 		return getJwtSecret(), nil
 	})
 	if err != nil || !token.Valid {

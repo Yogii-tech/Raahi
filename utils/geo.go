@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"raahi-backend/models"
 	"strings"
 	"sync"
@@ -24,6 +25,11 @@ func CacheGeocode(location string, lat, lon float64) {
 		return
 	}
 	geoCacheMutex.Lock()
+	// SECURITY: Limit cache size to prevent memory exhaustion attacks
+	if len(geoCache) >= 5000 {
+		// Evict all entries (simple strategy; a production system would use LRU)
+		geoCache = make(map[string][2]float64)
+	}
 	geoCache[cleanLoc] = [2]float64{lat, lon}
 	geoCacheMutex.Unlock()
 }
@@ -195,8 +201,8 @@ func Geocode(location string) (float64, float64, error) {
 		query = location + ", Uttarakhand, India"
 	}
 
-	// Fetch more results to find the best match (e.g. Town vs District center)
-	nominatimURL := fmt.Sprintf("https://nominatim.openstreetmap.org/search?format=json&q=%s&limit=5", strings.ReplaceAll(query, " ", "+"))
+	// SECURITY: Use url.QueryEscape to prevent URL injection via user-supplied query
+	nominatimURL := fmt.Sprintf("https://nominatim.openstreetmap.org/search?format=json&q=%s&limit=5", url.QueryEscape(query))
 
 	req, _ := http.NewRequest("GET", nominatimURL, nil)
 	req.Header.Set("User-Agent", "RaahiApp/1.0 (contact@raahi.com)")
