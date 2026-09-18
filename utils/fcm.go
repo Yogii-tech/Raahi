@@ -146,7 +146,11 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 		Android: &messaging.AndroidConfig{
 			Priority: "high",
 			Notification: &messaging.AndroidNotification{
-				Sound: "default",
+				ChannelID:             "raahi_high_importance",
+				Sound:                 "default",
+				DefaultSound:         true,
+				DefaultVibrateTimings: true,
+				NotificationPriority: messaging.PriorityHigh,
 			},
 		},
 		APNS: &messaging.APNSConfig{
@@ -242,7 +246,11 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 		Android: &messaging.AndroidConfig{
 			Priority: "high",
 			Notification: &messaging.AndroidNotification{
-				Sound: "default",
+				ChannelID:             "raahi_high_importance",
+				Sound:                 "default",
+				DefaultSound:         true,
+				DefaultVibrateTimings: true,
+				NotificationPriority: messaging.PriorityHigh,
 			},
 		},
 		APNS: &messaging.APNSConfig{
