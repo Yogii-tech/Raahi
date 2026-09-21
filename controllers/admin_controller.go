@@ -454,6 +454,66 @@ func AdminVerifyDriver(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Driver verification status updated", "status": body.Status})
 }
 
+// AdminDeleteDriver permanently deletes a driver and all associated data (rides, bookings).
+func AdminDeleteDriver(c *gin.Context) {
+	driverIdHex := c.Param("driverId")
+	driverId, err := primitive.ObjectIDFromHex(driverIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid driver ID"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	// Verify the user exists and is actually a driver
+	var driver models.User
+	err = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": driverId, "role": "driver"}).Decode(&driver)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Driver not found"})
+		return
+	}
+
+	// Delete all bookings associated with rides by this driver
+	ridesCursor, _ := config.Database.Collection("rides").Find(ctx, bson.M{"driverId": driverId}, options.Find().SetProjection(bson.M{"_id": 1}))
+	var rideIds []primitive.ObjectID
+	for ridesCursor.Next(ctx) {
+		var r struct {
+			ID primitive.ObjectID `bson:"_id"`
+		}
+		ridesCursor.Decode(&r)
+		rideIds = append(rideIds, r.ID)
+	}
+
+	deletedBookings := int64(0)
+	if len(rideIds) > 0 {
+		bookingResult, _ := config.Database.Collection("bookings").DeleteMany(ctx, bson.M{"rideId": bson.M{"$in": rideIds}})
+		if bookingResult != nil {
+			deletedBookings = bookingResult.DeletedCount
+		}
+	}
+
+	// Delete all rides by this driver
+	rideResult, _ := config.Database.Collection("rides").DeleteMany(ctx, bson.M{"driverId": driverId})
+	deletedRides := int64(0)
+	if rideResult != nil {
+		deletedRides = rideResult.DeletedCount
+	}
+
+	// Delete the driver user document
+	_, err = config.Database.Collection("users").DeleteOne(ctx, bson.M{"_id": driverId})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete driver"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":         fmt.Sprintf("Driver %s deleted successfully", driver.Name),
+		"deletedRides":    deletedRides,
+		"deletedBookings": deletedBookings,
+	})
+}
+
 func AdminRidesList(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
