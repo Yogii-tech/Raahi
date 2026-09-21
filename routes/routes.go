@@ -90,6 +90,8 @@ func RegisterRoutes(r *gin.Engine) {
 		admin.GET("/routes", controllers.AdminRoutesAnalytics)
 		admin.GET("/parcels", controllers.AdminParcels)
 		admin.GET("/users", controllers.AdminUsersList)
+		admin.DELETE("/users/incomplete", controllers.AdminCleanupIncompleteUsers)
+		admin.POST("/users/cleanup-incomplete", controllers.AdminCleanupIncompleteUsers)
 		admin.GET("/reports/:type", controllers.AdminReports)
 	}
 }

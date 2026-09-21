@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -215,6 +216,48 @@ func AdminUsersList(c *gin.Context) {
 		result = []UserRow{}
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// AdminCleanupIncompleteUsers deletes abandoned registrations (missing name or role older than 24 hours).
+func AdminCleanupIncompleteUsers(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	force := c.Query("force") == "true"
+
+	var filter bson.M
+	if force {
+		filter = bson.M{
+			"$or": []bson.M{
+				{"name": ""},
+				{"name": bson.M{"$exists": false}},
+				{"role": ""},
+				{"role": bson.M{"$exists": false}},
+			},
+		}
+	} else {
+		filter = bson.M{
+			"$or": []bson.M{
+				{"name": "", "submitted_at": bson.M{"$lt": cutoff}},
+				{"name": bson.M{"$exists": false}, "submitted_at": bson.M{"$lt": cutoff}},
+				{"role": "", "submitted_at": bson.M{"$lt": cutoff}},
+				{"role": bson.M{"$exists": false}, "submitted_at": bson.M{"$lt": cutoff}},
+			},
+		}
+	}
+
+	result, err := config.Database.Collection("users").DeleteMany(ctx, filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete incomplete user registrations"})
+		return
+	}
+
+	log.Printf("[ADMIN CLEANUP] Deleted %d incomplete user records (force=%v)", result.DeletedCount, force)
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Incomplete registrations cleaned up successfully",
+		"deletedCount": result.DeletedCount,
+	})
 }
 
 // AdminReports generates and streams a CSV report for the given type.

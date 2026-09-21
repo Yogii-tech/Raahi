@@ -25,6 +25,35 @@ var (
 
 func InitializeAuthCollection() {
 	userCollection = config.Database.Collection("users")
+	StartIncompleteUserCleanupTask()
+}
+
+func StartIncompleteUserCleanupTask() {
+	go func() {
+		// Run first check after 1 minute, then repeat every 6 hours
+		time.Sleep(1 * time.Minute)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			cutoff := time.Now().Add(-24 * time.Hour)
+			filter := bson.M{
+				"$or": []bson.M{
+					{"name": "", "submitted_at": bson.M{"$lt": cutoff}},
+					{"name": bson.M{"$exists": false}, "submitted_at": bson.M{"$lt": cutoff}},
+					{"role": "", "submitted_at": bson.M{"$lt": cutoff}},
+					{"role": bson.M{"$exists": false}, "submitted_at": bson.M{"$lt": cutoff}},
+				},
+			}
+			res, err := userCollection.DeleteMany(ctx, filter)
+			if err != nil {
+				log.Printf("[BACKGROUND CLEANUP] Error deleting incomplete user records: %v", err)
+			} else if res.DeletedCount > 0 {
+				log.Printf("[BACKGROUND CLEANUP] Automatically purged %d abandoned/incomplete user registrations", res.DeletedCount)
+			}
+			cancel()
+
+			time.Sleep(6 * time.Hour)
+		}
+	}()
 }
 
 func VerifyFirebaseToken(c *gin.Context) {
