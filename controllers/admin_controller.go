@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -343,6 +345,7 @@ func AdminBookings(c *gin.Context) {
 	cursor.All(ctx, &bookings)
 	type BookingRow struct {
 		ID             string `json:"id"`
+		BookingID      string `json:"bookingId"`
 		PassengerName  string `json:"passengerName"`
 		PassengerPhone string `json:"passengerPhone"`
 		DriverName     string `json:"driverName"`
@@ -357,12 +360,129 @@ func AdminBookings(c *gin.Context) {
 		config.Database.Collection("users").FindOne(ctx, bson.M{"_id": b.PassengerID}).Decode(&p)
 		var r models.Ride
 		config.Database.Collection("rides").FindOne(ctx, bson.M{"_id": b.RideID}).Decode(&r)
-		result = append(result, BookingRow{ID: b.ID.Hex(), PassengerName: p.Name, PassengerPhone: p.PhoneNumber, DriverName: r.DriverName, Ride: r.Pickup + " → " + r.Dropoff, Status: b.Status, Seats: b.SeatsRequested, CreatedAt: b.CreatedAt.Format("Jan 2, 2006")})
+		result = append(result, BookingRow{
+			ID:             b.ID.Hex(),
+			BookingID:      b.BookingID,
+			PassengerName:  p.Name,
+			PassengerPhone: p.PhoneNumber,
+			DriverName:     r.DriverName,
+			Ride:           r.Pickup + " → " + r.Dropoff,
+			Status:         b.Status,
+			Seats:          b.SeatsRequested,
+			CreatedAt:      b.CreatedAt.Format("Jan 2, 2006"),
+		})
 	}
 	if result == nil {
 		result = []BookingRow{}
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// AdminGetBookingDetails fetches complete details for a booking by BID (e.g. Go-0047) or Mongo ID.
+func AdminGetBookingDetails(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	queryVal := strings.TrimSpace(c.Query("bid"))
+	if queryVal == "" {
+		queryVal = strings.TrimSpace(c.Query("id"))
+	}
+
+	if queryVal == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Booking ID or BID is required"})
+		return
+	}
+
+	var filter bson.M
+	if objID, err := primitive.ObjectIDFromHex(queryVal); err == nil {
+		filter = bson.M{
+			"$or": []bson.M{
+				{"_id": objID},
+				{"bookingId": queryVal},
+			},
+		}
+	} else {
+		normalizedBID := queryVal
+		cleanNum := strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(queryVal), "go-"), "go"), "0")
+		if numVal, parseErr := strconv.Atoi(cleanNum); parseErr == nil && numVal > 0 {
+			normalizedBID = fmt.Sprintf("Go-%04d", numVal)
+		}
+
+		filter = bson.M{
+			"$or": []bson.M{
+				{"bookingId": queryVal},
+				{"bookingId": normalizedBID},
+				{"bookingId": bson.M{"$regex": primitive.Regex{Pattern: "(?i)^" + regexp.QuoteMeta(queryVal) + "$", Options: ""}}},
+			},
+		}
+	}
+
+	var b models.Booking
+	err := config.Database.Collection("bookings").FindOne(ctx, filter).Decode(&b)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found with specified BID or ID"})
+		return
+	}
+
+	// Fetch Passenger
+	var p models.User
+	_ = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": b.PassengerID}).Decode(&p)
+
+	// Fetch Ride
+	var r models.Ride
+	_ = config.Database.Collection("rides").FindOne(ctx, bson.M{"_id": b.RideID}).Decode(&r)
+
+	// Fetch Driver
+	var d models.User
+	if !r.DriverID.IsZero() {
+		_ = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": r.DriverID}).Decode(&d)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":             b.ID.Hex(),
+		"bookingId":      b.BookingID,
+		"type":           b.Type,
+		"pickup":         b.Pickup,
+		"dropoff":        b.Dropoff,
+		"seatsRequested": b.SeatsRequested,
+		"seatLayout":     b.SeatLayout,
+		"roofCarrier":    b.RoofCarrier,
+		"motionSickness": b.MotionSickness,
+		"price":          b.Price,
+		"status":         b.Status,
+		"createdAt":      b.CreatedAt,
+		"completedAt":    b.CompletedAt,
+
+		"passenger": gin.H{
+			"id":    p.ID.Hex(),
+			"name":  p.Name,
+			"phone": p.PhoneNumber,
+		},
+		"driver": gin.H{
+			"id":            d.ID.Hex(),
+			"name":          r.DriverName,
+			"phone":         d.PhoneNumber,
+			"vehicleModel":  r.VehicleModel,
+			"vehicleNumber": r.VehicleNumber,
+		},
+		"ride": gin.H{
+			"id":            r.ID.Hex(),
+			"date":          r.Date,
+			"departureTime": r.DepartureTime,
+			"pickup":        r.Pickup,
+			"dropoff":       r.Dropoff,
+			"pricePerSeat":  r.PricePerSeat,
+			"status":        r.Status,
+		},
+		"parcel": gin.H{
+			"parcelSize":    b.ParcelSize,
+			"recipientName": b.RecipientName,
+			"contactNumber": b.ContactNumber,
+			"dropLocation":  b.DropLocation,
+			"notes":         b.Notes,
+			"photoUrl":      b.PhotoUrl,
+		},
+	})
 }
 
 func AdminDrivers(c *gin.Context) {

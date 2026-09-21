@@ -31,6 +31,47 @@ func InitializeRideCollection() {
 	bookingCollection = config.Database.Collection("bookings")
 	recentRoutesCollection = config.Database.Collection("recent_routes")
 	usersCollection = config.Database.Collection("users")
+
+	// Create sparse unique index for Booking ID (BID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = bookingCollection.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "bookingId", Value: 1}},
+		Options: options.Index().SetUnique(true).SetSparse(true),
+	})
+
+	BackfillBookingIDs()
+}
+
+func BackfillBookingIDs() {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		cursor, err := bookingCollection.Find(ctx, bson.M{
+			"status": "accepted",
+			"$or": []bson.M{
+				{"bookingId": ""},
+				{"bookingId": bson.M{"$exists": false}},
+			},
+		}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: 1}}))
+
+		if err != nil {
+			return
+		}
+		defer cursor.Close(ctx)
+
+		for cursor.Next(ctx) {
+			var b models.Booking
+			if err := cursor.Decode(&b); err == nil && b.BookingID == "" {
+				bid, err := utils.GenerateNextBookingID(ctx)
+				if err == nil && bid != "" {
+					_, _ = bookingCollection.UpdateOne(ctx, bson.M{"_id": b.ID}, bson.M{"$set": bson.M{"bookingId": bid}})
+					log.Printf("[BACKFILL BID] Assigned %s to existing accepted booking %s", bid, b.ID.Hex())
+				}
+			}
+		}
+	}()
 }
 
 func CreateRide(c *gin.Context) {
@@ -922,11 +963,20 @@ func UpdateBookingStatus(c *gin.Context) {
 		return
 	}
 
-	// Update status
+	// Update status & assign unique Booking ID (BID) if accepting
+	updateFields := bson.M{"status": body.Status}
+	if body.Status == "accepted" && booking.BookingID == "" {
+		newBID, errBID := utils.GenerateNextBookingID(c.Request.Context())
+		if errBID == nil && newBID != "" {
+			updateFields["bookingId"] = newBID
+			booking.BookingID = newBID
+		}
+	}
+
 	_, err = bookingCollection.UpdateOne(
 		dbCtx,
 		bson.M{"_id": bookingId},
-		bson.M{"$set": bson.M{"status": body.Status}},
+		bson.M{"$set": updateFields},
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update booking"})

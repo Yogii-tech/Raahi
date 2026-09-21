@@ -39,6 +39,7 @@ type Ride struct {
 
 type Booking struct {
 	ID                primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	BookingID         string             `bson:"bookingId,omitempty" json:"bookingId"`
 	RideID            primitive.ObjectID `bson:"rideId" json:"rideId"`
 	PassengerID       primitive.ObjectID `bson:"passengerId" json:"passengerId"`
 	Type              string             `bson:"type" json:"type"` // "seat" or "parcel"
