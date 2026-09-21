@@ -150,7 +150,6 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 				Sound:                 "default",
 				DefaultSound:         true,
 				DefaultVibrateTimings: true,
-				NotificationPriority: messaging.PriorityHigh,
 			},
 		},
 		APNS: &messaging.APNSConfig{
@@ -250,7 +249,6 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 				Sound:                 "default",
 				DefaultSound:         true,
 				DefaultVibrateTimings: true,
-				NotificationPriority: messaging.PriorityHigh,
 			},
 		},
 		APNS: &messaging.APNSConfig{
