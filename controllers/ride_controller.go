@@ -963,6 +963,34 @@ func UpdateBookingStatus(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: Keep seatsBooked counter in sync and prevent overbooking race conditions.
+	// When accepting, atomically increment seatsBooked ONLY if seatsBooked + requested <= seatsTotal.
+	if body.Status == "accepted" {
+		requestedSeats := booking.SeatsRequested
+		if requestedSeats < 1 {
+			requestedSeats = 1
+		}
+
+		rideUpdateRes, rideErr := rideCollection.UpdateOne(
+			dbCtx,
+			bson.M{
+				"_id": booking.RideID,
+				"$expr": bson.M{
+					"$lte": []interface{}{
+						bson.M{"$add": []interface{}{"$seatsBooked", requestedSeats}},
+						"$seatsTotal",
+					},
+				},
+			},
+			bson.M{"$inc": bson.M{"seatsBooked": requestedSeats}},
+		)
+
+		if rideErr != nil || rideUpdateRes.MatchedCount == 0 {
+			c.JSON(http.StatusConflict, gin.H{"error": "Cannot accept booking: ride capacity is full"})
+			return
+		}
+	}
+
 	// Update status & assign unique Booking ID (BID) if accepting
 	updateFields := bson.M{"status": body.Status}
 	if body.Status == "accepted" && booking.BookingID == "" {
@@ -979,30 +1007,22 @@ func UpdateBookingStatus(c *gin.Context) {
 		bson.M{"$set": updateFields},
 	)
 	if err != nil {
+		// Rollback seatsBooked if booking update failed
+		if body.Status == "accepted" {
+			requestedSeats := booking.SeatsRequested
+			if requestedSeats < 1 {
+				requestedSeats = 1
+			}
+			_, _ = rideCollection.UpdateOne(
+				dbCtx,
+				bson.M{"_id": booking.RideID},
+				bson.M{"$inc": bson.M{"seatsBooked": -requestedSeats}},
+			)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update booking"})
 		return
 	}
 
-	// Keep seatsBooked counter in sync: increment on accept, decrement on reject.
-	if body.Status == "accepted" {
-		rideCollection.UpdateOne(
-			dbCtx,
-			bson.M{"_id": booking.RideID},
-			bson.M{"$inc": bson.M{"seatsBooked": booking.SeatsRequested}},
-		)
-	} else if body.Status == "rejected" {
-		// Only decrement if the booking was previously accepted
-		var currentBooking models.Booking
-		if lookupErr := bookingCollection.FindOne(dbCtx, bson.M{"_id": bookingId}).Decode(&currentBooking); lookupErr == nil {
-			if currentBooking.Status == "accepted" {
-				rideCollection.UpdateOne(
-					dbCtx,
-					bson.M{"_id": booking.RideID},
-					bson.M{"$inc": bson.M{"seatsBooked": -booking.SeatsRequested}},
-				)
-			}
-		}
-	}
 
 	// Capture status before goroutine so the closure doesn't race on body
 	capturedStatus := body.Status

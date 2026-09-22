@@ -193,3 +193,53 @@ func PromoteAdmin(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "Successfully promoted to admin"})
 }
+
+func RefreshToken(c *gin.Context) {
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	_ = c.BindJSON(&body)
+
+	tokenStr := strings.TrimSpace(body.RefreshToken)
+	if tokenStr == "" {
+		// Fall back to Authorization header if not in JSON body
+		authHeader := c.GetHeader("Authorization")
+		parts := strings.Split(authHeader, " ")
+		if len(parts) == 2 && parts[0] == "Bearer" {
+			tokenStr = parts[1]
+		}
+	}
+
+	if tokenStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Refresh token is required"})
+		return
+	}
+
+	userId, tokenVersion, err := utils.ValidateJWTIgnoreExpiry(tokenStr)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format or signature"})
+		return
+	}
+
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	var user struct {
+		ID           primitive.ObjectID `bson:"_id"`
+		TokenVersion int                `bson:"token_version"`
+	}
+	err = userCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&user)
+	if err != nil || user.TokenVersion != tokenVersion {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Session revoked or user not found"})
+		return
+	}
+
+	newToken, err := utils.GenerateJWT(user.ID, user.TokenVersion)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate new session token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"token": newToken})
+}
+

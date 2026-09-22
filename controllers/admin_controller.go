@@ -284,42 +284,59 @@ func AdminReports(c *gin.Context) {
 		c.Header("Content-Disposition", `attachment; filename="revenue.csv"`)
 		c.String(http.StatusOK, "Route,Bookings,Revenue (₹)\n")
 
-		pipeline := mongo.Pipeline{
-			{{Key: "$match", Value: bson.M{"status": "accepted"}}},
-			{{Key: "$group", Value: bson.M{
-				"_id":   bson.M{"pickup": "$pickup", "dropoff": "$dropoff"},
-				"count": bson.M{"$sum": 1},
-				"total": bson.M{"$sum": bson.M{"$convert": bson.M{"input": "$price", "to": "double", "onError": 0, "onNull": 0}}},
-			}}},
+		cursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
+		var bookings []models.Booking
+		cursor.All(ctx, &bookings)
+
+		type routeAgg struct {
+			count int
+			total float64
 		}
-		cursor, _ := config.Database.Collection("bookings").Aggregate(ctx, pipeline)
-		var results []bson.M
-		cursor.All(ctx, &results)
-		for _, r := range results {
-			idMap := r["_id"].(primitive.M)
-			c.String(http.StatusOK, fmt.Sprintf("%s → %s,%v,%v\n", idMap["pickup"], idMap["dropoff"], r["count"], r["total"]))
+		routeMap := make(map[string]*routeAgg)
+		for _, b := range bookings {
+			routeKey := fmt.Sprintf("%s → %s", b.Pickup, b.Dropoff)
+			if _, exists := routeMap[routeKey]; !exists {
+				routeMap[routeKey] = &routeAgg{}
+			}
+			routeMap[routeKey].count++
+			routeMap[routeKey].total += parsePriceFloat(b.Price)
+		}
+
+		for routeKey, agg := range routeMap {
+			c.String(http.StatusOK, fmt.Sprintf("%s,%d,%.2f\n", sanitizeCSV(routeKey), agg.count, agg.total))
 		}
 	case "payouts":
 		c.Header("Content-Disposition", `attachment; filename="payouts.csv"`)
 		c.String(http.StatusOK, "DriverID,Status,TotalPayout (₹)\n")
 
-		pipeline := mongo.Pipeline{
-			{{Key: "$match", Value: bson.M{"status": "accepted"}}},
-			{{Key: "$group", Value: bson.M{
-				"_id":   "$rideId",
-				"total": bson.M{"$sum": bson.M{"$convert": bson.M{"input": "$price", "to": "double", "onError": 0, "onNull": 0}}},
-			}}},
+		cursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
+		var bookings []models.Booking
+		cursor.All(ctx, &bookings)
+
+		payoutMap := make(map[primitive.ObjectID]float64)
+		for _, b := range bookings {
+			payoutMap[b.RideID] += parsePriceFloat(b.Price)
 		}
-		cursor, _ := config.Database.Collection("bookings").Aggregate(ctx, pipeline)
-		var results []bson.M
-		cursor.All(ctx, &results)
-		for _, r := range results {
-			c.String(http.StatusOK, fmt.Sprintf("%s,Pending,%v\n", r["_id"].(primitive.ObjectID).Hex(), r["total"]))
+
+		for rideID, total := range payoutMap {
+			c.String(http.StatusOK, fmt.Sprintf("%s,Pending,%.2f\n", rideID.Hex(), total))
 		}
 	default:
 		c.String(http.StatusBadRequest, "Unknown report type")
 	}
 }
+
+var priceRegex = regexp.MustCompile(`[0-9]+(\.[0-9]+)?`)
+
+func parsePriceFloat(s string) float64 {
+	match := priceRegex.FindString(s)
+	if match == "" {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(match, 64)
+	return v
+}
+
 
 // sanitizeCSV prevents CSV injection attacks by escaping dangerous cell prefixes.
 // If a cell starts with =, +, -, @, tab, or carriage return, Excel may interpret

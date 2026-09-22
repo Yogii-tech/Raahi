@@ -62,3 +62,40 @@ func ValidateJWT(tokenString string) (primitive.ObjectID, int, error) {
 	version := int(claims["version"].(float64))
 	return userId, version, nil
 }
+
+// ValidateJWTIgnoreExpiry verifies token signature and extracts claims even if the token is expired.
+func ValidateJWTIgnoreExpiry(tokenString string) (primitive.ObjectID, int, error) {
+	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return getJwtSecret(), nil
+	}, jwt.WithoutClaimsValidation())
+
+	if err != nil || token == nil {
+		return primitive.NilObjectID, 0, errors.New("invalid token format or signature")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return primitive.NilObjectID, 0, errors.New("invalid claims")
+	}
+
+	userIdStr, ok := claims["userId"].(string)
+	if !ok || userIdStr == "" {
+		return primitive.NilObjectID, 0, errors.New("missing userId in claims")
+	}
+
+	userId, err := primitive.ObjectIDFromHex(userIdStr)
+	if err != nil {
+		return primitive.NilObjectID, 0, err
+	}
+
+	versionFloat, ok := claims["version"].(float64)
+	if !ok {
+		return primitive.NilObjectID, 0, errors.New("missing version in claims")
+	}
+
+	return userId, int(versionFloat), nil
+}
+

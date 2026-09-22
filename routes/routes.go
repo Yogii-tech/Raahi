@@ -17,8 +17,10 @@ func RegisterRoutes(r *gin.Engine) {
 		auth.POST("/firebase-verify", middleware.OTPRateLimiter(), controllers.VerifyFirebaseToken)
 		auth.POST("/otp/send", middleware.OTPRateLimiter(), controllers.VerifyFirebaseToken)
 		auth.POST("/otp/verify", middleware.OTPRateLimiter(), controllers.VerifyFirebaseToken)
+		auth.POST("/refresh", controllers.RefreshToken)
 		auth.POST("/promote-admin", middleware.AuthMiddleware(), controllers.PromoteAdmin)
 	}
+
 
 	rides := api.Group("/rides")
 	rides.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(60, 1*time.Minute))
