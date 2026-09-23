@@ -722,9 +722,18 @@ func BookRide(c *gin.Context) {
 				log.Printf("[FCM] Driver %s has no FCM token stored in DB", ride.DriverID.Hex())
 			} else {
 				title := "🚗 New Booking Request"
-				body := "A passenger wants to book your ride from " + booking.Pickup + " to " + booking.Dropoff
-				if booking.SeatsRequested > 1 {
-					body = fmt.Sprintf("A passenger requested %d seats on your ride from %s to %s", booking.SeatsRequested, booking.Pickup, booking.Dropoff)
+				numSeats := booking.SeatsRequested
+				if numSeats <= 0 && len(booking.SeatLayout) > 0 {
+					numSeats = len(booking.SeatLayout)
+				}
+				if numSeats <= 0 {
+					numSeats = 1
+				}
+				var body string
+				if numSeats > 1 {
+					body = fmt.Sprintf("A passenger requested %d seats on your ride from %s to %s", numSeats, booking.Pickup, booking.Dropoff)
+				} else {
+					body = fmt.Sprintf("A passenger requested 1 seat on your ride from %s to %s", booking.Pickup, booking.Dropoff)
 				}
 				if bookingType == "parcel" {
 					title = "📦 New Parcel Request"
