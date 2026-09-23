@@ -665,6 +665,20 @@ func BookRide(c *gin.Context) {
 		takenMap[seat] = true
 	}
 
+	// SECURITY: Prevent same passenger from booking the same ride twice (seat rides only)
+	if body.Type != "parcel" {
+		existingCount, _ := bookingCollection.CountDocuments(checkCtx, bson.M{
+			"rideId":      rideId,
+			"passengerId": passengerId,
+			"type":        "seat",
+			"status":      bson.M{"$in": []string{"pending", "accepted"}},
+		})
+		if existingCount > 0 {
+			c.JSON(http.StatusConflict, gin.H{"error": "You already have an active booking for this ride. Check your notifications for the status."})
+			return
+		}
+	}
+
 	for _, requestedSeat := range body.SeatLayout {
 		if takenMap[requestedSeat] {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Seat %d is already taken or pending approval", requestedSeat+1)})

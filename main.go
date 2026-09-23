@@ -52,6 +52,7 @@ func main() {
 	controllers.InitializeUserController()
 	controllers.InitializeChatCollection()
 	controllers.InitializeNotificationCollection()
+	controllers.InitializeReviewCollection()
 
 	// Always run in release mode unless explicitly in development
 	if isDev {

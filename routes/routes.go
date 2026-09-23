@@ -80,6 +80,14 @@ func RegisterRoutes(r *gin.Engine) {
 		chat.POST("/:bookingId/read", controllers.MarkMessagesRead)
 	}
 
+	reviews := api.Group("/reviews")
+	reviews.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(20, 1*time.Minute))
+	{
+		reviews.POST("/", controllers.SubmitReview)
+		reviews.GET("/driver/:driverId", controllers.GetDriverReviews)
+		reviews.GET("/can-review/:rideId", controllers.CheckCanReview)
+	}
+
 	admin := api.Group("/admin")
 	admin.Use(middleware.AuthMiddleware(), middleware.AdminOnlyMiddleware(), middleware.GlobalRateLimiter(30, 1*time.Minute))
 	{
@@ -96,5 +104,6 @@ func RegisterRoutes(r *gin.Engine) {
 		admin.DELETE("/users/incomplete", controllers.AdminCleanupIncompleteUsers)
 		admin.POST("/users/cleanup-incomplete", controllers.AdminCleanupIncompleteUsers)
 		admin.GET("/reports/:type", controllers.AdminReports)
+		admin.GET("/reviews/driver/:driverId", controllers.GetDriverReviews)
 	}
 }
