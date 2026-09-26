@@ -183,7 +183,13 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 				Badge:              "/logo192.png",
 			},
 			FCMOptions: &messaging.WebpushFCMOptions{
-				Link: "/",
+				// Use the url from the data payload for deep-linking, fall back to root
+				Link: func() string {
+					if u, ok := data["url"]; ok && u != "" {
+						return u
+					}
+					return "/"
+				}(),
 			},
 		},
 	}

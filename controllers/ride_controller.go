@@ -757,7 +757,16 @@ func BookRide(c *gin.Context) {
 					body = "A new parcel pickup request has been received."
 				}
 				log.Printf("[FCM] Sending booking request push to driver %s...", ride.DriverID.Hex())
-				CreateNotification(ride.DriverID, title, body, "booking_request", result.InsertedID.(primitive.ObjectID).Hex())
+				// Pass rich data so the SW notification shows full ride details and
+				// tapping it deep-links straight into the requests overlay.
+				bookingObjectId := result.InsertedID.(primitive.ObjectID)
+				CreateNotification(ride.DriverID, title, body, "booking_request", bookingObjectId.Hex(), map[string]string{
+					"bookingId": bookingObjectId.Hex(),
+					"rideId":    rideId.Hex(),
+					"pickup":    booking.Pickup,
+					"dropoff":   booking.Dropoff,
+					"url":       "/?openRequests=true",
+				})
 			}
 		} else {
 			log.Printf("[FCM] Ride lookup error for ride %s: %v", rideId.Hex(), err)
@@ -1072,7 +1081,10 @@ func UpdateBookingStatus(c *gin.Context) {
 			}
 		}
 		log.Printf("[FCM] Creating booking status notification & push for passenger %s...", booking.PassengerID.Hex())
-		CreateNotification(booking.PassengerID, pushTitle, pushBody, "booking_status", bookingId.Hex())
+		CreateNotification(booking.PassengerID, pushTitle, pushBody, "booking_status", bookingId.Hex(), map[string]string{
+			"bookingId": bookingId.Hex(),
+			"url":       "/?openTrips=true",
+		})
 	}()
 
 	c.JSON(http.StatusOK, gin.H{"message": "Booking status updated"})
@@ -1316,7 +1328,7 @@ func CompleteRide(c *gin.Context) {
 		pid := passengerID // capture loop var
 		go CreateNotification(pid, "🏁 Ride Completed!",
 			"Your ride from "+ride.Pickup+" to "+ride.Dropoff+" is complete. Tap to rate your experience.",
-			"ride_completed", rideId.Hex())
+			"ride_completed", rideId.Hex(), nil)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Ride completed successfully"})
@@ -1374,7 +1386,7 @@ func StartRide(c *gin.Context) {
 					notifiedPassengers[b.PassengerID] = true
 					go CreateNotification(b.PassengerID, "🚀 Your Ride Has Started!",
 						"Your ride from "+ridePickup+" to "+rideDropoff+" is now on the way!",
-						"ride_started", startedRideId.Hex())
+						"ride_started", startedRideId.Hex(), nil)
 				}
 			}
 		}

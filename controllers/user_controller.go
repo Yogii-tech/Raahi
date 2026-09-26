@@ -149,6 +149,7 @@ func UpdateProfile(c *gin.Context) {
 			"Your vehicle documents have been submitted and are under review. You will be notified once the admin approves or rejects your application.",
 			"document_verification",
 			"",
+			nil,
 		)
 		
 		go NotifyAdmins(
@@ -163,6 +164,7 @@ func UpdateProfile(c *gin.Context) {
 			"Your vehicle documents have been resubmitted and are under review.",
 			"document_verification",
 			"",
+			nil,
 		)
 		
 		go NotifyAdmins(

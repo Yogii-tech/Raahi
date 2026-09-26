@@ -24,7 +24,9 @@ func InitializeNotificationCollection() {
 }
 
 // CreateNotification stores a notification in DB and sends an FCM push to the user's device.
-func CreateNotification(userId primitive.ObjectID, title, message, notifType, relatedId string) error {
+// extraData is an optional map of additional key-value pairs forwarded into the FCM data payload
+// (e.g. bookingId, pickup, dropoff, rideId). Pass nil if not needed.
+func CreateNotification(userId primitive.ObjectID, title, message, notifType, relatedId string, extraData map[string]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -62,10 +64,15 @@ func CreateNotification(userId primitive.ObjectID, title, message, notifType, re
 			FCMToken string `bson:"fcm_token"`
 		}
 		if e := config.Database.Collection("users").FindOne(tokenCtx, bson.M{"_id": userId}).Decode(&user); e == nil && user.FCMToken != "" {
-			utils.SendPushNotification(user.FCMToken, title, message, map[string]string{
-				"type": notifType,
+			// Build data payload: start with base fields, then overlay extraData
+			data := map[string]string{
+				"type":      notifType,
 				"relatedId": relatedId,
-			})
+			}
+			for k, v := range extraData {
+				data[k] = v
+			}
+			utils.SendPushNotification(user.FCMToken, title, message, data)
 		}
 	}()
 
@@ -92,7 +99,7 @@ func NotifyAdmins(title, message, notifType string) {
 		if err := cursor.Decode(&admin); err == nil {
 			// CreateNotification stores the DB record AND fires an FCM push internally.
 			// Do NOT also call SendMulticastPush here — that would send a duplicate notification.
-			CreateNotification(admin.ID, title, message, notifType, "")
+			CreateNotification(admin.ID, title, message, notifType, "", nil)
 		}
 	}
 }

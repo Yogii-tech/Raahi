@@ -153,7 +153,7 @@ func SendMessage(c *gin.Context) {
 	if len(notifText) > 40 {
 		notifText = notifText[:37] + "..."
 	}
-	CreateNotification(recipientID, "New Message", "💬 "+notifText, "chat", bookingIDHex)
+	CreateNotification(recipientID, "New Message", "💬 "+notifText, "chat", bookingIDHex, nil)
 
 	c.JSON(http.StatusCreated, msg)
 }
