@@ -84,8 +84,9 @@ func RegisterRoutes(r *gin.Engine) {
 	// Higher group limit so GET /can-review checks don't exhaust the quota before the POST fires
 	reviews.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(60, 1*time.Minute))
 	{
-		// Tighter per-user limit on submit to prevent spam (5 submissions per minute)
-		reviews.POST("/", middleware.GlobalRateLimiter(5, 1*time.Minute), controllers.SubmitReview)
+		// Tighter per-user limit on submit to prevent spam (5 submissions per minute).
+		// Uses a distinct label so GET /can-review calls don't burn the POST budget.
+		reviews.POST("/", middleware.GlobalRateLimiter(5, 1*time.Minute, "reviews:submit"), controllers.SubmitReview)
 		reviews.GET("/driver/:driverId", controllers.GetDriverReviews)
 		reviews.GET("/can-review/:rideId", controllers.CheckCanReview)
 	}

@@ -198,13 +198,21 @@ func init() {
 // GlobalRateLimiter limits authenticated users to maxRequests per window.
 // It keys on the "userId" set by AuthMiddleware. If userId is not set
 // (unauthenticated route), it falls back to client IP.
-func GlobalRateLimiter(maxRequests int, window time.Duration) gin.HandlerFunc {
+// label is an optional suffix appended to the bucket key so that multiple
+// stacked GlobalRateLimiter instances on the same route don't share a bucket.
+// Pass an empty string "" to use the default key (backward compatible).
+func GlobalRateLimiter(maxRequests int, window time.Duration, label ...string) gin.HandlerFunc {
+	suffix := ""
+	if len(label) > 0 && label[0] != "" {
+		suffix = ":" + label[0]
+	}
 	return func(c *gin.Context) {
 		// Prefer userId (set by AuthMiddleware); fall back to IP
-		key := c.ClientIP()
+		base := c.ClientIP()
 		if uid, exists := c.Get("userId"); exists {
-			key = "user:" + uid.(interface{ Hex() string }).Hex()
+			base = "user:" + uid.(interface{ Hex() string }).Hex()
 		}
+		key := base + suffix
 
 		now := time.Now()
 		cutoff := now.Add(-window)
