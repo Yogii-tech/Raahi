@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	firebase "firebase.google.com/go/v4"
@@ -14,6 +15,26 @@ import (
 	"google.golang.org/api/option"
 	"raahi-backend/config"
 )
+
+// webAppURL returns the canonical HTTPS origin of the GoRaahi web app.
+// It reads WEB_APP_URL from the environment (set in Cloud Run / .env).
+// Falls back to https://goraahi.in so existing deployments need no change.
+func webAppURL() string {
+	u := strings.TrimRight(os.Getenv("WEB_APP_URL"), "/")
+	if u == "" {
+		u = "https://goraahi.in"
+	}
+	return u
+}
+
+// absURL converts a relative path (e.g. "/logo192.png") to an absolute URL
+// using webAppURL() as the base. Absolute URLs are returned unchanged.
+func absURL(path string) string {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return path
+	}
+	return webAppURL() + "/" + strings.TrimLeft(path, "/")
+}
 
 var fcmClient *messaging.Client
 var firebaseAuthClient *auth.Client
@@ -179,16 +200,20 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 				Title:              title,
 				Body:               body,
 				RequireInteraction: true,
-				Icon:               "/logo192.png",
-				Badge:              "/logo192.png",
+				// Icon and Badge MUST be absolute HTTPS URLs — the OS fetches them
+				// directly to display on the lock-screen notification tile.
+				Icon:               absURL("/logo192.png"),
+				Badge:              absURL("/logo192.png"),
 			},
 			FCMOptions: &messaging.WebpushFCMOptions{
-				// Use the url from the data payload for deep-linking, fall back to root
+				// FCMOptions.Link MUST be an absolute HTTPS URL.
+				// Chrome silently drops web push messages that have a relative
+				// or missing link, so the lock-screen notification never appears.
 				Link: func() string {
 					if u, ok := data["url"]; ok && u != "" {
-						return u
+						return absURL(u)
 					}
-					return "/"
+					return webAppURL()
 				}(),
 			},
 		},
@@ -284,11 +309,13 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 				Title:              title,
 				Body:               body,
 				RequireInteraction: true,
-				Icon:               "/logo192.png",
-				Badge:              "/logo192.png",
+				// Must be absolute HTTPS URLs — relative paths are rejected by Chrome.
+				Icon:               absURL("/logo192.png"),
+				Badge:              absURL("/logo192.png"),
 			},
 			FCMOptions: &messaging.WebpushFCMOptions{
-				Link: "/",
+				// Must be an absolute HTTPS URL for Chrome to accept the push.
+				Link: webAppURL(),
 			},
 		},
 	}
