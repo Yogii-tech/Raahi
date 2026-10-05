@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"time"
 
@@ -55,24 +54,28 @@ func CreateNotification(userId primitive.ObjectID, title, message, notifType, re
 	}
 	_, err = notificationCollection.InsertOne(ctx, notif)
 
-	// Fetch user's FCM token and send push notification (fire-and-forget)
+	// Fetch user's FCM tokens and send push notification to all user devices (fire-and-forget)
 	go func() {
 		tokenCtx, tokenCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer tokenCancel()
 
 		var user struct {
-			FCMToken string `bson:"fcm_token"`
+			FCMToken  string   `bson:"fcm_token"`
+			FCMTokens []string `bson:"fcm_tokens"`
 		}
-		if e := config.Database.Collection("users").FindOne(tokenCtx, bson.M{"_id": userId}).Decode(&user); e == nil && user.FCMToken != "" {
-			// Build data payload: start with base fields, then overlay extraData
-			data := map[string]string{
-				"type":      notifType,
-				"relatedId": relatedId,
+		if e := config.Database.Collection("users").FindOne(tokenCtx, bson.M{"_id": userId}).Decode(&user); e == nil {
+			tokens := utils.CollectTokens(user.FCMToken, user.FCMTokens)
+			if len(tokens) > 0 {
+				// Build data payload: start with base fields, then overlay extraData
+				data := map[string]string{
+					"type":      notifType,
+					"relatedId": relatedId,
+				}
+				for k, v := range extraData {
+					data[k] = v
+				}
+				utils.SendPushToTokens(tokens, title, message, data)
 			}
-			for k, v := range extraData {
-				data[k] = v
-			}
-			utils.SendPushNotification(user.FCMToken, title, message, data)
 		}
 	}()
 
@@ -178,7 +181,7 @@ func ClearAllNotifications(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "All notifications cleared"})
 }
 
-// TestPushNotification triggers a test FCM push notification to the logged in user
+// TestPushNotification triggers a test FCM push notification to all logged in devices of the user
 func TestPushNotification(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
@@ -186,21 +189,19 @@ func TestPushNotification(c *gin.Context) {
 	defer tokenCancel()
 
 	var user struct {
-		FCMToken string `bson:"fcm_token"`
+		FCMToken  string   `bson:"fcm_token"`
+		FCMTokens []string `bson:"fcm_tokens"`
 	}
 	err := config.Database.Collection("users").FindOne(tokenCtx, bson.M{"_id": userId}).Decode(&user)
-	if err != nil || user.FCMToken == "" {
+	tokens := utils.CollectTokens(user.FCMToken, user.FCMTokens)
+	if err != nil || len(tokens) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No FCM token stored for this user in DB. Log out and log back in."})
 		return
 	}
 
-	sendErr := utils.SendPushNotification(user.FCMToken, "🔔 GoRaahi Test Notification", "If you see this banner, FCM Push Notifications are working 100%!", map[string]string{
+	utils.SendPushToTokens(tokens, "🔔 GoRaahi Test Notification", "If you see this banner, FCM Push Notifications are working 100%!", map[string]string{
 		"type": "test",
 	})
-	if sendErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("FCM push failed: %v", sendErr)})
-		return
-	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Test push notification sent successfully!"})
 }

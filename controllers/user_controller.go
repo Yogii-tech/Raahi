@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"raahi-backend/config"
@@ -215,6 +216,7 @@ func Logout(c *gin.Context) {
 
 // UpdateFCMToken stores or refreshes the user's FCM device push token in the database.
 // Called by the app after login and whenever the FCM token is refreshed.
+// Uses $addToSet to maintain all active device tokens for multi-device push.
 func UpdateFCMToken(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
@@ -226,13 +228,22 @@ func UpdateFCMToken(c *gin.Context) {
 		return
 	}
 
+	token := strings.TrimSpace(body.FCMToken)
+	if token == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "fcmToken cannot be empty"})
+		return
+	}
+
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
 	_, err := userProfileCollection.UpdateOne(
 		dbCtx,
 		bson.M{"_id": userId},
-		bson.M{"$set": bson.M{"fcm_token": body.FCMToken}},
+		bson.M{
+			"$set":      bson.M{"fcm_token": token},
+			"$addToSet": bson.M{"fcm_tokens": token},
+		},
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update FCM token"})
@@ -241,4 +252,39 @@ func UpdateFCMToken(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "FCM token updated"})
 }
+
+// RemoveFCMToken removes a specific FCM device push token (e.g. on logout).
+func RemoveFCMToken(c *gin.Context) {
+	userId := c.MustGet("userId").(primitive.ObjectID)
+
+	var body struct {
+		FCMToken string `json:"fcmToken"`
+	}
+	_ = c.BindJSON(&body)
+
+	token := strings.TrimSpace(body.FCMToken)
+
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	var update bson.M
+	if token != "" {
+		update = bson.M{
+			"$pull": bson.M{"fcm_tokens": token},
+		}
+	} else {
+		update = bson.M{
+			"$unset": bson.M{"fcm_token": "", "fcm_tokens": ""},
+		}
+	}
+
+	_, err := userProfileCollection.UpdateOne(dbCtx, bson.M{"_id": userId}, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove FCM token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "FCM token removed"})
+}
+
 

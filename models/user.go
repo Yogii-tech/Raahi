@@ -38,5 +38,7 @@ type User struct {
 	SubmittedAt        time.Time          `bson:"submitted_at,omitempty" json:"submitted_at"`
 	Vehicle            *Vehicle           `bson:"vehicle,omitempty" json:"vehicle"`
 	TokenVersion       int                `bson:"token_version" json:"-"`
-	FCMToken           string             `bson:"fcm_token,omitempty" json:"-"` // device push token — never expose to clients
+	FCMToken           string             `bson:"fcm_token,omitempty" json:"-"`  // legacy single device push token
+	FCMTokens          []string           `bson:"fcm_tokens,omitempty" json:"-"` // all active device push tokens
 }
+

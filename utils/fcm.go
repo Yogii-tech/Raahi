@@ -124,7 +124,40 @@ func GetFirebaseAuth() *auth.Client {
 	return firebaseAuthClient
 }
 
-// removeFCMToken cleans up stale tokens from the database when a user uninstalls the app
+// CollectTokens takes a legacy single token string and a slice of token strings,
+// and returns a deduplicated list of non-empty tokens.
+func CollectTokens(legacyToken string, tokenList []string) []string {
+	seen := make(map[string]bool)
+	var result []string
+	if strings.TrimSpace(legacyToken) != "" {
+		t := strings.TrimSpace(legacyToken)
+		seen[t] = true
+		result = append(result, t)
+	}
+	for _, t := range tokenList {
+		t = strings.TrimSpace(t)
+		if t != "" && !seen[t] {
+			seen[t] = true
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
+// SendPushToTokens sends a push notification to one or multiple FCM device tokens.
+func SendPushToTokens(tokens []string, title, body string, data map[string]string) {
+	validTokens := CollectTokens("", tokens)
+	if len(validTokens) == 0 {
+		return
+	}
+	if len(validTokens) == 1 {
+		_ = SendPushNotification(validTokens[0], title, body, data)
+	} else {
+		SendMulticastPush(validTokens, title, body, data)
+	}
+}
+
+// removeFCMToken cleans up stale tokens from the database when a user uninstalls the app or token expires
 func removeFCMToken(token string) {
 	if config.Database == nil {
 		return
@@ -134,8 +167,14 @@ func removeFCMToken(token string) {
 
 	_, err := config.Database.Collection("users").UpdateMany(
 		ctx,
-		bson.M{"fcm_token": token},
-		bson.M{"$unset": bson.M{"fcm_token": ""}},
+		bson.M{"$or": []bson.M{
+			{"fcm_token": token},
+			{"fcm_tokens": token},
+		}},
+		bson.M{
+			"$unset": bson.M{"fcm_token": ""},
+			"$pull":  bson.M{"fcm_tokens": token},
+		},
 	)
 	if err != nil {
 		log.Printf("[FCM] Failed to remove stale token from DB: %v", err)
@@ -314,8 +353,12 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 				Badge:              absURL("/logo192.png"),
 			},
 			FCMOptions: &messaging.WebpushFCMOptions{
-				// Must be an absolute HTTPS URL for Chrome to accept the push.
-				Link: webAppURL(),
+				Link: func() string {
+					if u, ok := data["url"]; ok && u != "" {
+						return absURL(u)
+					}
+					return webAppURL()
+				}(),
 			},
 		},
 	}
@@ -347,8 +390,14 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 
 				_, cleanupErr := config.Database.Collection("users").UpdateMany(
 					ctxCleanup,
-					bson.M{"fcm_token": bson.M{"$in": tokensToRemove}},
-					bson.M{"$unset": bson.M{"fcm_token": ""}},
+					bson.M{"$or": []bson.M{
+						{"fcm_token": bson.M{"$in": tokensToRemove}},
+						{"fcm_tokens": bson.M{"$in": tokensToRemove}},
+					}},
+					bson.M{
+						"$unset": bson.M{"fcm_token": ""},
+						"$pull":  bson.M{"fcm_tokens": bson.M{"$in": tokensToRemove}},
+					},
 				)
 				if cleanupErr != nil {
 					log.Printf("[FCM] Failed to bulk remove stale tokens: %v", cleanupErr)

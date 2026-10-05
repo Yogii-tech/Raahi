@@ -729,14 +729,16 @@ func BookRide(c *gin.Context) {
 		var ride models.Ride
 		if err := rideCollection.FindOne(fcmCtx, bson.M{"_id": rideId}).Decode(&ride); err == nil {
 			var driver struct {
-				FCMToken string `bson:"fcm_token"`
-				Name     string `bson:"name"`
+				FCMToken  string   `bson:"fcm_token"`
+				FCMTokens []string `bson:"fcm_tokens"`
+				Name      string   `bson:"name"`
 			}
 			err2 := usersCollection.FindOne(fcmCtx, bson.M{"_id": ride.DriverID}).Decode(&driver)
+			driverTokens := utils.CollectTokens(driver.FCMToken, driver.FCMTokens)
 			if err2 != nil {
 				log.Printf("[FCM] Driver lookup error for ride %s (DriverID %s): %v", rideId.Hex(), ride.DriverID.Hex(), err2)
-			} else if driver.FCMToken == "" {
-				log.Printf("[FCM] Driver %s has no FCM token stored in DB", ride.DriverID.Hex())
+			} else if len(driverTokens) == 0 {
+				log.Printf("[FCM] Driver %s has no FCM tokens stored in DB", ride.DriverID.Hex())
 			} else {
 				title := "🚗 New Booking Request"
 				numSeats := booking.SeatsRequested
