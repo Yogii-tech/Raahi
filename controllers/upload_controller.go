@@ -129,9 +129,12 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
+	scheme := "https"
+	fwdProto := strings.ToLower(strings.TrimSpace(strings.Split(c.GetHeader("X-Forwarded-Proto"), ",")[0]))
+	host := c.Request.Host
+	isLocal := strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1")
+	if c.Request.TLS == nil && fwdProto != "https" && isLocal {
+		scheme = "http"
 	}
 	fileURL := fmt.Sprintf("%s://%s/uploads/%s", scheme, c.Request.Host, safeFilename)
 
