@@ -138,23 +138,38 @@ func CreateRide(c *gin.Context) {
 		return
 	}
 
-	delCtx, delCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	delCtx, delCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer delCancel()
 
-	// Delete existing rides for this driver to keep it clean
-	_, err = rideCollection.DeleteMany(delCtx, bson.M{"driverId": userId, "status": "available"})
-	if err != nil {
+	// Replace this driver's previous open rides WITHOUT orphaning passenger bookings.
+	// (Previously this hard-deleted every "available" ride, leaving booked passengers
+	// pointing at a ride that no longer existed.)
+	if err := retireOpenRides(delCtx, userId); err != nil {
+		log.Printf("[CreateRide] Failed to retire previous rides for driver %s: %v", userId.Hex(), err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset available rides"})
 		return
 	}
 
-	// --- AUTO-DISCOVER INTERMEDIATE STOPS FROM MAPS ---
+	// Build final route array starting with pickup and including user-entered intermediate stops
+	route := []string{body.Pickup}
+	seenStops := make(map[string]bool)
+	seenStops[strings.ToLower(strings.TrimSpace(body.Pickup))] = true
+
+	// Add driver's manually specified route stops (if provided)
+	for _, s := range body.Route {
+		sClean := strings.ToLower(strings.TrimSpace(s))
+		if sClean != "" && !seenStops[sClean] {
+			seenStops[sClean] = true
+			route = append(route, s)
+		}
+	}
+
+	// --- AUTO-DISCOVER INTERMEDIATE STOPS FROM MAPS (NON-BLOCKING TIMEOUT) ---
 	var discoveredStops []models.StopInfo
 	var routeCoords [][]float64
 	var totalDistM float64
-	var routeNames []string
 
-	// Geocode pickup and dropoff in parallel
+	// Quick non-blocking attempt (max 1.5s) to avoid hanging ride creation if external map APIs are slow
 	type geoRes struct {
 		lat, lon float64
 		err      error
@@ -171,45 +186,40 @@ func CreateRide(c *gin.Context) {
 		dChan <- geoRes{lat, lon, err}
 	}()
 
-	pRes, dRes := <-pChan, <-dChan
-	startLat, startLon, geoErr1 := pRes.lat, pRes.lon, pRes.err
-	endLat, endLon, geoErr2 := dRes.lat, dRes.lon, dRes.err
-
-	if geoErr1 == nil && geoErr2 == nil {
-		// Discover intermediate villages/towns from maps
-		log.Printf("Discovering intermediate stops for: %s → %s", body.Pickup, body.Dropoff)
-		stops, coords, dist, discErr := utils.DiscoverIntermediateStops(startLat, startLon, endLat, endLon, 3.0)
-		if discErr == nil && len(stops) > 0 {
-			discoveredStops = stops
-			routeCoords = make([][]float64, len(coords))
-			for i, c := range coords {
-				routeCoords[i] = []float64{c[0], c[1]}
+	select {
+	case pRes := <-pChan:
+		select {
+		case dRes := <-dChan:
+			if pRes.err == nil && dRes.err == nil {
+				stops, coords, dist, discErr := utils.DiscoverIntermediateStops(pRes.lat, pRes.lon, dRes.lat, dRes.lon, 3.0)
+				if discErr == nil && len(stops) > 0 {
+					discoveredStops = stops
+					routeCoords = make([][]float64, len(coords))
+					for i, c := range coords {
+						routeCoords[i] = []float64{c[0], c[1]}
+					}
+					totalDistM = dist
+					for _, s := range stops {
+						sClean := strings.ToLower(strings.TrimSpace(s.Name))
+						if sClean != "" && !seenStops[sClean] {
+							seenStops[sClean] = true
+							// Insert before dropoff
+							route = append(route, s.Name)
+						}
+					}
+				}
 			}
-			totalDistM = dist
-			// Build route names from discovered stops
-			for _, s := range stops {
-				routeNames = append(routeNames, s.Name)
-			}
-			log.Printf("Discovered %d intermediate stops: %v", len(stops), routeNames)
-		} else {
-			log.Printf("Stop discovery warning: %v (found %d stops)", discErr, len(stops))
+		case <-time.After(1500 * time.Millisecond):
+			log.Printf("[CreateRide] Map geocoding timed out softly — proceeding with text route")
 		}
-	} else {
-		log.Printf("Geocoding failed for ride: pickup=%v, dropoff=%v", geoErr1, geoErr2)
+	case <-time.After(1500 * time.Millisecond):
+		log.Printf("[CreateRide] Map geocoding timed out softly — proceeding with text route")
 	}
 
-	// Build final route array for matching
-	route := []string{body.Pickup} // Always start with what the user typed
-	for _, s := range routeNames {
-		// Avoid exact duplicates (case-insensitive) if discovery found the same name
-		sClean := strings.ToLower(strings.TrimSpace(s))
-		if sClean != strings.ToLower(strings.TrimSpace(body.Pickup)) &&
-			sClean != strings.ToLower(strings.TrimSpace(body.Dropoff)) &&
-			sClean != "" {
-			route = append(route, s)
-		}
+	sDropClean := strings.ToLower(strings.TrimSpace(body.Dropoff))
+	if !seenStops[sDropClean] {
+		route = append(route, body.Dropoff) // Always end with dropoff
 	}
-	route = append(route, body.Dropoff) // Always end with what the user typed
 
 	ride := models.Ride{
 		DriverID:        userId,
@@ -342,15 +352,33 @@ func segmentsOverlap(p1, d1, p2, d2 string, route []string) bool {
 }
 
 func getTakenSeats(ctx context.Context, ride models.Ride, searchPickup, searchDropoff string) []int {
-	cursor, err := bookingCollection.Find(ctx, bson.M{
-		"rideId": ride.ID,
-		"status": bson.M{"$in": []string{"pending", "accepted"}},
-	})
+	taken, err := queryTakenSeats(ctx, ride, searchPickup, searchDropoff, primitive.NilObjectID)
 	if err != nil {
 		return []int{}
 	}
+	return taken
+}
+
+// queryTakenSeats returns the seats taken on a ride (optionally for a segment),
+// ignoring the booking with excludeID (pass NilObjectID to ignore none).
+// Unlike getTakenSeats it reports DB errors, so callers that must be strict
+// (booking verification) can fail safely.
+func queryTakenSeats(ctx context.Context, ride models.Ride, searchPickup, searchDropoff string, excludeID primitive.ObjectID) ([]int, error) {
+	filter := bson.M{
+		"rideId": ride.ID,
+		"status": bson.M{"$in": []string{"pending", "accepted"}},
+	}
+	if !excludeID.IsZero() {
+		filter["_id"] = bson.M{"$ne": excludeID}
+	}
+	cursor, err := bookingCollection.Find(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
 	var bookings []models.Booking
-	cursor.All(ctx, &bookings)
+	if err := cursor.All(ctx, &bookings); err != nil {
+		return nil, err
+	}
 
 	takenMap := make(map[int]bool)
 	for _, b := range bookings {
@@ -388,7 +416,7 @@ func getTakenSeats(ctx context.Context, ride models.Ride, searchPickup, searchDr
 		}
 	}
 
-	return taken
+	return taken, nil
 }
 
 func GetAvailableRides(c *gin.Context) {
@@ -657,6 +685,10 @@ func BookRide(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You cannot book your own ride"})
 		return
 	}
+	if rideForCheck.Status != "available" {
+		c.JSON(http.StatusConflict, gin.H{"error": "This ride is no longer accepting bookings"})
+		return
+	}
 
 	// Verify that requested seats are not already taken or pending approval
 	takenSeats := getTakenSeats(checkCtx, rideForCheck, body.Pickup, body.Dropoff)
@@ -714,6 +746,24 @@ func BookRide(c *gin.Context) {
 	result, err := bookingCollection.InsertOne(dbCtx, booking)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store booking"})
+		return
+	}
+
+	// CONCURRENCY: The availability checks above ran BEFORE the insert, so two
+	// simultaneous requests for the same seat could both pass them. Re-verify now
+	// that our booking is persisted; if it conflicts, roll it back.
+	newBookingID, _ := result.InsertedID.(primitive.ObjectID)
+	conflictMsg, verifyErr := verifyNewBooking(dbCtx, rideId, newBookingID, passengerId, bookingType, body.Pickup, body.Dropoff, body.SeatLayout)
+	if verifyErr != nil || conflictMsg != "" {
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, _ = bookingCollection.DeleteOne(rbCtx, bson.M{"_id": newBookingID})
+		rbCancel()
+		if verifyErr != nil {
+			log.Printf("[BookRide] Verification failed for booking %s: %v", newBookingID.Hex(), verifyErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to confirm booking. Please try again."})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": conflictMsg})
 		return
 	}
 
@@ -803,6 +853,11 @@ func GetDriverRequests(c *gin.Context) {
 		rideIds = append(rideIds, ride.ID)
 		rideMap[ride.ID] = ride
 	}
+	if len(rideIds) == 0 {
+		// A nil slice encodes as BSON null and "$in" would error — no rides means no requests.
+		c.JSON(http.StatusOK, []interface{}{})
+		return
+	}
 
 	// Filter bookings for those rideIds (newest first)
 	opts := options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}})
@@ -826,10 +881,34 @@ func GetDriverRequests(c *gin.Context) {
 		Ride           models.Ride `json:"ride"`
 	}
 
+	// PERF: Load all passengers in ONE query instead of one query per booking (N+1).
+	passengerIDs := make([]primitive.ObjectID, 0, len(bookings))
+	seenPassenger := make(map[primitive.ObjectID]bool, len(bookings))
+	for _, b := range bookings {
+		if !seenPassenger[b.PassengerID] {
+			seenPassenger[b.PassengerID] = true
+			passengerIDs = append(passengerIDs, b.PassengerID)
+		}
+	}
+	passengerMap := make(map[primitive.ObjectID]models.User, len(passengerIDs))
+	if len(passengerIDs) > 0 {
+		pCursor, pErr := usersCollection.Find(dbCtx,
+			bson.M{"_id": bson.M{"$in": passengerIDs}},
+			options.Find().SetProjection(bson.M{"name": 1, "phone_number": 1}),
+		)
+		if pErr == nil {
+			var passengers []models.User
+			if err := pCursor.All(dbCtx, &passengers); err == nil {
+				for _, p := range passengers {
+					passengerMap[p.ID] = p
+				}
+			}
+		}
+	}
+
 	var enriched []EnrichedBooking
 	for _, b := range bookings {
-		var passenger models.User
-		_ = usersCollection.FindOne(dbCtx, bson.M{"_id": b.PassengerID}).Decode(&passenger)
+		passenger := passengerMap[b.PassengerID]
 		ride := rideMap[b.RideID]
 		enriched = append(enriched, EnrichedBooking{
 			Booking:        b,
@@ -989,6 +1068,10 @@ func UpdateBookingStatus(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized"})
 		return
 	}
+	if body.Status == "accepted" && (ride.Status == "cancelled" || ride.Status == "completed") {
+		c.JSON(http.StatusConflict, gin.H{"error": "Cannot accept a booking for a ride that is " + ride.Status})
+		return
+	}
 
 	// Check driver verification status
 	var driver struct {
@@ -1038,23 +1121,33 @@ func UpdateBookingStatus(c *gin.Context) {
 		}
 	}
 
-	_, err = bookingCollection.UpdateOne(
+	// CONCURRENCY: Only transition the booking if it is STILL pending. Without this
+	// condition, two concurrent accept requests could both pass the status check
+	// above and increment seatsBooked twice for the same booking.
+	updateRes, err := bookingCollection.UpdateOne(
 		dbCtx,
-		bson.M{"_id": bookingId},
+		bson.M{"_id": bookingId, "status": "pending"},
 		bson.M{"$set": updateFields},
 	)
-	if err != nil {
-		// Rollback seatsBooked if booking update failed
+	if err != nil || updateRes.MatchedCount == 0 {
+		// Rollback seatsBooked if the booking was not actually transitioned.
+		// Use a fresh context: dbCtx may be the reason the update failed.
 		if body.Status == "accepted" {
 			requestedSeats := booking.SeatsRequested
 			if requestedSeats < 1 {
 				requestedSeats = 1
 			}
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_, _ = rideCollection.UpdateOne(
-				dbCtx,
+				rbCtx,
 				bson.M{"_id": booking.RideID},
 				bson.M{"$inc": bson.M{"seatsBooked": -requestedSeats}},
 			)
+			rbCancel()
+		}
+		if err == nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Booking status already updated"})
+			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update booking"})
 		return
@@ -1508,4 +1601,173 @@ func ToggleBlockSeat(c *gin.Context) {
 		"message":            "Seat status updated",
 		"manualBlockedSeats": newBlocked,
 	})
+}
+
+// retireOpenRides replaces a driver's previously posted "available" rides when they
+// post a new one, WITHOUT orphaning passenger bookings:
+//   - rides nobody has booked are deleted (same clean-up behaviour as before);
+//   - rides with pending/accepted bookings are marked "cancelled" (kept for history),
+//     their active bookings are cancelled and the affected passengers are notified.
+func retireOpenRides(ctx context.Context, driverID primitive.ObjectID) error {
+	cursor, err := rideCollection.Find(ctx, bson.M{"driverId": driverID, "status": "available"})
+	if err != nil {
+		return err
+	}
+	var oldRides []models.Ride
+	if err := cursor.All(ctx, &oldRides); err != nil {
+		return err
+	}
+	if len(oldRides) == 0 {
+		return nil
+	}
+
+	allIDs := make([]primitive.ObjectID, 0, len(oldRides))
+	rideByID := make(map[primitive.ObjectID]models.Ride, len(oldRides))
+	for _, r := range oldRides {
+		allIDs = append(allIDs, r.ID)
+		rideByID[r.ID] = r
+	}
+
+	activeStatuses := bson.M{"$in": []string{"pending", "accepted"}}
+	bookedRideIDs, err := bookingCollection.Distinct(ctx, "rideId", bson.M{
+		"rideId": bson.M{"$in": allIDs},
+		"status": activeStatuses,
+	})
+	if err != nil {
+		return err
+	}
+	booked := make(map[primitive.ObjectID]bool, len(bookedRideIDs))
+	for _, v := range bookedRideIDs {
+		if id, ok := v.(primitive.ObjectID); ok {
+			booked[id] = true
+		}
+	}
+
+	var toCancel, toDelete []primitive.ObjectID
+	for _, id := range allIDs {
+		if booked[id] {
+			toCancel = append(toCancel, id)
+		} else {
+			toDelete = append(toDelete, id)
+		}
+	}
+
+	now := time.Now()
+	if len(toCancel) > 0 {
+		if _, err := rideCollection.UpdateMany(ctx,
+			bson.M{"_id": bson.M{"$in": toCancel}, "status": "available"},
+			bson.M{"$set": bson.M{"status": "cancelled", "cancelledAt": now}},
+		); err != nil {
+			return err
+		}
+	}
+	if len(toDelete) > 0 {
+		if _, err := rideCollection.DeleteMany(ctx,
+			bson.M{"_id": bson.M{"$in": toDelete}, "status": "available"},
+		); err != nil {
+			return err
+		}
+	}
+
+	// Cancel every booking still active on the retired rides. This runs AFTER the
+	// rides were retired, so it also catches any booking that raced in during the
+	// steps above (BookRide re-checks the ride's status after inserting).
+	bCursor, err := bookingCollection.Find(ctx, bson.M{"rideId": bson.M{"$in": allIDs}, "status": activeStatuses})
+	if err != nil {
+		return err
+	}
+	var affected []models.Booking
+	if err := bCursor.All(ctx, &affected); err != nil {
+		return err
+	}
+	if len(affected) == 0 {
+		return nil
+	}
+
+	affectedIDs := make([]primitive.ObjectID, 0, len(affected))
+	for _, b := range affected {
+		affectedIDs = append(affectedIDs, b.ID)
+	}
+	if _, err := bookingCollection.UpdateMany(ctx,
+		bson.M{"_id": bson.M{"$in": affectedIDs}, "status": activeStatuses},
+		bson.M{"$set": bson.M{"status": "cancelled", "cancelledAt": now}},
+	); err != nil {
+		return err
+	}
+
+	for _, b := range affected {
+		r := rideByID[b.RideID]
+		bookingHex := b.ID.Hex()
+		go CreateNotification(b.PassengerID, "❌ Ride Cancelled",
+			"Your booking from "+b.Pickup+" to "+b.Dropoff+" was cancelled because the driver replaced the ride ("+r.Pickup+" → "+r.Dropoff+"). Please book another ride.",
+			"booking_status", bookingHex, map[string]string{
+				"bookingId": bookingHex,
+				"url":       "/?openTrips=true",
+			})
+	}
+	log.Printf("[CreateRide] Driver %s: deleted %d unbooked ride(s), cancelled %d booked ride(s) and %d booking(s)",
+		driverID.Hex(), len(toDelete), len(toCancel), len(affected))
+	return nil
+}
+
+// verifyNewBooking re-validates a booking AFTER it has been inserted.
+//
+// Because this check runs after the insert, two concurrent requests for the same
+// seat can never both succeed: whichever request checks second is guaranteed to
+// see the other's booking. In the rare case both check at the same instant, both
+// are rolled back and the passengers simply retry — overbooking is impossible.
+// This works on standalone MongoDB too (no replica-set transactions required).
+//
+// Returns a user-facing conflict message ("" if the booking is valid), or an error
+// if verification could not be performed (caller should roll back to be safe).
+func verifyNewBooking(ctx context.Context, rideID, bookingID, passengerID primitive.ObjectID, bookingType, pickup, dropoff string, seatLayout []int) (string, error) {
+	// Re-read the ride: it may have been cancelled/replaced since our first check.
+	var ride models.Ride
+	if err := rideCollection.FindOne(ctx, bson.M{"_id": rideID}).Decode(&ride); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return "This ride is no longer available", nil
+		}
+		return "", err
+	}
+	if ride.Status != "available" {
+		return "This ride is no longer accepting bookings", nil
+	}
+
+	if bookingType == "parcel" {
+		return "", nil
+	}
+
+	// Same passenger double-submitting (e.g. double tap) on the same ride.
+	dup, err := bookingCollection.CountDocuments(ctx, bson.M{
+		"_id":         bson.M{"$ne": bookingID},
+		"rideId":      rideID,
+		"passengerId": passengerID,
+		"type":        "seat",
+		"status":      bson.M{"$in": []string{"pending", "accepted"}},
+	})
+	if err != nil {
+		return "", err
+	}
+	if dup > 0 {
+		return "You already have an active booking for this ride. Check your notifications for the status.", nil
+	}
+
+	if len(seatLayout) == 0 {
+		return "", nil
+	}
+
+	taken, err := queryTakenSeats(ctx, ride, pickup, dropoff, bookingID)
+	if err != nil {
+		return "", err
+	}
+	takenMap := make(map[int]bool, len(taken))
+	for _, s := range taken {
+		takenMap[s] = true
+	}
+	for _, s := range seatLayout {
+		if takenMap[s] {
+			return fmt.Sprintf("Seat %d was just taken by another passenger. Please pick a different seat.", s+1), nil
+		}
+	}
+	return "", nil
 }

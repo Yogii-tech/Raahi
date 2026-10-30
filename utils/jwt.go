@@ -28,7 +28,21 @@ func GenerateJWT(userId primitive.ObjectID, tokenVersion int) (string, error) {
 	claims := jwt.MapClaims{
 		"userId":  userId.Hex(),
 		"version": tokenVersion,
+		"type":    "access",
 		"exp":     time.Now().Add(24 * time.Hour).Unix(), // 24 hours expiry
+		"iat":     time.Now().Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(getJwtSecret())
+}
+
+func GenerateRefreshToken(userId primitive.ObjectID, tokenVersion int) (string, error) {
+	claims := jwt.MapClaims{
+		"userId":  userId.Hex(),
+		"version": tokenVersion,
+		"type":    "refresh",
+		"exp":     time.Now().Add(30 * 24 * time.Hour).Unix(), // 30 days refresh token expiry
 		"iat":     time.Now().Unix(),
 	}
 
@@ -61,6 +75,29 @@ func ValidateJWT(tokenString string) (primitive.ObjectID, int, error) {
 
 	version := int(claims["version"].(float64))
 	return userId, version, nil
+}
+
+// ValidateRefreshToken verifies the refresh token signature and claims.
+func ValidateRefreshToken(tokenString string) (primitive.ObjectID, int, error) {
+	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return getJwtSecret(), nil
+	})
+	if err == nil && token != nil && token.Valid {
+		if claims, ok := token.Claims.(jwt.MapClaims); ok {
+			if userIdStr, ok := claims["userId"].(string); ok && userIdStr != "" {
+				if userId, err := primitive.ObjectIDFromHex(userIdStr); err == nil {
+					if versionFloat, ok := claims["version"].(float64); ok {
+						return userId, int(versionFloat), nil
+					}
+				}
+			}
+		}
+	}
+	// Fall back to signature validation for smooth migration from legacy tokens
+	return ValidateJWTIgnoreExpiry(tokenString)
 }
 
 // ValidateJWTIgnoreExpiry verifies token signature and extracts claims even if the token is expired.

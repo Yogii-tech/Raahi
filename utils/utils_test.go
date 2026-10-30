@@ -32,6 +32,23 @@ func TestJWTGenerationAndValidation(t *testing.T) {
 		t.Errorf("Expected TokenVersion %d, got %d", tokenVersion, parsedVersion)
 	}
 
+	// Positive Scenario: Valid Refresh Token Generation & Validation
+	refreshStr, err := GenerateRefreshToken(userID, tokenVersion)
+	if err != nil {
+		t.Fatalf("Failed to generate Refresh Token: %v", err)
+	}
+
+	parsedRefID, parsedRefVersion, err := ValidateRefreshToken(refreshStr)
+	if err != nil {
+		t.Fatalf("Validation failed for valid Refresh Token: %v", err)
+	}
+	if parsedRefID != userID {
+		t.Errorf("Refresh Token: Expected UserID %s, got %s", userID.Hex(), parsedRefID.Hex())
+	}
+	if parsedRefVersion != tokenVersion {
+		t.Errorf("Refresh Token: Expected TokenVersion %d, got %d", tokenVersion, parsedRefVersion)
+	}
+
 	// Negative Scenario 1: Malformed JWT String
 	_, _, err = ValidateJWT("invalid.jwt.token")
 	if err == nil {
@@ -49,6 +66,11 @@ func TestJWTGenerationAndValidation(t *testing.T) {
 	_, _, err = ValidateJWT(fakeTokenStr)
 	if err == nil {
 		t.Errorf("Expected signature validation failure for fake secret key")
+	}
+
+	_, _, err = ValidateRefreshToken(fakeTokenStr)
+	if err == nil {
+		t.Errorf("Expected signature validation failure for fake secret key on refresh")
 	}
 }
 

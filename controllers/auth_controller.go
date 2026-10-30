@@ -87,11 +87,19 @@ func VerifyFirebaseToken(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired Firebase verification token"})
 		return
 	}
-	log.Printf("[Firebase Auth SUCCESS] IP: %s | Verified token for phone: %s", clientIP, phoneNum)
-
-	if claimPhone, ok := token.Claims["phone_number"].(string); ok && claimPhone != "" {
-		phoneNum = claimPhone
+	// SECURITY: The user's identity MUST come from the verified phone_number claim
+	// in the Firebase ID token. Never fall back to the client-supplied phone number,
+	// otherwise any valid Firebase token (e.g. from another sign-in provider) could be
+	// used to log in as an arbitrary phone number.
+	claimPhone, ok := token.Claims["phone_number"].(string)
+	claimPhone = strings.TrimSpace(claimPhone)
+	if !ok || claimPhone == "" {
+		log.Printf("[Firebase Auth] Rejected token without verified phone_number claim (IP %s, uid %s)", clientIP, token.UID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Phone number not verified. Please sign in with phone OTP."})
+		return
 	}
+	phoneNum = claimPhone
+	log.Printf("[Firebase Auth SUCCESS] IP: %s | Verified token for phone claim", clientIP)
 
 	cleanPhone := strings.TrimPrefix(phoneNum, "+91")
 	cleanPhone = strings.TrimPrefix(cleanPhone, "+")
@@ -143,9 +151,12 @@ func VerifyFirebaseToken(c *gin.Context) {
 		return
 	}
 
+	refreshToken, _ := utils.GenerateRefreshToken(user.ID, user.TokenVersion)
+
 	c.JSON(http.StatusOK, gin.H{
-		"token": jwtToken,
-		"user":  user,
+		"token":         jwtToken,
+		"refresh_token": refreshToken,
+		"user":          user,
 	})
 }
 
@@ -215,7 +226,7 @@ func RefreshToken(c *gin.Context) {
 		return
 	}
 
-	userId, tokenVersion, err := utils.ValidateJWTIgnoreExpiry(tokenStr)
+	userId, tokenVersion, err := utils.ValidateRefreshToken(tokenStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format or signature"})
 		return
@@ -240,6 +251,11 @@ func RefreshToken(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"token": newToken})
+	newRefreshToken, _ := utils.GenerateRefreshToken(user.ID, user.TokenVersion)
+
+	c.JSON(http.StatusOK, gin.H{
+		"token":         newToken,
+		"refresh_token": newRefreshToken,
+	})
 }
 

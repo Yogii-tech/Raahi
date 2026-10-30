@@ -142,12 +142,37 @@ func AdminParcels(c *gin.Context) {
 		ContactNumber string `json:"contactNumber"`
 	}
 
+	// PERF: Load all senders in ONE query instead of one query per parcel (N+1).
+	senderIDs := make([]primitive.ObjectID, 0, len(parcels))
+	seenSender := make(map[primitive.ObjectID]bool, len(parcels))
+	for _, p := range parcels {
+		if !seenSender[p.PassengerID] {
+			seenSender[p.PassengerID] = true
+			senderIDs = append(senderIDs, p.PassengerID)
+		}
+	}
+	senderNames := make(map[primitive.ObjectID]string, len(senderIDs))
+	if len(senderIDs) > 0 {
+		sCursor, sErr := config.Database.Collection("users").Find(ctx,
+			bson.M{"_id": bson.M{"$in": senderIDs}},
+			options.Find().SetProjection(bson.M{"name": 1}),
+		)
+		if sErr == nil {
+			var senders []struct {
+				ID   primitive.ObjectID `bson:"_id"`
+				Name string             `bson:"name"`
+			}
+			if err := sCursor.All(ctx, &senders); err == nil {
+				for _, s := range senders {
+					senderNames[s.ID] = s.Name
+				}
+			}
+		}
+	}
+
 	var result []ParcelRow
 	for _, p := range parcels {
-		var sender struct {
-			Name string `bson:"name"`
-		}
-		config.Database.Collection("users").FindOne(ctx, bson.M{"_id": p.PassengerID}).Decode(&sender)
+		sender := struct{ Name string }{Name: senderNames[p.PassengerID]}
 
 		result = append(result, ParcelRow{
 			ID:            "RA-P-" + p.ID.Hex()[len(p.ID.Hex())-4:],
@@ -185,7 +210,60 @@ func AdminUsersList(c *gin.Context) {
 	}
 
 	var users []models.User
-	cursor.All(ctx, &users)
+	if err := cursor.All(ctx, &users); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse users"})
+		return
+	}
+
+	// PERF: Batch count driver rides and passenger bookings using Mongo aggregation
+	// instead of executing N+1 queries in a loop.
+	driverIDs := make([]primitive.ObjectID, 0)
+	passengerIDs := make([]primitive.ObjectID, 0)
+	for _, u := range users {
+		if u.Role == "driver" {
+			driverIDs = append(driverIDs, u.ID)
+		} else {
+			passengerIDs = append(passengerIDs, u.ID)
+		}
+	}
+
+	driverRideCounts := make(map[primitive.ObjectID]int64)
+	if len(driverIDs) > 0 {
+		pipeline := mongo.Pipeline{
+			{{Key: "$match", Value: bson.M{"driverId": bson.M{"$in": driverIDs}}}},
+			{{Key: "$group", Value: bson.M{"_id": "$driverId", "count": bson.M{"$sum": 1}}}},
+		}
+		if dCursor, dErr := config.Database.Collection("rides").Aggregate(ctx, pipeline); dErr == nil {
+			var dResults []struct {
+				ID    primitive.ObjectID `bson:"_id"`
+				Count int64              `bson:"count"`
+			}
+			if dCursor.All(ctx, &dResults) == nil {
+				for _, res := range dResults {
+					driverRideCounts[res.ID] = res.Count
+				}
+			}
+		}
+	}
+
+	passengerBookingCounts := make(map[primitive.ObjectID]int64)
+	if len(passengerIDs) > 0 {
+		pipeline := mongo.Pipeline{
+			{{Key: "$match", Value: bson.M{"passengerId": bson.M{"$in": passengerIDs}}}},
+			{{Key: "$group", Value: bson.M{"_id": "$passengerId", "count": bson.M{"$sum": 1}}}},
+		}
+		if pCursor, pErr := config.Database.Collection("bookings").Aggregate(ctx, pipeline); pErr == nil {
+			var pResults []struct {
+				ID    primitive.ObjectID `bson:"_id"`
+				Count int64              `bson:"count"`
+			}
+			if pCursor.All(ctx, &pResults) == nil {
+				for _, res := range pResults {
+					passengerBookingCounts[res.ID] = res.Count
+				}
+			}
+		}
+	}
 
 	type UserRow struct {
 		ID         string `json:"id"`
@@ -198,11 +276,12 @@ func AdminUsersList(c *gin.Context) {
 
 	var result []UserRow
 	for _, u := range users {
-		rideField := "passengerId"
+		totalRides := int64(0)
 		if u.Role == "driver" {
-			rideField = "driverId"
+			totalRides = driverRideCounts[u.ID]
+		} else {
+			totalRides = passengerBookingCounts[u.ID]
 		}
-		rideCount, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{rideField: u.ID})
 
 		result = append(result, UserRow{
 			ID:         u.ID.Hex(),
@@ -210,7 +289,7 @@ func AdminUsersList(c *gin.Context) {
 			Phone:      u.PhoneNumber,
 			Role:       u.Role,
 			JoinedAt:   u.ID.Timestamp().Format("Jan 2, 2006"),
-			TotalRides: rideCount,
+			TotalRides: totalRides,
 		})
 	}
 
