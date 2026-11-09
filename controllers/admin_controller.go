@@ -713,6 +713,59 @@ func AdminVerifyDriver(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Driver verification status updated", "status": body.Status})
 }
 
+// AdminRequestReKYC notifies a driver to re-upload their documents and resets verification status.
+func AdminRequestReKYC(c *gin.Context) {
+	driverIdHex := c.Param("driverId")
+	driverId, err := primitive.ObjectIDFromHex(driverIdHex)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid driver ID"})
+		return
+	}
+
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = c.BindJSON(&body)
+
+	reason := strings.TrimSpace(body.Reason)
+	if reason == "" {
+		reason = "Admin requested KYC re-verification. Please re-upload your driving license, vehicle RC, and other documents."
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	// Update verification status to 'rejected' so the driver app displays the
+	// Action Required banner and the "Resubmit Documents" button.
+	// Also clear old document URLs so the driver is prompted to upload fresh files.
+	update := bson.M{
+		"$set": bson.M{
+			"verification_status":       "rejected",
+			"rejection_reason":          reason,
+			"vehicle.dl_url":            "",
+			"vehicle.rc_url":            "",
+			"vehicle.pollution_url":     "",
+			"vehicle.vehicle_image_url": "",
+			"vehicle.ownership_url":     "",
+		},
+	}
+
+	res, err := config.Database.Collection("users").UpdateOne(ctx, bson.M{"_id": driverId, "role": "driver"}, update)
+	if err != nil || res.MatchedCount == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update driver or driver not found"})
+		return
+	}
+
+	// Send Push & In-app Notification to Driver
+	title := "Re-KYC Required"
+	msg := reason
+	CreateNotification(driverId, title, msg, "document_verification", "", map[string]string{
+		"action": "rekyc",
+	})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Re-KYC request and notification sent to driver successfully"})
+}
+
 // AdminDeleteDriver permanently deletes a driver and all associated data (rides, bookings).
 func AdminDeleteDriver(c *gin.Context) {
 	driverIdHex := c.Param("driverId")
