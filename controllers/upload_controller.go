@@ -104,7 +104,11 @@ func UploadFile(c *gin.Context) {
 
 		wc := storageClient.Bucket(bucketName).Object(objectName).NewWriter(ctx)
 		wc.ContentType = detectedType
-		wc.PredefinedACL = "publicRead"
+		// NOTE: Do NOT set wc.PredefinedACL here. The bucket has Uniform Bucket-Level
+		// Access enabled, which means per-object ACLs are silently ignored by GCS.
+		// Public read access is granted at the bucket level via the IAM binding:
+		//   allUsers → roles/storage.objectViewer
+		// To change visibility, update the bucket IAM policy — not per-object ACLs.
 
 		if _, copyErr := io.Copy(wc, file); copyErr != nil {
 			log.Printf("[Upload] GCS stream copy failed: %v", copyErr)
