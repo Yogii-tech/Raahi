@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"raahi-backend/config"
 	"raahi-backend/controllers"
 	"raahi-backend/routes"
@@ -123,7 +125,9 @@ func main() {
 	r.Use(cors.New(corsConfig))
 
 	// SECURITY: Serve uploads with security headers and no directory listing.
-	// Files are served as attachments to prevent inline script execution.
+	// Images are served inline so they can be rendered by browser <img> tags and
+	// the React Native Web <Image> component. Non-image files (PDFs etc.) are
+	// served as attachments to prevent inline script execution.
 	r.GET("/uploads/:filename", func(c *gin.Context) {
 		filename := c.Param("filename")
 		// Prevent path traversal
@@ -131,7 +135,16 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid filename"})
 			return
 		}
-		c.Header("Content-Disposition", "attachment; filename=\""+filename+"\"")
+		ext := strings.ToLower(filepath.Ext(filename))
+		imageExts := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".webp": true}
+		if imageExts[ext] {
+			// Inline disposition lets the browser render the image directly
+			// (required for the admin Document Preview modal).
+			c.Header("Content-Disposition", "inline; filename=\""+filename+"\"")
+		} else {
+			// PDFs and other files: force download to prevent XSS via inline execution.
+			c.Header("Content-Disposition", "attachment; filename=\""+filename+"\"")
+		}
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.File("./uploads/" + filename)
 	})

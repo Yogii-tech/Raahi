@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -84,32 +85,47 @@ func UploadFile(c *gin.Context) {
 
 	bucketName := os.Getenv("GCS_BUCKET_NAME")
 	if bucketName != "" {
-		objectName := "uploads/" + safeFilename
+		// GCS is configured — this is a production upload. Never fall back to
+		// local disk here: Cloud Run containers are ephemeral and any file saved
+		// to ./uploads/ will be lost on the next deploy or instance restart.
+		// Objects are stored at the bucket root (no subdirectory prefix) to match
+		// the existing files already in the bucket and their stored MongoDB URLs.
+		objectName := safeFilename
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 		defer cancel()
 
 		storageClient, err := storage.NewClient(ctx)
-		if err == nil {
-			wc := storageClient.Bucket(bucketName).Object(objectName).NewWriter(ctx)
-			wc.ContentType = detectedType
-			wc.PredefinedACL = "publicRead"
-
-			if _, copyErr := io.Copy(wc, file); copyErr == nil {
-				if closeErr := wc.Close(); closeErr == nil {
-					storageClient.Close()
-					fileURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", bucketName, objectName)
-					c.JSON(http.StatusOK, gin.H{
-						"url":      fileURL,
-						"filename": objectName,
-					})
-					return
-				}
-			}
-			storageClient.Close()
+		if err != nil {
+			log.Printf("[Upload] GCS client init failed: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Storage service unavailable. Please try again."})
+			return
 		}
+		defer storageClient.Close()
+
+		wc := storageClient.Bucket(bucketName).Object(objectName).NewWriter(ctx)
+		wc.ContentType = detectedType
+		wc.PredefinedACL = "publicRead"
+
+		if _, copyErr := io.Copy(wc, file); copyErr != nil {
+			log.Printf("[Upload] GCS stream copy failed: %v", copyErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload file to storage. Please try again."})
+			return
+		}
+		if closeErr := wc.Close(); closeErr != nil {
+			log.Printf("[Upload] GCS writer close failed: %v", closeErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to finalise upload. Please try again."})
+			return
+		}
+
+		fileURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", bucketName, objectName)
+		c.JSON(http.StatusOK, gin.H{
+			"url":      fileURL,
+			"filename": objectName,
+		})
+		return
 	}
 
-	// Local file storage fallback
+	// Local file storage fallback (development only — GCS_BUCKET_NAME not set)
 	if err := os.MkdirAll("./uploads", 0750); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create local upload directory"})
 		return
