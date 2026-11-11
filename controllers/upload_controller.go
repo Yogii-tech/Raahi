@@ -35,6 +35,14 @@ var allowedMimeTypes = map[string]bool{
 	"application/pdf": true,
 }
 
+// mimeToExtension maps each allowed detected MIME type to the extension used for storage.
+var mimeToExtension = map[string]string{
+	"image/jpeg":      ".jpg",
+	"image/png":       ".png",
+	"image/webp":      ".webp",
+	"application/pdf": ".pdf",
+}
+
 // generateSafeFilename creates a cryptographically random filename with the given extension.
 // Never uses any part of the user-supplied filename to prevent path traversal attacks.
 func generateSafeFilename(ext string) string {
@@ -58,21 +66,22 @@ func UploadFile(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// SECURITY: Validate file extension (whitelist only)
-	ext := strings.ToLower(filepath.Ext(header.Filename))
-	if !allowedExtensions[ext] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file type. Only images (jpg, jpeg, png, webp) and PDFs are allowed."})
-		return
-	}
-
 	// SECURITY: Validate actual file content via magic bytes (MIME sniffing prevention).
 	// Read the first 512 bytes to detect the real content type.
 	sniffBuf := make([]byte, 512)
-	n, _ := file.Read(sniffBuf)
+	n, _ := io.ReadFull(file, sniffBuf)
 	detectedType := http.DetectContentType(sniffBuf[:n])
 	if !allowedMimeTypes[detectedType] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File content does not match an allowed type. Upload rejected."})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported file. Please upload a JPG, PNG, WebP image or a PDF (HEIC/HEIF photos are not supported)."})
 		return
+	}
+
+	// SECURITY: The stored extension is derived from the sniffed content type, never from
+	// the client-supplied filename. Mobile gallery pickers frequently supply files with no
+	// extension or an unexpected one (e.g. ".jpe", ".image"), which must not block valid uploads.
+	ext := mimeToExtension[detectedType]
+	if userExt := strings.ToLower(filepath.Ext(header.Filename)); userExt != "" && !allowedExtensions[userExt] {
+		log.Printf("[Upload] Accepting file with unrecognised extension %q (content type %s)", userExt, detectedType)
 	}
 	// Seek back to the beginning so the full file can be copied downstream
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
