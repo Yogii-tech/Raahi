@@ -84,7 +84,12 @@ func decodePolyline(encoded string) [][2]float64 {
 
 	for index < len(encoded) {
 		var b, shift, result int
+		incomplete := false
 		for {
+			if index >= len(encoded) {
+				incomplete = true
+				break
+			}
 			b = int(encoded[index]) - 63
 			index++
 			result |= (b & 0x1f) << shift
@@ -92,6 +97,9 @@ func decodePolyline(encoded string) [][2]float64 {
 			if b < 0x20 {
 				break
 			}
+		}
+		if incomplete {
+			break
 		}
 		if result&1 != 0 {
 			lat += ^(result >> 1)
@@ -101,6 +109,10 @@ func decodePolyline(encoded string) [][2]float64 {
 
 		shift, result = 0, 0
 		for {
+			if index >= len(encoded) {
+				incomplete = true
+				break
+			}
 			b = int(encoded[index]) - 63
 			index++
 			result |= (b & 0x1f) << shift
@@ -108,6 +120,9 @@ func decodePolyline(encoded string) [][2]float64 {
 			if b < 0x20 {
 				break
 			}
+		}
+		if incomplete {
+			break
 		}
 		if result&1 != 0 {
 			lon += ^(result >> 1)

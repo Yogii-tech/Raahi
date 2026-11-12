@@ -409,6 +409,83 @@ func getTakenSeats(ctx context.Context, ride models.Ride, searchPickup, searchDr
 	return taken
 }
 
+// computeTakenSeatsFromBookings computes the deduplicated taken seats for a ride
+// from a pre-fetched slice of active (pending/accepted) bookings plus the ride's
+// manualBlockedSeats. When searchPickup and searchDropoff are both non-empty, only
+// bookings whose route segment overlaps the requested segment are counted.
+func computeTakenSeatsFromBookings(ride models.Ride, bookings []models.Booking, searchPickup, searchDropoff string) []int {
+	normRoute := normalizeRideRoute(ride)
+	takenMap := make(map[int]bool)
+	for _, b := range bookings {
+		if b.Type == "parcel" {
+			continue
+		}
+		// If searching for specific segment, only include overlapping bookings
+		if searchPickup != "" && searchDropoff != "" {
+			if segmentsOverlap(searchPickup, searchDropoff, b.Pickup, b.Dropoff, normRoute) {
+				for _, s := range b.SeatLayout {
+					takenMap[s] = true
+				}
+			}
+		} else {
+			// If no specific segment, show all taken seats (classic behavior)
+			for _, s := range b.SeatLayout {
+				takenMap[s] = true
+			}
+		}
+	}
+
+	// MERGE manual blocked seats by driver (Offline bookings)
+	for _, s := range ride.ManualBlockedSeats {
+		takenMap[s] = true
+	}
+
+	taken := make([]int, 0, len(takenMap))
+	for s := range takenMap {
+		taken = append(taken, s)
+	}
+	return taken
+}
+
+// batchBookingsForRides loads all pending/accepted bookings for the given ride IDs
+// in a single MongoDB query and groups them by rideId.
+func batchBookingsForRides(ctx context.Context, rideIDs []primitive.ObjectID) (map[primitive.ObjectID][]models.Booking, error) {
+	grouped := make(map[primitive.ObjectID][]models.Booking, len(rideIDs))
+	if len(rideIDs) == 0 {
+		return grouped, nil
+	}
+
+	uniqueIDs := make([]primitive.ObjectID, 0, len(rideIDs))
+	seen := make(map[primitive.ObjectID]bool, len(rideIDs))
+	for _, id := range rideIDs {
+		if !id.IsZero() && !seen[id] {
+			seen[id] = true
+			uniqueIDs = append(uniqueIDs, id)
+		}
+	}
+	if len(uniqueIDs) == 0 {
+		return grouped, nil
+	}
+
+	cursor, err := bookingCollection.Find(ctx, bson.M{
+		"rideId": bson.M{"$in": uniqueIDs},
+		"status": bson.M{"$in": []string{"pending", "accepted"}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var bookings []models.Booking
+	if err := cursor.All(ctx, &bookings); err != nil {
+		return nil, err
+	}
+	for _, b := range bookings {
+		grouped[b.RideID] = append(grouped[b.RideID], b)
+	}
+	return grouped, nil
+}
+
 // queryTakenSeats returns the seats taken on a ride (optionally for a segment),
 // ignoring the booking with excludeID (pass NilObjectID to ignore none).
 // Unlike getTakenSeats it reports DB errors, so callers that must be strict
@@ -425,49 +502,14 @@ func queryTakenSeats(ctx context.Context, ride models.Ride, searchPickup, search
 	if err != nil {
 		return nil, err
 	}
+	defer cursor.Close(ctx)
+
 	var bookings []models.Booking
 	if err := cursor.All(ctx, &bookings); err != nil {
 		return nil, err
 	}
 
-	normRoute := normalizeRideRoute(ride)
-	takenMap := make(map[int]bool)
-	for _, b := range bookings {
-		// If searching for specific segment, only include overlapping bookings
-		if searchPickup != "" && searchDropoff != "" {
-			if segmentsOverlap(searchPickup, searchDropoff, b.Pickup, b.Dropoff, normRoute) {
-				for _, s := range b.SeatLayout {
-					takenMap[s] = true
-				}
-			}
-		} else {
-			// If no specific segment, show all taken seats (classic behavior)
-			for _, s := range b.SeatLayout {
-				takenMap[s] = true
-			}
-		}
-	}
-
-	taken := []int{}
-	for s := range takenMap {
-		taken = append(taken, s)
-	}
-
-	// MERGE manual blocked seats by driver (Offline bookings)
-	for _, s := range ride.ManualBlockedSeats {
-		found := false
-		for _, t := range taken {
-			if t == s {
-				found = true
-				break
-			}
-		}
-		if !found {
-			taken = append(taken, s)
-		}
-	}
-
-	return taken, nil
+	return computeTakenSeatsFromBookings(ride, bookings, searchPickup, searchDropoff), nil
 }
 
 // RideResponse represents an available ride returned by GetAvailableRides,
@@ -752,26 +794,53 @@ func GetAvailableRides(c *gin.Context) {
 		return
 	}
 
-	var results []RideResponse
+	type candidateMatch struct {
+		ride           models.Ride
+		matchType      string
+		isPartial      bool
+		matchedPickup  string
+		matchedDropoff string
+	}
+	candidates := make([]candidateMatch, 0, len(matchedRides))
+	candidateRideIDs := make([]primitive.ObjectID, 0, len(matchedRides))
 	for _, ride := range matchedRides {
 		matched, matchType, isPartial, matchedPickup, matchedDropoff := classifyRideMatch(ride, pickup, dropoff)
 		if !matched {
 			continue
 		}
+		candidates = append(candidates, candidateMatch{
+			ride:           ride,
+			matchType:      matchType,
+			isPartial:      isPartial,
+			matchedPickup:  matchedPickup,
+			matchedDropoff: matchedDropoff,
+		})
+		candidateRideIDs = append(candidateRideIDs, ride.ID)
+	}
 
-		ride.TakenSeats = getTakenSeats(dbCtx, ride, matchedPickup, matchedDropoff)
+	bookingsByRide, err := batchBookingsForRides(dbCtx, candidateRideIDs)
+	if err != nil {
+		log.Printf("❌ BATCH BOOKINGS ERROR: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check seat availability"})
+		return
+	}
+
+	var results []RideResponse
+	for _, cand := range candidates {
+		ride := cand.ride
+		ride.TakenSeats = computeTakenSeatsFromBookings(ride, bookingsByRide[ride.ID], cand.matchedPickup, cand.matchedDropoff)
 		if len(ride.TakenSeats) >= ride.SeatsTotal {
 			continue
 		}
 
 		response := RideResponse{
 			Ride:           ride,
-			MatchType:      matchType,
-			IsPartialMatch: isPartial,
+			MatchType:      cand.matchType,
+			IsPartialMatch: cand.isPartial,
 		}
 
-		if matchedPickup != "" && matchedDropoff != "" {
-			segPrice, segDistKm, normPickup, normDropoff := computeSegmentPricing(ride, matchedPickup, matchedDropoff)
+		if cand.matchedPickup != "" && cand.matchedDropoff != "" {
+			segPrice, segDistKm, normPickup, normDropoff := computeSegmentPricing(ride, cand.matchedPickup, cand.matchedDropoff)
 			response.SegmentPricePerSeat = segPrice
 			response.SegmentDistanceKm = segDistKm
 			response.MatchedPickup = normPickup
@@ -839,6 +908,53 @@ func GetRideDetails(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// prepareBookingSeats validates and normalizes seat selection for a booking.
+// Parcel bookings never consume passenger seats (SeatsRequested=0, empty SeatLayout).
+// Seat bookings must provide a non-empty 1-indexed SeatLayout matching SeatsRequested.
+// Pass seatsTotal < 0 to skip upper-bound seat validation before the ride document is loaded.
+func prepareBookingSeats(bookingType string, seatsRequested int, seatLayout []int, seatsTotal int) (int, []int, string) {
+	if bookingType == "parcel" {
+		return 0, []int{}, ""
+	}
+	if len(seatLayout) == 0 {
+		return 0, nil, "Please select at least one seat"
+	}
+	if seatsRequested != len(seatLayout) {
+		return 0, nil, "seatsRequested must match the number of selected seats"
+	}
+
+	seen := make(map[int]bool, len(seatLayout))
+	normalized := make([]int, len(seatLayout))
+	for i, requestedSeat := range seatLayout {
+		if requestedSeat < 1 || (seatsTotal >= 0 && requestedSeat > seatsTotal) {
+			return 0, nil, "Invalid seat index"
+		}
+		if seen[requestedSeat] {
+			return 0, nil, "Duplicate seat selection is not allowed"
+		}
+		seen[requestedSeat] = true
+		normalized[i] = requestedSeat
+	}
+	return len(normalized), normalized, ""
+}
+
+// shouldReserveSeatsForBooking reports whether accepting a booking must increment
+// ride.seatsBooked and returns the number of seats to reserve. Only "seat" bookings
+// consume passenger capacity; parcel bookings never reduce available seats.
+func shouldReserveSeatsForBooking(booking models.Booking) (bool, int) {
+	if booking.Type != "seat" {
+		return false, 0
+	}
+	requestedSeats := booking.SeatsRequested
+	if requestedSeats < 1 {
+		requestedSeats = len(booking.SeatLayout)
+	}
+	if requestedSeats < 1 {
+		requestedSeats = 1
+	}
+	return true, requestedSeats
+}
+
 func BookRide(c *gin.Context) {
 	passengerId := c.MustGet("userId").(primitive.ObjectID)
 	rideIdHex := c.Param("rideId")
@@ -876,6 +992,14 @@ func BookRide(c *gin.Context) {
 		bookingType = "seat" // dynamic default for backward compatibility
 	}
 
+	// Pre-DB seat selection validation so empty/mismatched/0-indexed/duplicate seat layouts
+	// are rejected immediately for seat bookings, and parcel bookings normalize to 0 seats.
+	seatsCount, seatLayout, seatErr := prepareBookingSeats(bookingType, body.SeatsRequested, body.SeatLayout, -1)
+	if seatErr != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": seatErr})
+		return
+	}
+
 	// SECURITY: Prevent driver from booking their own ride
 	checkCtx, checkCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer checkCancel()
@@ -893,12 +1017,10 @@ func BookRide(c *gin.Context) {
 		return
 	}
 
-	seatsCount := body.SeatsRequested
-	if seatsCount <= 0 && len(body.SeatLayout) > 0 {
-		seatsCount = len(body.SeatLayout)
-	}
-	if seatsCount <= 0 {
-		seatsCount = 1
+	seatsCount, seatLayout, seatErr = prepareBookingSeats(bookingType, body.SeatsRequested, body.SeatLayout, rideForCheck.SeatsTotal)
+	if seatErr != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": seatErr})
+		return
 	}
 
 	validSegment, effectivePickup, effectiveDropoff, _, computedTotalPrice := resolveBookingSegment(rideForCheck, body.Pickup, body.Dropoff, seatsCount)
@@ -912,15 +1034,8 @@ func BookRide(c *gin.Context) {
 		bookingPrice = fmt.Sprintf("%.0f", computedTotalPrice)
 	}
 
-	// Verify that requested seats are valid, unique, and not already taken or pending approval
-	takenSeats := getTakenSeats(checkCtx, rideForCheck, effectivePickup, effectiveDropoff)
-	takenMap := make(map[int]bool)
-	for _, seat := range takenSeats {
-		takenMap[seat] = true
-	}
-
-	// SECURITY: Prevent same passenger from booking the same ride twice (seat rides only)
-	if body.Type != "parcel" {
+	if bookingType == "seat" {
+		// SECURITY: Prevent same passenger from booking the same ride twice (seat rides only)
 		existingCount, _ := bookingCollection.CountDocuments(checkCtx, bson.M{
 			"rideId":      rideId,
 			"passengerId": passengerId,
@@ -931,22 +1046,18 @@ func BookRide(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "You already have an active booking for this ride. Check your notifications for the status."})
 			return
 		}
-	}
 
-	seenRequestedSeats := make(map[int]bool, len(body.SeatLayout))
-	for _, requestedSeat := range body.SeatLayout {
-		if requestedSeat < 0 || requestedSeat > rideForCheck.SeatsTotal {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid seat index"})
-			return
+		// Verify that requested seats are not already taken or pending approval
+		takenSeats := getTakenSeats(checkCtx, rideForCheck, effectivePickup, effectiveDropoff)
+		takenMap := make(map[int]bool, len(takenSeats))
+		for _, seat := range takenSeats {
+			takenMap[seat] = true
 		}
-		if seenRequestedSeats[requestedSeat] {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Duplicate seat selection is not allowed"})
-			return
-		}
-		seenRequestedSeats[requestedSeat] = true
-		if takenMap[requestedSeat] {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Seat %d is already taken or pending approval", requestedSeat+1)})
-			return
+		for _, requestedSeat := range seatLayout {
+			if takenMap[requestedSeat] {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Seat %d is already taken or pending approval", requestedSeat)})
+				return
+			}
 		}
 	}
 
@@ -957,7 +1068,7 @@ func BookRide(c *gin.Context) {
 		Pickup:         effectivePickup,
 		Dropoff:        effectiveDropoff,
 		SeatsRequested: seatsCount,
-		SeatLayout:     body.SeatLayout,
+		SeatLayout:     seatLayout,
 		RoofCarrier:    body.RoofCarrier,
 		MotionSickness: body.MotionSickness,
 		// Parcel fields
@@ -985,7 +1096,7 @@ func BookRide(c *gin.Context) {
 	// simultaneous requests for the same seat could both pass them. Re-verify now
 	// that our booking is persisted; if it conflicts, roll it back.
 	newBookingID, _ := result.InsertedID.(primitive.ObjectID)
-	conflictMsg, verifyErr := verifyNewBooking(dbCtx, rideId, newBookingID, passengerId, bookingType, effectivePickup, effectiveDropoff, body.SeatLayout)
+	conflictMsg, verifyErr := verifyNewBooking(dbCtx, rideId, newBookingID, passengerId, bookingType, effectivePickup, effectiveDropoff, seatsCount, seatLayout)
 	if verifyErr != nil || conflictMsg != "" {
 		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, _ = bookingCollection.DeleteOne(rbCtx, bson.M{"_id": newBookingID})
@@ -1195,6 +1306,47 @@ func GetPassengerBookings(c *gin.Context) {
 		DriverPhone string      `json:"driverPhone"`
 	}
 
+	// PERF: Batch load bookings and driver phones for all rides in ONE query each instead of N+1.
+	rideIDs := make([]primitive.ObjectID, 0, len(results))
+	driverIDs := make([]primitive.ObjectID, 0, len(results))
+	seenDrivers := make(map[primitive.ObjectID]bool, len(results))
+	for _, res := range results {
+		if len(res.RideDetails) > 0 {
+			r := res.RideDetails[0]
+			rideIDs = append(rideIDs, r.ID)
+			if !r.DriverID.IsZero() && !seenDrivers[r.DriverID] {
+				seenDrivers[r.DriverID] = true
+				driverIDs = append(driverIDs, r.DriverID)
+			}
+		}
+	}
+
+	bookingsByRide, bErr := batchBookingsForRides(dbCtx, rideIDs)
+	if bErr != nil {
+		log.Printf("[GetPassengerBookings] batchBookingsForRides warning: %v", bErr)
+		bookingsByRide = make(map[primitive.ObjectID][]models.Booking)
+	}
+
+	driverPhones := make(map[primitive.ObjectID]string, len(driverIDs))
+	if len(driverIDs) > 0 {
+		dCursor, dErr := usersCollection.Find(dbCtx,
+			bson.M{"_id": bson.M{"$in": driverIDs}},
+			options.Find().SetProjection(bson.M{"phone_number": 1}),
+		)
+		if dErr == nil && dCursor != nil {
+			var drivers []struct {
+				ID          primitive.ObjectID `bson:"_id"`
+				PhoneNumber string             `bson:"phone_number"`
+			}
+			if dCursor.All(dbCtx, &drivers) == nil {
+				for _, d := range drivers {
+					driverPhones[d.ID] = d.PhoneNumber
+				}
+			}
+			dCursor.Close(dbCtx)
+		}
+	}
+
 	var response []BookingResponse
 	for _, res := range results {
 		ride := models.Ride{}
@@ -1202,12 +1354,8 @@ func GetPassengerBookings(c *gin.Context) {
 		if len(res.RideDetails) > 0 {
 			ride = res.RideDetails[0]
 			// Populate real-time taken seats for THIS booking's segment
-			ride.TakenSeats = getTakenSeats(dbCtx, ride, res.Booking.Pickup, res.Booking.Dropoff)
-			// Fetch driver phone
-			var driver models.User
-			if err := usersCollection.FindOne(dbCtx, bson.M{"_id": ride.DriverID}).Decode(&driver); err == nil {
-				driverPhone = driver.PhoneNumber
-			}
+			ride.TakenSeats = computeTakenSeatsFromBookings(ride, bookingsByRide[ride.ID], res.Booking.Pickup, res.Booking.Dropoff)
+			driverPhone = driverPhones[ride.DriverID]
 		}
 		response = append(response, BookingResponse{
 			Booking:     res.Booking,
@@ -1316,13 +1464,10 @@ func UpdateBookingStatus(c *gin.Context) {
 	}
 
 	// SECURITY: Keep seatsBooked counter in sync and prevent overbooking race conditions.
-	// When accepting, atomically increment seatsBooked ONLY if seatsBooked + requested <= seatsTotal.
-	if body.Status == "accepted" {
-		requestedSeats := booking.SeatsRequested
-		if requestedSeats < 1 {
-			requestedSeats = 1
-		}
-
+	// When accepting a seat booking, atomically increment seatsBooked ONLY if seatsBooked + requested <= seatsTotal.
+	// Parcel bookings never consume passenger seat capacity.
+	reserveSeats, requestedSeats := shouldReserveSeatsForBooking(booking)
+	if body.Status == "accepted" && reserveSeats {
 		rideUpdateRes, rideErr := rideCollection.UpdateOne(
 			dbCtx,
 			bson.M{
@@ -1364,11 +1509,7 @@ func UpdateBookingStatus(c *gin.Context) {
 	if err != nil || updateRes.MatchedCount == 0 {
 		// Rollback seatsBooked if the booking was not actually transitioned.
 		// Use a fresh context: dbCtx may be the reason the update failed.
-		if body.Status == "accepted" {
-			requestedSeats := booking.SeatsRequested
-			if requestedSeats < 1 {
-				requestedSeats = 1
-			}
+		if body.Status == "accepted" && reserveSeats {
 			rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_, _ = rideCollection.UpdateOne(
 				rbCtx,
@@ -1471,23 +1612,35 @@ func GetRecentRides(c *gin.Context) {
 			Bookings []models.Booking `json:"bookings"`
 		}
 
-		var enrichedRides []EnrichedDriverRide
+		// PERF: Fetch all bookings across all driver rides in ONE query instead of 2*N queries.
+		rideIDs := make([]primitive.ObjectID, 0, len(rides))
 		for _, r := range rides {
-			r.TakenSeats = getTakenSeats(dbCtx, r, "", "")
-			r.SeatsBooked = len(r.TakenSeats)
-
-			// Fetch bookings for this ride
-			bCursor, bErr := bookingCollection.Find(dbCtx, bson.M{"rideId": r.ID})
-			var rideBookings []models.Booking
-			if bErr == nil {
-				for bCursor.Next(dbCtx) {
-					var b models.Booking
-					if bErr2 := bCursor.Decode(&b); bErr2 == nil {
-						rideBookings = append(rideBookings, b)
+			rideIDs = append(rideIDs, r.ID)
+		}
+		allBookingsByRide := make(map[primitive.ObjectID][]models.Booking, len(rideIDs))
+		activeBookingsByRide := make(map[primitive.ObjectID][]models.Booking, len(rideIDs))
+		if len(rideIDs) > 0 {
+			bCursor, bErr := bookingCollection.Find(dbCtx, bson.M{"rideId": bson.M{"$in": rideIDs}})
+			if bErr == nil && bCursor != nil {
+				var allBookings []models.Booking
+				if bCursor.All(dbCtx, &allBookings) == nil {
+					for _, b := range allBookings {
+						allBookingsByRide[b.RideID] = append(allBookingsByRide[b.RideID], b)
+						if b.Status == "pending" || b.Status == "accepted" {
+							activeBookingsByRide[b.RideID] = append(activeBookingsByRide[b.RideID], b)
+						}
 					}
 				}
 				bCursor.Close(dbCtx)
 			}
+		}
+
+		var enrichedRides []EnrichedDriverRide
+		for _, r := range rides {
+			r.TakenSeats = computeTakenSeatsFromBookings(r, activeBookingsByRide[r.ID], "", "")
+			r.SeatsBooked = len(r.TakenSeats)
+
+			rideBookings := allBookingsByRide[r.ID]
 			if rideBookings == nil {
 				rideBookings = []models.Booking{}
 			}
@@ -1974,7 +2127,7 @@ func retireOpenRides(ctx context.Context, driverID primitive.ObjectID) error {
 //
 // Returns a user-facing conflict message ("" if the booking is valid), or an error
 // if verification could not be performed (caller should roll back to be safe).
-func verifyNewBooking(ctx context.Context, rideID, bookingID, passengerID primitive.ObjectID, bookingType, pickup, dropoff string, seatLayout []int) (string, error) {
+func verifyNewBooking(ctx context.Context, rideID, bookingID, passengerID primitive.ObjectID, bookingType, pickup, dropoff string, seatsRequested int, seatLayout []int) (string, error) {
 	// Re-read the ride: it may have been cancelled/replaced since our first check.
 	var ride models.Ride
 	if err := rideCollection.FindOne(ctx, bson.M{"_id": rideID}).Decode(&ride); err != nil {
@@ -2006,8 +2159,8 @@ func verifyNewBooking(ctx context.Context, rideID, bookingID, passengerID primit
 		return "You already have an active booking for this ride. Check your notifications for the status.", nil
 	}
 
-	if len(seatLayout) == 0 {
-		return "", nil
+	if _, _, seatErr := prepareBookingSeats(bookingType, seatsRequested, seatLayout, ride.SeatsTotal); seatErr != "" {
+		return seatErr, nil
 	}
 
 	taken, err := queryTakenSeats(ctx, ride, pickup, dropoff, bookingID)
@@ -2020,7 +2173,7 @@ func verifyNewBooking(ctx context.Context, rideID, bookingID, passengerID primit
 	}
 	for _, s := range seatLayout {
 		if takenMap[s] {
-			return fmt.Sprintf("Seat %d was just taken by another passenger. Please pick a different seat.", s+1), nil
+			return fmt.Sprintf("Seat %d was just taken by another passenger. Please pick a different seat.", s), nil
 		}
 	}
 	return "", nil

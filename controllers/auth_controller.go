@@ -3,6 +3,8 @@ package controllers
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -26,6 +28,38 @@ var (
 	authRateStore  = make(map[string][]time.Time)
 )
 
+const authRateMaxWindow = 15 * time.Minute
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanupAuthRateStore(time.Now().Add(-authRateMaxWindow))
+		}
+	}()
+}
+
+// cleanupAuthRateStore evicts expired timestamps and deletes empty buckets from authRateStore.
+func cleanupAuthRateStore(cutoff time.Time) {
+	authRateMu.Lock()
+	defer authRateMu.Unlock()
+
+	for k, entries := range authRateStore {
+		var active []time.Time
+		for _, t := range entries {
+			if t.After(cutoff) {
+				active = append(active, t)
+			}
+		}
+		if len(active) == 0 {
+			delete(authRateStore, k)
+		} else {
+			authRateStore[k] = active
+		}
+	}
+}
+
 // checkAuthActionRateLimit enforces an in-controller sliding-window rate limit
 // for sensitive auth actions (e.g. PromoteAdmin, RefreshToken).
 func checkAuthActionRateLimit(key string, maxAttempts int, window time.Duration) bool {
@@ -43,7 +77,11 @@ func checkAuthActionRateLimit(key string, maxAttempts int, window time.Duration)
 		}
 	}
 	if len(active) >= maxAttempts {
-		authRateStore[key] = active
+		if len(active) == 0 {
+			delete(authRateStore, key)
+		} else {
+			authRateStore[key] = active
+		}
 		return false
 	}
 	active = append(active, now)
@@ -264,7 +302,12 @@ func RefreshToken(c *gin.Context) {
 	var body struct {
 		RefreshToken string `json:"refresh_token"`
 	}
-	_ = c.BindJSON(&body)
+	if c.Request != nil && c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+			return
+		}
+	}
 
 	tokenStr := strings.TrimSpace(body.RefreshToken)
 	if tokenStr == "" {

@@ -22,14 +22,16 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o main .
 # SECURITY: Use a pinned Alpine version (not :latest) for reproducible builds
 FROM alpine:3.20
 
+# Install CA certificates for outbound TLS (MongoDB Atlas, Firebase, GCS, Sentry) and timezone data
+RUN apk add --no-cache ca-certificates tzdata
+
 # SECURITY: Create and switch to a non-root user
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
 
-# Copy the binary and serviceAccountKey.json from the builder stage
+# Copy the binary from the builder stage (secrets must be injected at runtime, never baked into the image)
 COPY --from=builder /app/main .
-COPY --from=builder /app/serviceAccountKey.json* ./
 
 # SECURITY: Set ownership to non-root user
 RUN chown -R appuser:appgroup /app

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -548,5 +549,172 @@ func TestBackendSecurityControls(t *testing.T) {
 	escaped := sanitizeCSV("=cmd|' /C calc'!A0")
 	if !strings.HasPrefix(escaped, "\"'=cmd") {
 		t.Errorf("expected formula prefix to be neutralized with leading single quote, got %s", escaped)
+	}
+}
+
+func TestSprint1BookingSeatAndParcelValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// 1. Parcel bookings must NOT consume passenger seats (SeatsRequested == 0, empty SeatLayout)
+	parcelSeats, parcelLayout, parcelErr := prepareBookingSeats("parcel", 2, []int{1, 2}, 9)
+	if parcelErr != "" || parcelSeats != 0 || len(parcelLayout) != 0 {
+		t.Errorf("prepareBookingSeats(parcel) = (%d, %v, %q), want (0, [], \"\")", parcelSeats, parcelLayout, parcelErr)
+	}
+	if reserve, count := shouldReserveSeatsForBooking(models.Booking{Type: "parcel", SeatsRequested: 1}); reserve || count != 0 {
+		t.Errorf("shouldReserveSeatsForBooking(parcel) = (%v, %d), want (false, 0)", reserve, count)
+	}
+	if reserve, count := shouldReserveSeatsForBooking(models.Booking{Type: "seat", SeatsRequested: 2, SeatLayout: []int{1, 2}}); !reserve || count != 2 {
+		t.Errorf("shouldReserveSeatsForBooking(seat) = (%v, %d), want (true, 2)", reserve, count)
+	}
+
+	// 2. Empty SeatLayout on a seat booking is rejected (helper + HTTP handler)
+	if _, _, errMsg := prepareBookingSeats("seat", 1, []int{}, 9); errMsg == "" {
+		t.Errorf("expected empty SeatLayout for seat booking to be rejected")
+	}
+	wEmpty := httptest.NewRecorder()
+	cEmpty, _ := gin.CreateTestContext(wEmpty)
+	cEmpty.Set("userId", primitive.NewObjectID())
+	cEmpty.Params = gin.Params{{Key: "rideId", Value: primitive.NewObjectID().Hex()}}
+	cEmpty.Request = httptest.NewRequest(http.MethodPost, "/api/rides/id/book", bytes.NewBufferString(`{"type":"seat","pickup":"Bageshwar","dropoff":"Haldwani","seatsRequested":1,"seatLayout":[]}`))
+	cEmpty.Request.Header.Set("Content-Type", "application/json")
+	BookRide(cEmpty)
+	if wEmpty.Code != http.StatusBadRequest {
+		t.Errorf("BookRide with empty seatLayout returned %d, want 400", wEmpty.Code)
+	}
+
+	// 3. Mismatched seatsRequested vs len(seatLayout) is rejected (helper + HTTP handler)
+	if _, _, errMsg := prepareBookingSeats("seat", 2, []int{1}, 9); errMsg == "" {
+		t.Errorf("expected seatsRequested != len(seatLayout) to be rejected")
+	}
+	wMismatch := httptest.NewRecorder()
+	cMismatch, _ := gin.CreateTestContext(wMismatch)
+	cMismatch.Set("userId", primitive.NewObjectID())
+	cMismatch.Params = gin.Params{{Key: "rideId", Value: primitive.NewObjectID().Hex()}}
+	cMismatch.Request = httptest.NewRequest(http.MethodPost, "/api/rides/id/book", bytes.NewBufferString(`{"type":"seat","pickup":"Bageshwar","dropoff":"Haldwani","seatsRequested":2,"seatLayout":[1]}`))
+	cMismatch.Request.Header.Set("Content-Type", "application/json")
+	BookRide(cMismatch)
+	if wMismatch.Code != http.StatusBadRequest {
+		t.Errorf("BookRide with mismatched seatsRequested returned %d, want 400", wMismatch.Code)
+	}
+
+	// 4. Out-of-range 1-indexed seat indices (0, negative, > SeatsTotal) and duplicates are rejected
+	invalidSeatCases := [][]int{
+		{0},
+		{-1},
+		{10}, // > seatsTotal (9)
+		{1, 1},
+	}
+	for _, seats := range invalidSeatCases {
+		if _, _, errMsg := prepareBookingSeats("seat", len(seats), seats, 9); errMsg == "" {
+			t.Errorf("expected seatLayout %v for seatsTotal=9 to be rejected", seats)
+		}
+	}
+
+	// HTTP handler also rejects 0-indexed seat before hitting DB
+	wZero := httptest.NewRecorder()
+	cZero, _ := gin.CreateTestContext(wZero)
+	cZero.Set("userId", primitive.NewObjectID())
+	cZero.Params = gin.Params{{Key: "rideId", Value: primitive.NewObjectID().Hex()}}
+	cZero.Request = httptest.NewRequest(http.MethodPost, "/api/rides/id/book", bytes.NewBufferString(`{"type":"seat","pickup":"Bageshwar","dropoff":"Haldwani","seatsRequested":1,"seatLayout":[0]}`))
+	cZero.Request.Header.Set("Content-Type", "application/json")
+	BookRide(cZero)
+	if wZero.Code != http.StatusBadRequest {
+		t.Errorf("BookRide with 0-indexed seat [0] returned %d, want 400", wZero.Code)
+	}
+
+	// 5. Valid 1-indexed seat selection succeeds
+	gotSeats, gotLayout, gotErr := prepareBookingSeats("seat", 2, []int{1, 9}, 9)
+	if gotErr != "" || gotSeats != 2 || len(gotLayout) != 2 || gotLayout[0] != 1 || gotLayout[1] != 9 {
+		t.Errorf("prepareBookingSeats valid 1-indexed = (%d, %v, %q), want (2, [1 9], \"\")", gotSeats, gotLayout, gotErr)
+	}
+}
+
+func TestSprint2ComputeTakenSeatsFromBookingsAndRateCleanup(t *testing.T) {
+	ride := models.Ride{
+		ID:                 primitive.NewObjectID(),
+		Pickup:             "Bageshwar",
+		Dropoff:            "Haldwani",
+		Route:              []string{"Bageshwar", "Almora", "Haldwani"},
+		SeatsTotal:         7,
+		ManualBlockedSeats: []int{7, 1},
+	}
+
+	bookings := []models.Booking{
+		{
+			RideID:     ride.ID,
+			Type:       "seat",
+			Pickup:     "Bageshwar",
+			Dropoff:    "Almora",
+			SeatLayout: []int{1, 2},
+			Status:     "accepted",
+		},
+		{
+			RideID:     ride.ID,
+			Type:       "seat",
+			Pickup:     "Almora",
+			Dropoff:    "Haldwani",
+			SeatLayout: []int{3},
+			Status:     "pending",
+		},
+		{
+			RideID:     ride.ID,
+			Type:       "parcel",
+			Pickup:     "Bageshwar",
+			Dropoff:    "Haldwani",
+			SeatLayout: []int{4, 5}, // parcel bookings must be ignored
+			Status:     "accepted",
+		},
+	}
+
+	// 1. Classic mode (empty search segment): all non-parcel bookings + deduplicated ManualBlockedSeats
+	allTaken := computeTakenSeatsFromBookings(ride, bookings, "", "")
+	sort.Ints(allTaken)
+	wantAll := []int{1, 2, 3, 7}
+	if len(allTaken) != len(wantAll) {
+		t.Fatalf("computeTakenSeatsFromBookings(full) = %v, want %v", allTaken, wantAll)
+	}
+	for i := range wantAll {
+		if allTaken[i] != wantAll[i] {
+			t.Fatalf("computeTakenSeatsFromBookings(full) = %v, want %v", allTaken, wantAll)
+		}
+	}
+
+	// 2. Segment-scoped search (Almora -> Haldwani): excludes non-overlapping Bageshwar -> Almora booking (seat 2),
+	//    keeps overlapping Almora -> Haldwani (seat 3) + ManualBlockedSeats (1, 7).
+	segTaken := computeTakenSeatsFromBookings(ride, bookings, "Almora", "Haldwani")
+	sort.Ints(segTaken)
+	wantSeg := []int{1, 3, 7}
+	if len(segTaken) != len(wantSeg) {
+		t.Fatalf("computeTakenSeatsFromBookings(Almora->Haldwani) = %v, want %v", segTaken, wantSeg)
+	}
+	for i := range wantSeg {
+		if segTaken[i] != wantSeg[i] {
+			t.Fatalf("computeTakenSeatsFromBookings(Almora->Haldwani) = %v, want %v", segTaken, wantSeg)
+		}
+	}
+
+	// 3. authRateStore eviction deletes fully expired buckets and prunes expired timestamps
+	now := time.Now()
+	expiredKey := "test_expired:" + primitive.NewObjectID().Hex()
+	mixedKey := "test_mixed:" + primitive.NewObjectID().Hex()
+
+	authRateMu.Lock()
+	authRateStore[expiredKey] = []time.Time{now.Add(-30 * time.Minute), now.Add(-20 * time.Minute)}
+	authRateStore[mixedKey] = []time.Time{now.Add(-30 * time.Minute), now.Add(-2 * time.Minute)}
+	authRateMu.Unlock()
+
+	cleanupAuthRateStore(now.Add(-15 * time.Minute))
+
+	authRateMu.Lock()
+	_, hasExpired := authRateStore[expiredKey]
+	mixedEntries := append([]time.Time(nil), authRateStore[mixedKey]...)
+	delete(authRateStore, mixedKey)
+	authRateMu.Unlock()
+
+	if hasExpired {
+		t.Errorf("expected expired bucket %q to be evicted from authRateStore", expiredKey)
+	}
+	if len(mixedEntries) != 1 {
+		t.Errorf("expected mixed bucket %q to retain 1 active entry after eviction, got %d", mixedKey, len(mixedEntries))
 	}
 }

@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -183,5 +184,55 @@ func TestFuzzyMatch(t *testing.T) {
 	}
 	if FuzzyMatch("", "Kotdwar") {
 		t.Errorf("Expected false when matching against empty string")
+	}
+}
+
+func TestDecodePolyline(t *testing.T) {
+	// Valid Google-encoded polyline: (38.5, -120.2), (40.7, -120.95), (43.252, -126.453)
+	validEncoded := "_p~iF~ps|U_ulLnnqC_mqNvxq`@"
+	coords := decodePolyline(validEncoded)
+	expected := [][2]float64{
+		{38.5, -120.2},
+		{40.7, -120.95},
+		{43.252, -126.453},
+	}
+	if len(coords) != len(expected) {
+		t.Fatalf("decodePolyline(%q) returned %d coords, want %d", validEncoded, len(coords), len(expected))
+	}
+	for i := range expected {
+		if math.Abs(coords[i][0]-expected[i][0]) > 1e-5 || math.Abs(coords[i][1]-expected[i][1]) > 1e-5 {
+			t.Errorf("coord[%d] = %v, want %v", i, coords[i], expected[i])
+		}
+	}
+
+	// Empty polyline returns empty slice without panic
+	if emptyCoords := decodePolyline(""); len(emptyCoords) != 0 {
+		t.Errorf("expected empty slice for empty polyline, got %v", emptyCoords)
+	}
+
+	// Truncated and malformed polylines must NOT panic
+	malformedCases := []struct {
+		name      string
+		encoded   string
+		wantCount int
+	}{
+		{"Truncated mid-latitude varint", "_p~i", 0},
+		{"Truncated right after latitude (no longitude)", "_p~iF", 0},
+		{"Truncated mid-longitude varint on 3rd point", "_p~iF~ps|U_ulLnnqC_mqNvxq", 2},
+		{"All continuation bits", "~~~~~~~~", 0},
+		{"Single continuation byte", "~", 0},
+	}
+	for _, tc := range malformedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("decodePolyline(%q) panicked: %v", tc.encoded, r)
+				}
+			}()
+			got := decodePolyline(tc.encoded)
+			if len(got) != tc.wantCount {
+				t.Errorf("decodePolyline(%q) returned %d points, want %d", tc.encoded, len(got), tc.wantCount)
+			}
+		})
 	}
 }

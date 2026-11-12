@@ -2,6 +2,8 @@ package controllers
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -96,12 +98,17 @@ func isAllowedUserProfileRole(role string) bool {
 	}
 }
 
-// hasDriverVehicleChanged checks whether KYC-critical vehicle fields or document URLs changed.
+// hasDriverVehicleChanged checks whether KYC-critical vehicle specs or document URLs changed.
+// Note: RatePerKm is intentionally excluded so verified drivers can adjust per-km pricing
+// in PricingSettingsScreen without triggering KYC re-verification.
 func hasDriverVehicleChanged(oldV, newV *models.Vehicle) bool {
 	if oldV == nil || newV == nil {
 		return oldV != newV
 	}
-	return strings.TrimSpace(oldV.VehicleNumber) != strings.TrimSpace(newV.VehicleNumber) ||
+	return oldV.Seats != newV.Seats ||
+		strings.TrimSpace(oldV.VehicleType) != strings.TrimSpace(newV.VehicleType) ||
+		strings.TrimSpace(oldV.SeatingLayout) != strings.TrimSpace(newV.SeatingLayout) ||
+		strings.TrimSpace(oldV.VehicleNumber) != strings.TrimSpace(newV.VehicleNumber) ||
 		strings.TrimSpace(oldV.DLUrl) != strings.TrimSpace(newV.DLUrl) ||
 		strings.TrimSpace(oldV.RCUrl) != strings.TrimSpace(newV.RCUrl) ||
 		strings.TrimSpace(oldV.PollutionUrl) != strings.TrimSpace(newV.PollutionUrl) ||
@@ -312,7 +319,12 @@ func RemoveFCMToken(c *gin.Context) {
 	var body struct {
 		FCMToken string `json:"fcmToken"`
 	}
-	_ = c.BindJSON(&body)
+	if c.Request != nil && c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+			return
+		}
+	}
 
 	token := strings.TrimSpace(body.FCMToken)
 

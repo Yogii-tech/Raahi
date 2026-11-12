@@ -2,7 +2,9 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -49,12 +51,13 @@ func AdminStats(c *gin.Context) {
 	}
 	routeCursor, err := config.Database.Collection("rides").Aggregate(ctx, routePipeline)
 	routeCount := int64(0)
-	if err == nil {
+	if err == nil && routeCursor != nil {
 		var routeResult []bson.M
-		routeCursor.All(ctx, &routeResult)
-		if len(routeResult) > 0 {
+		if allErr := routeCursor.All(ctx, &routeResult); allErr == nil && len(routeResult) > 0 {
 			if v, ok := routeResult[0]["count"].(int32); ok {
 				routeCount = int64(v)
+			} else if v64, ok := routeResult[0]["count"].(int64); ok {
+				routeCount = v64
 			}
 		}
 	}
@@ -127,7 +130,12 @@ func AdminParcels(c *gin.Context) {
 	}
 
 	var parcels []models.Booking
-	cursor.All(ctx, &parcels)
+	if cursor != nil {
+		if err := cursor.All(ctx, &parcels); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse parcels"})
+			return
+		}
+	}
 
 	type ParcelRow struct {
 		ID            string `json:"id"`
@@ -157,7 +165,7 @@ func AdminParcels(c *gin.Context) {
 			bson.M{"_id": bson.M{"$in": senderIDs}},
 			options.Find().SetProjection(bson.M{"name": 1}),
 		)
-		if sErr == nil {
+		if sErr == nil && sCursor != nil {
 			var senders []struct {
 				ID   primitive.ObjectID `bson:"_id"`
 				Name string             `bson:"name"`
@@ -210,9 +218,11 @@ func AdminUsersList(c *gin.Context) {
 	}
 
 	var users []models.User
-	if err := cursor.All(ctx, &users); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse users"})
-		return
+	if cursor != nil {
+		if err := cursor.All(ctx, &users); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse users"})
+			return
+		}
 	}
 
 	// PERF: Batch count driver rides and passenger bookings using Mongo aggregation
@@ -233,7 +243,7 @@ func AdminUsersList(c *gin.Context) {
 			{{Key: "$match", Value: bson.M{"driverId": bson.M{"$in": driverIDs}}}},
 			{{Key: "$group", Value: bson.M{"_id": "$driverId", "count": bson.M{"$sum": 1}}}},
 		}
-		if dCursor, dErr := config.Database.Collection("rides").Aggregate(ctx, pipeline); dErr == nil {
+		if dCursor, dErr := config.Database.Collection("rides").Aggregate(ctx, pipeline); dErr == nil && dCursor != nil {
 			var dResults []struct {
 				ID    primitive.ObjectID `bson:"_id"`
 				Count int64              `bson:"count"`
@@ -252,7 +262,7 @@ func AdminUsersList(c *gin.Context) {
 			{{Key: "$match", Value: bson.M{"passengerId": bson.M{"$in": passengerIDs}}}},
 			{{Key: "$group", Value: bson.M{"_id": "$passengerId", "count": bson.M{"$sum": 1}}}},
 		}
-		if pCursor, pErr := config.Database.Collection("bookings").Aggregate(ctx, pipeline); pErr == nil {
+		if pCursor, pErr := config.Database.Collection("bookings").Aggregate(ctx, pipeline); pErr == nil && pCursor != nil {
 			var pResults []struct {
 				ID    primitive.ObjectID `bson:"_id"`
 				Count int64              `bson:"count"`
@@ -346,29 +356,46 @@ func AdminReports(c *gin.Context) {
 	reportType := c.Param("type")
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	c.Header("Content-Type", "text/csv")
 
 	switch reportType {
 	case "daily_bookings":
-		c.Header("Content-Disposition", `attachment; filename="daily_bookings.csv"`)
 		since := time.Now().AddDate(0, 0, -30)
-		cursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{"createdAt": bson.M{"$gte": since}})
+		cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{"createdAt": bson.M{"$gte": since}})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings report"})
+			return
+		}
 		var bookings []models.Booking
 		if cursor != nil {
-			cursor.All(ctx, &bookings)
+			if err := cursor.All(ctx, &bookings); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings report"})
+				return
+			}
 		}
+		c.Header("Content-Type", "text/csv")
+		c.Header("Content-Disposition", `attachment; filename="daily_bookings.csv"`)
 		c.String(http.StatusOK, "BookingID,Date,Route,Type,Status\n")
 		for _, b := range bookings {
 			routeStr := sanitizeCSV(fmt.Sprintf("%s → %s", b.Pickup, b.Dropoff))
 			c.String(http.StatusOK, fmt.Sprintf("%s,%s,%s,%s,%s\n", b.ID.Hex(), b.CreatedAt.Format("2006-01-02"), routeStr, sanitizeCSV(b.Type), sanitizeCSV(b.Status)))
 		}
 	case "revenue":
+		cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch revenue report"})
+			return
+		}
+		var bookings []models.Booking
+		if cursor != nil {
+			if err := cursor.All(ctx, &bookings); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse revenue report"})
+				return
+			}
+		}
+
+		c.Header("Content-Type", "text/csv")
 		c.Header("Content-Disposition", `attachment; filename="revenue.csv"`)
 		c.String(http.StatusOK, "Route,Bookings,Revenue (₹)\n")
-
-		cursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
-		var bookings []models.Booking
-		cursor.All(ctx, &bookings)
 
 		type routeAgg struct {
 			count int
@@ -388,12 +415,22 @@ func AdminReports(c *gin.Context) {
 			c.String(http.StatusOK, fmt.Sprintf("%s,%d,%.2f\n", sanitizeCSV(routeKey), agg.count, agg.total))
 		}
 	case "payouts":
-		c.Header("Content-Disposition", `attachment; filename="payouts.csv"`)
-		c.String(http.StatusOK, "DriverID,Status,TotalPayout (₹)\n")
-
-		cursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
+		cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch payouts report"})
+			return
+		}
 		var bookings []models.Booking
-		cursor.All(ctx, &bookings)
+		if cursor != nil {
+			if err := cursor.All(ctx, &bookings); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse payouts report"})
+				return
+			}
+		}
+
+		c.Header("Content-Type", "text/csv")
+		c.Header("Content-Disposition", `attachment; filename="payouts.csv"`)
+		c.String(http.StatusOK, "RideID,Status,TotalPayout (₹)\n")
 
 		payoutMap := make(map[primitive.ObjectID]float64)
 		for _, b := range bookings {
@@ -439,9 +476,18 @@ func fmtFloat(f float64) string   { return fmt.Sprintf("%.2f", f) }
 func AdminBookings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	cursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(100))
+	cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(100))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings"})
+		return
+	}
 	var bookings []models.Booking
-	cursor.All(ctx, &bookings)
+	if cursor != nil {
+		if err := cursor.All(ctx, &bookings); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings"})
+			return
+		}
+	}
 	type BookingRow struct {
 		ID             string `json:"id"`
 		BookingID      string `json:"bookingId"`
@@ -453,12 +499,62 @@ func AdminBookings(c *gin.Context) {
 		Seats          int    `json:"seats"`
 		CreatedAt      string `json:"createdAt"`
 	}
+	// PERF: Batch load passengers and rides in two $in queries instead of N+1 FindOne queries.
+	passengerIDs := make([]primitive.ObjectID, 0, len(bookings))
+	seenPassenger := make(map[primitive.ObjectID]bool, len(bookings))
+	rideIDs := make([]primitive.ObjectID, 0, len(bookings))
+	seenRide := make(map[primitive.ObjectID]bool, len(bookings))
+	for _, b := range bookings {
+		if !b.PassengerID.IsZero() && !seenPassenger[b.PassengerID] {
+			seenPassenger[b.PassengerID] = true
+			passengerIDs = append(passengerIDs, b.PassengerID)
+		}
+		if !b.RideID.IsZero() && !seenRide[b.RideID] {
+			seenRide[b.RideID] = true
+			rideIDs = append(rideIDs, b.RideID)
+		}
+	}
+
+	passengerMap := make(map[primitive.ObjectID]models.User, len(passengerIDs))
+	if len(passengerIDs) > 0 {
+		uCursor, uErr := config.Database.Collection("users").Find(
+			ctx,
+			bson.M{"_id": bson.M{"$in": passengerIDs}},
+			options.Find().SetProjection(bson.M{"name": 1, "phone_number": 1}),
+		)
+		if uErr == nil && uCursor != nil {
+			var passengers []models.User
+			if uCursor.All(ctx, &passengers) == nil {
+				for _, p := range passengers {
+					passengerMap[p.ID] = p
+				}
+			}
+			uCursor.Close(ctx)
+		}
+	}
+
+	rideMap := make(map[primitive.ObjectID]models.Ride, len(rideIDs))
+	if len(rideIDs) > 0 {
+		rCursor, rErr := config.Database.Collection("rides").Find(
+			ctx,
+			bson.M{"_id": bson.M{"$in": rideIDs}},
+			options.Find().SetProjection(bson.M{"driverName": 1, "pickup": 1, "dropoff": 1}),
+		)
+		if rErr == nil && rCursor != nil {
+			var rides []models.Ride
+			if rCursor.All(ctx, &rides) == nil {
+				for _, r := range rides {
+					rideMap[r.ID] = r
+				}
+			}
+			rCursor.Close(ctx)
+		}
+	}
+
 	var result []BookingRow
 	for _, b := range bookings {
-		var p models.User
-		config.Database.Collection("users").FindOne(ctx, bson.M{"_id": b.PassengerID}).Decode(&p)
-		var r models.Ride
-		config.Database.Collection("rides").FindOne(ctx, bson.M{"_id": b.RideID}).Decode(&r)
+		p := passengerMap[b.PassengerID]
+		r := rideMap[b.RideID]
 		result = append(result, BookingRow{
 			ID:             b.ID.Hex(),
 			BookingID:      b.BookingID,
@@ -587,9 +683,18 @@ func AdminGetBookingDetails(c *gin.Context) {
 func AdminDrivers(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	cursor, _ := config.Database.Collection("users").Find(ctx, bson.M{"role": "driver"}, options.Find().SetSort(bson.D{{Key: "submitted_at", Value: -1}}))
+	cursor, err := config.Database.Collection("users").Find(ctx, bson.M{"role": "driver"}, options.Find().SetSort(bson.D{{Key: "submitted_at", Value: -1}}))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch drivers"})
+		return
+	}
 	var drivers []models.User
-	cursor.All(ctx, &drivers)
+	if cursor != nil {
+		if err := cursor.All(ctx, &drivers); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse drivers"})
+			return
+		}
+	}
 
 	type DriverRow struct {
 		ID                 string `json:"id"`
@@ -613,9 +718,34 @@ func AdminDrivers(c *gin.Context) {
 		CurrentRide        string `json:"currentRide"`
 	}
 
+	// PERF: Batch count driver rides in ONE aggregation instead of N+1 CountDocuments queries.
+	driverIDs := make([]primitive.ObjectID, 0, len(drivers))
+	for _, d := range drivers {
+		driverIDs = append(driverIDs, d.ID)
+	}
+	driverRideCounts := make(map[primitive.ObjectID]int64, len(driverIDs))
+	if len(driverIDs) > 0 {
+		pipeline := mongo.Pipeline{
+			{{Key: "$match", Value: bson.M{"driverId": bson.M{"$in": driverIDs}}}},
+			{{Key: "$group", Value: bson.M{"_id": "$driverId", "count": bson.M{"$sum": 1}}}},
+		}
+		if dCursor, dErr := config.Database.Collection("rides").Aggregate(ctx, pipeline); dErr == nil && dCursor != nil {
+			var counts []struct {
+				ID    primitive.ObjectID `bson:"_id"`
+				Count int64              `bson:"count"`
+			}
+			if dCursor.All(ctx, &counts) == nil {
+				for _, c := range counts {
+					driverRideCounts[c.ID] = c.Count
+				}
+			}
+			dCursor.Close(ctx)
+		}
+	}
+
 	var result []DriverRow
 	for _, d := range drivers {
-		totalRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"driverId": d.ID})
+		totalRides := driverRideCounts[d.ID]
 
 		status := d.VerificationStatus
 		if status == "" {
@@ -728,7 +858,12 @@ func AdminRequestReKYC(c *gin.Context) {
 	var body struct {
 		Reason string `json:"reason"`
 	}
-	_ = c.BindJSON(&body)
+	if c.Request != nil && c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+			return
+		}
+	}
 
 	reason := strings.TrimSpace(body.Reason)
 	if reason == "" {
@@ -790,7 +925,11 @@ func AdminDeleteDriver(c *gin.Context) {
 	}
 
 	// Delete all bookings associated with rides by this driver
-	ridesCursor, _ := config.Database.Collection("rides").Find(ctx, bson.M{"driverId": driverId}, options.Find().SetProjection(bson.M{"_id": 1}))
+	ridesCursor, err := config.Database.Collection("rides").Find(ctx, bson.M{"driverId": driverId}, options.Find().SetProjection(bson.M{"_id": 1}))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver rides"})
+		return
+	}
 	var rideIds []primitive.ObjectID
 	if ridesCursor != nil {
 		for ridesCursor.Next(ctx) {
@@ -836,20 +975,49 @@ func AdminDeleteDriver(c *gin.Context) {
 func AdminRidesList(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	cursor, _ := config.Database.Collection("rides").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(50))
+	cursor, err := config.Database.Collection("rides").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(50))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch rides"})
+		return
+	}
 	var rides []models.Ride
-	cursor.All(ctx, &rides)
+	if cursor != nil {
+		if err := cursor.All(ctx, &rides); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse rides"})
+			return
+		}
+	}
 
-	// Fetch all accepted bookings in one query for efficiency
-	bookingCursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
-	var allBookings []models.Booking
-	bookingCursor.All(ctx, &allBookings)
+	// Scope accepted bookings query to the fetched ride IDs instead of loading the entire collection.
+	rideIDs := make([]primitive.ObjectID, 0, len(rides))
+	for _, r := range rides {
+		rideIDs = append(rideIDs, r.ID)
+	}
 
-	// Build a map: rideId -> count of accepted booked seats (from actual SeatLayout)
-	bookedSeatCount := make(map[primitive.ObjectID]int)
-	for _, b := range allBookings {
-		for range b.SeatLayout {
-			bookedSeatCount[b.RideID]++
+	bookedSeatCount := make(map[primitive.ObjectID]int, len(rideIDs))
+	if len(rideIDs) > 0 {
+		bookingCursor, err := config.Database.Collection("bookings").Find(
+			ctx,
+			bson.M{"rideId": bson.M{"$in": rideIDs}, "status": "accepted"},
+			options.Find().SetProjection(bson.M{"rideId": 1, "seatLayout": 1}),
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings for rides"})
+			return
+		}
+		var allBookings []models.Booking
+		if bookingCursor != nil {
+			if err := bookingCursor.All(ctx, &allBookings); err != nil {
+				bookingCursor.Close(ctx)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings for rides"})
+				return
+			}
+			bookingCursor.Close(ctx)
+		}
+
+		// Build a map: rideId -> count of accepted booked seats (from actual SeatLayout)
+		for _, b := range allBookings {
+			bookedSeatCount[b.RideID] += len(b.SeatLayout)
 		}
 	}
 
@@ -877,13 +1045,45 @@ func AdminRidesList(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+func bsonInt32Val(v interface{}) int32 {
+	switch n := v.(type) {
+	case int32:
+		return n
+	case int64:
+		return int32(n)
+	case int:
+		return int32(n)
+	default:
+		return 0
+	}
+}
+
 func AdminRoutesAnalytics(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	pipeline := mongo.Pipeline{{{Key: "$group", Value: bson.M{"_id": bson.M{"pickup": "$pickup", "dropoff": "$dropoff"}, "totalRides": bson.M{"$sum": 1}, "topDriver": bson.M{"$first": "$driverName"}, "avgPrice": bson.M{"$avg": "$pricePerSeat"}}}}}
-	cursor, _ := config.Database.Collection("rides").Aggregate(ctx, pipeline)
+	pipeline := mongo.Pipeline{
+		{{Key: "$group", Value: bson.M{
+			"_id":           bson.M{"pickup": "$pickup", "dropoff": "$dropoff"},
+			"totalRides":    bson.M{"$sum": 1},
+			"cancellations": bson.M{"$sum": bson.M{"$cond": []interface{}{bson.M{"$eq": []interface{}{"$status", "cancelled"}}, 1, 0}}},
+			"topDriver":     bson.M{"$first": "$driverName"},
+			"avgPrice":      bson.M{"$avg": "$pricePerSeat"},
+		}}},
+	}
+	cursor, err := config.Database.Collection("rides").Aggregate(ctx, pipeline)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch route analytics"})
+		return
+	}
 	var raw []bson.M
-	cursor.All(ctx, &raw)
+	if cursor != nil {
+		if err := cursor.All(ctx, &raw); err != nil {
+			cursor.Close(ctx)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse route analytics"})
+			return
+		}
+		cursor.Close(ctx)
+	}
 	type RouteRow struct {
 		ID            string  `json:"id"`
 		Route         string  `json:"route"`
@@ -901,21 +1101,16 @@ func AdminRoutesAnalytics(c *gin.Context) {
 		}
 		pickup, _ := idMap["pickup"].(string)
 		dropoff, _ := idMap["dropoff"].(string)
-		totalRides, _ := r["totalRides"].(int32)
+		totalRides := bsonInt32Val(r["totalRides"])
+		cancelledCount := bsonInt32Val(r["cancellations"])
 		topDriver, _ := r["topDriver"].(string)
 		avgPrice, _ := r["avgPrice"].(float64)
-
-		cancelledCount, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{
-			"pickup":  pickup,
-			"dropoff": dropoff,
-			"status":  "cancelled",
-		})
 
 		result = append(result, RouteRow{
 			ID:            "RT-" + primitive.NewObjectID().Hex()[:4],
 			Route:         pickup + " ⇄ " + dropoff,
 			Bookings:      totalRides,
-			Cancellations: int32(cancelledCount),
+			Cancellations: cancelledCount,
 			TopDriver:     topDriver,
 			AvgPrice:      avgPrice,
 			Status:        "Active",

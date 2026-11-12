@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
+
 	"raahi-backend/config"
 	"raahi-backend/controllers"
 	"raahi-backend/routes"
@@ -48,6 +54,9 @@ func main() {
 	}
 
 	config.ConnectDB()
+	if config.Database == nil {
+		log.Fatal("FATAL: MongoDB database is not initialized")
+	}
 	utils.InitFCM()
 	controllers.InitializeAuthCollection()
 	controllers.InitializeRideCollection()
@@ -155,5 +164,39 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	r.Run(":" + port)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("Server listening on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Server listen error: %v", err)
+		}
+	}()
+
+	<-sigCtx.Done()
+	log.Println("Shutdown signal received — shutting down gracefully...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server forced to shutdown: %v", err)
+	}
+
+	if config.DB != nil {
+		if err := config.DB.Disconnect(shutdownCtx); err != nil {
+			log.Printf("MongoDB disconnect error: %v", err)
+		}
+	}
+
+	sentry.Flush(5 * time.Second)
+	log.Println("Server exited cleanly")
 }
