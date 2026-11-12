@@ -642,12 +642,29 @@ func matchPriority(r RideResponse) int {
 	return 3
 }
 
+func effectiveRidePrice(r RideResponse) float64 {
+	if r.SegmentPricePerSeat > 0 {
+		return r.SegmentPricePerSeat
+	}
+	return r.PricePerSeat
+}
+
 func sortRideResponses(results []RideResponse) {
 	for i := 0; i < len(results)-1; i++ {
 		for j := 0; j < len(results)-i-1; j++ {
 			pJ := matchPriority(results[j])
 			pNext := matchPriority(results[j+1])
-			if pJ > pNext || (pJ == pNext && len(results[j].TakenSeats) < len(results[j+1].TakenSeats)) {
+			priceJ := effectiveRidePrice(results[j])
+			priceNext := effectiveRidePrice(results[j+1])
+			shouldSwap := false
+			if pJ != pNext {
+				shouldSwap = pJ > pNext
+			} else if priceJ != priceNext {
+				shouldSwap = priceJ < priceNext
+			} else {
+				shouldSwap = len(results[j].TakenSeats) < len(results[j+1].TakenSeats)
+			}
+			if shouldSwap {
 				results[j], results[j+1] = results[j+1], results[j]
 			}
 		}
@@ -759,9 +776,9 @@ func GetAvailableRides(c *gin.Context) {
 	}
 
 	// Sort results:
-	// 1. Full matches (!IsPartialMatch) first, sorted by len(TakenSeats) descending
-	// 2. Common starting point ("common_pickup") matches, sorted by len(TakenSeats) descending
-	// 3. Common destination ("common_dropoff") matches, sorted by len(TakenSeats) descending
+	// 1. Full matches (!IsPartialMatch) first, sorted by effectiveRidePrice descending (then len(TakenSeats) descending)
+	// 2. Common starting point ("common_pickup") matches, sorted by effectiveRidePrice descending (then len(TakenSeats) descending)
+	// 3. Common destination ("common_dropoff") matches, sorted by effectiveRidePrice descending (then len(TakenSeats) descending)
 	if len(results) > 1 {
 		sortRideResponses(results)
 	}

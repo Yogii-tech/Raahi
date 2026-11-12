@@ -289,30 +289,51 @@ func TestComputeSegmentPricingAndSorting(t *testing.T) {
 		t.Errorf("substring stop pricing got (price=%v, distKm=%v, p=%q, d=%q), want distKm=250 and proportional price < 600", ndPrice, ndDistKm, ndP, ndD)
 	}
 
-	// 3. Sorting order: full matches (by takenSeats desc) -> common_pickup (by takenSeats desc) -> common_dropoff (by takenSeats desc)
+	// 3. Sorting order:
+	//    - Primary: match tier ("full" -> "common_pickup" -> "common_dropoff")
+	//    - Secondary: effectiveRidePrice descending (High to Low), preferring SegmentPricePerSeat when > 0 else PricePerSeat
+	//    - Tertiary tie-breaker: len(TakenSeats) descending
 	results := []RideResponse{
 		{
-			Ride:           models.Ride{Pickup: "Haldwani", Dropoff: "Delhi", TakenSeats: []int{1, 2, 3}},
+			Ride:           models.Ride{Pickup: "Haldwani", Dropoff: "Delhi", PricePerSeat: 300, TakenSeats: []int{1, 2, 3}},
 			MatchType:      "common_dropoff",
 			IsPartialMatch: true,
 		},
 		{
-			Ride:           models.Ride{Pickup: "Bageshwar", Dropoff: "Haldwani", TakenSeats: []int{1}},
+			Ride:                models.Ride{Pickup: "Haldwani", Dropoff: "Delhi", PricePerSeat: 600, TakenSeats: []int{1}},
+			SegmentPricePerSeat: 450,
+			MatchType:           "common_dropoff",
+			IsPartialMatch:      true,
+		},
+		{
+			Ride:           models.Ride{Pickup: "Bageshwar", Dropoff: "Haldwani", PricePerSeat: 350, TakenSeats: []int{1}},
 			MatchType:      "common_pickup",
 			IsPartialMatch: true,
 		},
 		{
-			Ride:           models.Ride{Pickup: "Bageshwar", Dropoff: "Delhi", TakenSeats: []int{}},
+			Ride:                models.Ride{Pickup: "Bageshwar", Dropoff: "Haldwani", PricePerSeat: 500, TakenSeats: []int{}},
+			SegmentPricePerSeat: 400,
+			MatchType:           "common_pickup",
+			IsPartialMatch:      true,
+		},
+		{
+			Ride:           models.Ride{Pickup: "Bageshwar", Dropoff: "Haldwani", PricePerSeat: 350, TakenSeats: []int{1, 2}},
+			MatchType:      "common_pickup",
+			IsPartialMatch: true,
+		},
+		{
+			Ride:           models.Ride{Pickup: "Bageshwar", Dropoff: "Delhi", PricePerSeat: 500, TakenSeats: []int{}},
 			MatchType:      "full",
 			IsPartialMatch: false,
 		},
 		{
-			Ride:           models.Ride{Pickup: "Bageshwar", Dropoff: "Haldwani", TakenSeats: []int{1, 2}},
-			MatchType:      "common_pickup",
-			IsPartialMatch: true,
+			Ride:                models.Ride{Pickup: "Bageshwar", Dropoff: "Delhi", PricePerSeat: 900, TakenSeats: []int{1}},
+			SegmentPricePerSeat: 750,
+			MatchType:           "full",
+			IsPartialMatch:      false,
 		},
 		{
-			Ride:           models.Ride{Pickup: "Bageshwar", Dropoff: "Delhi", TakenSeats: []int{1, 2}},
+			Ride:           models.Ride{Pickup: "Bageshwar", Dropoff: "Delhi", PricePerSeat: 500, TakenSeats: []int{1, 2}},
 			MatchType:      "full",
 			IsPartialMatch: false,
 		},
@@ -322,19 +343,28 @@ func TestComputeSegmentPricingAndSorting(t *testing.T) {
 
 	expectedOrder := []struct {
 		matchType string
+		effPrice  float64
 		taken     int
 	}{
-		{"full", 2},
-		{"full", 0},
-		{"common_pickup", 2},
-		{"common_pickup", 1},
-		{"common_dropoff", 3},
+		{"full", 750, 1},
+		{"full", 500, 2},
+		{"full", 500, 0},
+		{"common_pickup", 400, 0},
+		{"common_pickup", 350, 2},
+		{"common_pickup", 350, 1},
+		{"common_dropoff", 450, 1},
+		{"common_dropoff", 300, 3},
+	}
+
+	if len(results) != len(expectedOrder) {
+		t.Fatalf("len(results) = %d, want %d", len(results), len(expectedOrder))
 	}
 
 	for i, exp := range expectedOrder {
-		if results[i].MatchType != exp.matchType || len(results[i].TakenSeats) != exp.taken {
-			t.Errorf("sorted[%d] = (%s, taken=%d), want (%s, taken=%d)",
-				i, results[i].MatchType, len(results[i].TakenSeats), exp.matchType, exp.taken)
+		gotPrice := effectiveRidePrice(results[i])
+		if results[i].MatchType != exp.matchType || gotPrice != exp.effPrice || len(results[i].TakenSeats) != exp.taken {
+			t.Errorf("sorted[%d] = (%s, effPrice=%v, taken=%d), want (%s, effPrice=%v, taken=%d)",
+				i, results[i].MatchType, gotPrice, len(results[i].TakenSeats), exp.matchType, exp.effPrice, exp.taken)
 		}
 	}
 }
