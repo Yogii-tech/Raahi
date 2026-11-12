@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -315,13 +316,56 @@ func RoutePreview(c *gin.Context) {
 }
 
 
+var locationPattern = regexp.MustCompile(`^[a-zA-Z0-9\s\-,.]+$`)
+
 func getStopIndex(route []string, stop string) int {
+	stopClean := strings.TrimSpace(stop)
+	if stopClean == "" {
+		return -1
+	}
+	// First pass: exact case-insensitive match so substring stops (e.g. "Kota" vs "Kotabagh") don't collide
 	for i, s := range route {
-		if utils.FuzzyMatch(s, stop) {
+		if strings.EqualFold(strings.TrimSpace(s), stopClean) {
+			return i
+		}
+	}
+	// Second pass: fuzzy substring match
+	for i, s := range route {
+		if utils.FuzzyMatch(s, stopClean) {
 			return i
 		}
 	}
 	return -1
+}
+
+// normalizeRideRoute returns a clean, trimmed, case-insensitively deduplicated route slice,
+// falling back to [ride.Pickup, ride.Dropoff] when ride.Route has no valid stops.
+func normalizeRideRoute(ride models.Ride) []string {
+	var clean []string
+	seen := make(map[string]bool, len(ride.Route)+2)
+	for _, s := range ride.Route {
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if !seen[key] {
+			seen[key] = true
+			clean = append(clean, trimmed)
+		}
+	}
+	if len(clean) == 0 {
+		p := strings.TrimSpace(ride.Pickup)
+		d := strings.TrimSpace(ride.Dropoff)
+		if p != "" {
+			clean = append(clean, p)
+			seen[strings.ToLower(p)] = true
+		}
+		if d != "" && !seen[strings.ToLower(d)] {
+			clean = append(clean, d)
+		}
+	}
+	return clean
 }
 
 func segmentsOverlap(p1, d1, p2, d2 string, route []string) bool {
@@ -380,11 +424,12 @@ func queryTakenSeats(ctx context.Context, ride models.Ride, searchPickup, search
 		return nil, err
 	}
 
+	normRoute := normalizeRideRoute(ride)
 	takenMap := make(map[int]bool)
 	for _, b := range bookings {
 		// If searching for specific segment, only include overlapping bookings
 		if searchPickup != "" && searchDropoff != "" {
-			if segmentsOverlap(searchPickup, searchDropoff, b.Pickup, b.Dropoff, ride.Route) {
+			if segmentsOverlap(searchPickup, searchDropoff, b.Pickup, b.Dropoff, normRoute) {
 				for _, s := range b.SeatLayout {
 					takenMap[s] = true
 				}
@@ -419,6 +464,196 @@ func queryTakenSeats(ctx context.Context, ride models.Ride, searchPickup, search
 	return taken, nil
 }
 
+// RideResponse represents an available ride returned by GetAvailableRides,
+// enriched with segment-specific pricing and route match metadata.
+type RideResponse struct {
+	models.Ride
+	SegmentPricePerSeat float64 `json:"segmentPricePerSeat,omitempty"`
+	SegmentDistanceKm   float64 `json:"segmentDistanceKm,omitempty"`
+	MatchedPickup       string  `json:"matchedPickup,omitempty"`
+	MatchedDropoff      string  `json:"matchedDropoff,omitempty"`
+	MatchType           string  `json:"matchType,omitempty"`
+	IsPartialMatch      bool    `json:"isPartialMatch,omitempty"`
+}
+
+// classifyRideMatch determines whether a candidate ride matches the passenger's search
+// (as a "full" match, a "common_pickup" partial match, or a "common_dropoff" partial match)
+// and returns the effective segment endpoints on the driver's route.
+func classifyRideMatch(ride models.Ride, searchPickup, searchDropoff string) (matched bool, matchType string, isPartial bool, matchedPickup, matchedDropoff string) {
+	searchPickup = strings.TrimSpace(searchPickup)
+	searchDropoff = strings.TrimSpace(searchDropoff)
+
+	if searchPickup == "" && searchDropoff == "" {
+		return true, "full", false, "", ""
+	}
+
+	// Reject same-city searches (e.g. pickup == dropoff or fuzzy-equivalent endpoints)
+	if searchPickup != "" && searchDropoff != "" && utils.FuzzyMatch(searchPickup, searchDropoff) {
+		return false, "", false, "", ""
+	}
+
+	route := normalizeRideRoute(ride)
+	if len(route) < 2 {
+		return false, "", false, "", ""
+	}
+
+	pickupIdx := -1
+	if searchPickup != "" {
+		pickupIdx = getStopIndex(route, searchPickup)
+	}
+	dropoffIdx := -1
+	if searchDropoff != "" {
+		dropoffIdx = getStopIndex(route, searchDropoff)
+	}
+
+	// Full match: both pickup and dropoff exist in route in forward order.
+	// If both exist in reverse order (or same stop), reject so reverse-direction rides never match.
+	if searchPickup != "" && searchDropoff != "" && pickupIdx >= 0 && dropoffIdx >= 0 {
+		if pickupIdx < dropoffIdx && !utils.FuzzyMatch(route[pickupIdx], route[dropoffIdx]) {
+			return true, "full", false, route[pickupIdx], route[dropoffIdx]
+		}
+		return false, "", false, "", ""
+	}
+
+	// Common starting point match: driver starts at or passes through pickup and continues onward.
+	if searchPickup != "" && pickupIdx >= 0 && pickupIdx < len(route)-1 {
+		endStop := strings.TrimSpace(ride.Dropoff)
+		if endStop == "" {
+			endStop = route[len(route)-1]
+		}
+		if !utils.FuzzyMatch(route[pickupIdx], endStop) {
+			return true, "common_pickup", searchDropoff != "", route[pickupIdx], endStop
+		}
+	}
+
+	// Common destination match: driver starts at ride.Pickup and reaches passenger's dropoff.
+	if searchDropoff != "" && dropoffIdx > 0 {
+		startStop := strings.TrimSpace(ride.Pickup)
+		if startStop == "" {
+			startStop = route[0]
+		}
+		if !utils.FuzzyMatch(startStop, route[dropoffIdx]) {
+			return true, "common_dropoff", searchPickup != "", startStop, route[dropoffIdx]
+		}
+	}
+
+	return false, "", false, "", ""
+}
+
+func computeSegmentPricing(ride models.Ride, matchedPickup, matchedDropoff string) (segPrice float64, segDistKm float64, normPickup string, normDropoff string) {
+	normPickup = strings.TrimSpace(matchedPickup)
+	normDropoff = strings.TrimSpace(matchedDropoff)
+
+	route := normalizeRideRoute(ride)
+	rideStart := strings.TrimSpace(ride.Pickup)
+	if rideStart == "" && len(route) > 0 {
+		rideStart = route[0]
+	}
+	rideEnd := strings.TrimSpace(ride.Dropoff)
+	if rideEnd == "" && len(route) > 0 {
+		rideEnd = route[len(route)-1]
+	}
+
+	spansFullRide := rideStart != "" && rideEnd != "" &&
+		(strings.EqualFold(normPickup, rideStart) || (len(route) >= 2 && getStopIndex(route, normPickup) == 0)) &&
+		(strings.EqualFold(normDropoff, rideEnd) || (len(route) >= 2 && getStopIndex(route, normDropoff) == len(route)-1))
+
+	if !spansFullRide {
+		pIdx, pStop := utils.MatchStopInRoute(ride.DiscoveredStops, normPickup)
+		dIdx, dStop := utils.MatchStopInRoute(ride.DiscoveredStops, normDropoff)
+
+		if len(ride.DiscoveredStops) > 0 {
+			if pIdx == -1 && rideStart != "" && utils.FuzzyMatch(normPickup, rideStart) {
+				pIdx = 0
+				pStop = models.StopInfo{Name: rideStart, DistanceM: 0}
+			}
+			if dIdx == -1 && rideEnd != "" && utils.FuzzyMatch(normDropoff, rideEnd) && ride.TotalDistanceM > 0 {
+				dIdx = len(ride.DiscoveredStops)
+				dStop = models.StopInfo{Name: rideEnd, DistanceM: ride.TotalDistanceM}
+			}
+		}
+
+		if pIdx != -1 && dIdx != -1 && dStop.DistanceM > pStop.DistanceM {
+			segDistKm = (dStop.DistanceM - pStop.DistanceM) / 1000
+			segPrice = utils.CalculateSegmentPrice(ride.PricePerSeat, ride.TotalDistanceM, pStop.DistanceM, dStop.DistanceM)
+			outPickup := strings.TrimSpace(pStop.Name)
+			if outPickup == "" {
+				outPickup = normPickup
+			}
+			outDropoff := strings.TrimSpace(dStop.Name)
+			if outDropoff == "" {
+				outDropoff = normDropoff
+			}
+			return segPrice, segDistKm, outPickup, outDropoff
+		}
+	}
+
+	return ride.PricePerSeat, ride.TotalDistanceM / 1000, normPickup, normDropoff
+}
+
+// resolveBookingSegment validates a booking's requested pickup and dropoff against a ride's route,
+// returning the normalized segment endpoints on the driver's route, per-seat segment price, and total price.
+func resolveBookingSegment(ride models.Ride, reqPickup, reqDropoff string, seats int) (valid bool, normPickup, normDropoff string, segPricePerSeat, totalPrice float64) {
+	reqPickup = strings.TrimSpace(reqPickup)
+	reqDropoff = strings.TrimSpace(reqDropoff)
+	if reqPickup == "" || reqDropoff == "" {
+		return false, "", "", 0, 0
+	}
+
+	matched, _, _, matchedPickup, matchedDropoff := classifyRideMatch(ride, reqPickup, reqDropoff)
+	if !matched || matchedPickup == "" || matchedDropoff == "" {
+		return false, "", "", 0, 0
+	}
+
+	segPrice, _, nPickup, nDropoff := computeSegmentPricing(ride, matchedPickup, matchedDropoff)
+	if seats <= 0 {
+		seats = 1
+	}
+	total := math.Round(segPrice * float64(seats))
+	return true, nPickup, nDropoff, segPrice, total
+}
+
+// buildLocationRegex builds a safe case-insensitive MongoDB regex for a validated location query.
+// When the location includes a comma-qualified suffix (e.g. "Bageshwar, Uttarakhand"), it also
+// matches the primary locality name before the comma so MongoDB filtering aligns with utils.FuzzyMatch.
+func buildLocationRegex(loc string) primitive.Regex {
+	loc = strings.TrimSpace(loc)
+	quotedFull := regexp.QuoteMeta(loc)
+	if idx := strings.Index(loc, ","); idx > 0 {
+		primary := strings.TrimSpace(loc[:idx])
+		if len(primary) >= 2 && !strings.EqualFold(primary, loc) {
+			quotedPrimary := regexp.QuoteMeta(primary)
+			return primitive.Regex{Pattern: "(?i)(?:" + quotedFull + "|" + quotedPrimary + ")", Options: ""}
+		}
+	}
+	return primitive.Regex{Pattern: "(?i)" + quotedFull, Options: ""}
+}
+
+func matchPriority(r RideResponse) int {
+	if !r.IsPartialMatch || r.MatchType == "full" {
+		return 0
+	}
+	if r.MatchType == "common_pickup" {
+		return 1
+	}
+	if r.MatchType == "common_dropoff" {
+		return 2
+	}
+	return 3
+}
+
+func sortRideResponses(results []RideResponse) {
+	for i := 0; i < len(results)-1; i++ {
+		for j := 0; j < len(results)-i-1; j++ {
+			pJ := matchPriority(results[j])
+			pNext := matchPriority(results[j+1])
+			if pJ > pNext || (pJ == pNext && len(results[j].TakenSeats) < len(results[j+1].TakenSeats)) {
+				results[j], results[j+1] = results[j+1], results[j]
+			}
+		}
+	}
+}
+
 func GetAvailableRides(c *gin.Context) {
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -429,7 +664,6 @@ func GetAvailableRides(c *gin.Context) {
 
 	// Validate user-controlled inputs before using them in DB query construction
 	const maxLocationLen = 100
-	locationPattern := regexp.MustCompile(`^[a-zA-Z0-9\s\-,.]+$`)
 
 	if pickup != "" {
 		if len(pickup) > maxLocationLen || !locationPattern.MatchString(pickup) {
@@ -454,82 +688,32 @@ func GetAvailableRides(c *gin.Context) {
 
 	log.Printf("🔍 SEARCH REQUEST: pickup='%s', dropoff='%s', date='%s'", pickup, dropoff, date)
 
-	// Build DB filter: always filter available rides, optionally by date
+	// Build DB filter: always filter available rides, optionally by date,
+	// and match rides whose route contains pickup OR dropoff (to support both full and common-point matches).
 	matchStage := bson.M{"status": "available"}
 	if date != "" {
 		matchStage["date"] = date
 	}
 
-	// Use MongoDB aggregation for efficient multi-stop matching
-	pipeline := mongo.Pipeline{
-		{{Key: "$match", Value: matchStage}},
+	var routeConditions []bson.M
+	if pickup != "" {
+		routeConditions = append(routeConditions, bson.M{
+			"route": bson.M{"$regex": buildLocationRegex(pickup)},
+		})
+	}
+	if dropoff != "" {
+		routeConditions = append(routeConditions, bson.M{
+			"route": bson.M{"$regex": buildLocationRegex(dropoff)},
+		})
+	}
+	if len(routeConditions) == 1 {
+		matchStage["route"] = routeConditions[0]["route"]
+	} else if len(routeConditions) > 1 {
+		matchStage["$or"] = routeConditions
 	}
 
-	// If pickup/dropoff are provided, filter by route sequence
-	if pickup != "" && dropoff != "" {
-		// --- SECURITY HARDENING: Validation ---
-		if len(pickup) > 100 || len(dropoff) > 100 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Search query too long"})
-			return
-		}
-
-		// Only allow alphanumeric, spaces, commas, and hyphens to prevent regex injection attacks
-		safeRegex := regexp.MustCompile(`^[a-zA-Z0-9\s,\-]+$`)
-		if !safeRegex.MatchString(pickup) || !safeRegex.MatchString(dropoff) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid characters in search"})
-			return
-		}
-
-		quotedPickup := regexp.QuoteMeta(pickup)
-		quotedDropoff := regexp.QuoteMeta(dropoff)
-
-		// We use multiple $match stages because $all with $regex is not supported in many MongoDB versions/drivers
-		pipeline = append(pipeline, bson.D{{Key: "$match", Value: bson.M{
-			"route": bson.M{"$regex": primitive.Regex{Pattern: "(?i)" + quotedPickup, Options: ""}},
-		}}})
-		pipeline = append(pipeline, bson.D{{Key: "$match", Value: bson.M{
-			"route": bson.M{"$regex": primitive.Regex{Pattern: "(?i)" + quotedDropoff, Options: ""}},
-		}}})
-
-		// Add fields for indexes to check sequence
-		// We use $map with $regexMatch to handle fuzzy/partial matches for indices
-		pipeline = append(pipeline, bson.D{{Key: "$addFields", Value: bson.M{
-			"pickupIndex": bson.M{
-				"$indexOfArray": []interface{}{
-					bson.M{"$map": bson.M{
-						"input": "$route",
-						"as":    "r",
-						"in": bson.M{"$regexMatch": bson.M{
-							"input": "$$r",
-							"regex": "(?i)" + quotedPickup,
-						}},
-					}},
-					true,
-				},
-			},
-			"dropoffIndex": bson.M{
-				"$indexOfArray": []interface{}{
-					bson.M{"$map": bson.M{
-						"input": "$route",
-						"as":    "r",
-						"in": bson.M{"$regexMatch": bson.M{
-							"input": "$$r",
-							"regex": "(?i)" + quotedDropoff,
-						}},
-					}},
-					true,
-				},
-			},
-		}}})
-
-		// Filter: pickup must come before dropoff
-		pipeline = append(pipeline, bson.D{{Key: "$match", Value: bson.M{
-			"$expr": bson.M{"$and": []interface{}{
-				bson.M{"$ne": []interface{}{"$pickupIndex", -1}},
-				bson.M{"$ne": []interface{}{"$dropoffIndex", -1}},
-				bson.M{"$lt": []interface{}{"$pickupIndex", "$dropoffIndex"}},
-			}},
-		}}})
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: matchStage}},
 	}
 
 	cursor, err := rideCollection.Aggregate(dbCtx, pipeline)
@@ -545,66 +729,41 @@ func GetAvailableRides(c *gin.Context) {
 		return
 	}
 
-	type RideResponse struct {
-		models.Ride
-		SegmentPricePerSeat float64 `json:"segmentPricePerSeat,omitempty"`
-		SegmentDistanceKm   float64 `json:"segmentDistanceKm,omitempty"`
-		MatchedPickup       string  `json:"matchedPickup,omitempty"`
-		MatchedDropoff      string  `json:"matchedDropoff,omitempty"`
-	}
-
 	var results []RideResponse
 	for _, ride := range matchedRides {
-		ride.TakenSeats = getTakenSeats(dbCtx, ride, pickup, dropoff)
+		matched, matchType, isPartial, matchedPickup, matchedDropoff := classifyRideMatch(ride, pickup, dropoff)
+		if !matched {
+			continue
+		}
+
+		ride.TakenSeats = getTakenSeats(dbCtx, ride, matchedPickup, matchedDropoff)
 		if len(ride.TakenSeats) >= ride.SeatsTotal {
 			continue
 		}
-		response := RideResponse{Ride: ride}
 
-		if pickup != "" && dropoff != "" {
-			// Find actual stop names for the response
-			var pStop, dStop models.StopInfo
-			pIdx, dIdx := -1, -1
-
-			for i, s := range ride.DiscoveredStops {
-				if utils.FuzzyMatch(s.Name, pickup) {
-					pIdx = i
-					pStop = s
-				}
-				if utils.FuzzyMatch(s.Name, dropoff) {
-					dIdx = i
-					dStop = s
-				}
-			}
-
-			if pIdx != -1 && dIdx != -1 {
-				response.SegmentDistanceKm = (dStop.DistanceM - pStop.DistanceM) / 1000
-				response.SegmentPricePerSeat = utils.CalculateSegmentPrice(ride.PricePerSeat, ride.TotalDistanceM, pStop.DistanceM, dStop.DistanceM)
-				response.MatchedPickup = pStop.Name
-				response.MatchedDropoff = dStop.Name
-			} else {
-				// Fallback to full route info if stops not detailed
-				response.SegmentPricePerSeat = ride.PricePerSeat
-				response.SegmentDistanceKm = ride.TotalDistanceM / 1000
-				response.MatchedPickup = pickup
-				response.MatchedDropoff = dropoff
-			}
+		response := RideResponse{
+			Ride:           ride,
+			MatchType:      matchType,
+			IsPartialMatch: isPartial,
 		}
+
+		if matchedPickup != "" && matchedDropoff != "" {
+			segPrice, segDistKm, normPickup, normDropoff := computeSegmentPricing(ride, matchedPickup, matchedDropoff)
+			response.SegmentPricePerSeat = segPrice
+			response.SegmentDistanceKm = segDistKm
+			response.MatchedPickup = normPickup
+			response.MatchedDropoff = normDropoff
+		}
+
 		results = append(results, response)
 	}
 
-	// Sort results: Rides with the most filled/taken seats first (descending)
+	// Sort results:
+	// 1. Full matches (!IsPartialMatch) first, sorted by len(TakenSeats) descending
+	// 2. Common starting point ("common_pickup") matches, sorted by len(TakenSeats) descending
+	// 3. Common destination ("common_dropoff") matches, sorted by len(TakenSeats) descending
 	if len(results) > 1 {
-		// Import "sort" package isn't strictly needed if we sort inline or use a simple bubble sort since list sizes are small
-		// Let's implement a standard bubble sort to avoid adding new imports to imports block
-		for i := 0; i < len(results)-1; i++ {
-			for j := 0; j < len(results)-i-1; j++ {
-				// Sort by len(TakenSeats) descending
-				if len(results[j].TakenSeats) < len(results[j+1].TakenSeats) {
-					results[j], results[j+1] = results[j+1], results[j]
-				}
-			}
-		}
+		sortRideResponses(results)
 	}
 
 	if results == nil {
@@ -612,6 +771,7 @@ func GetAvailableRides(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, results)
 }
+
 func GetRideDetails(c *gin.Context) {
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -622,8 +782,8 @@ func GetRideDetails(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ride ID"})
 		return
 	}
-	pickup := c.Query("pickup")
-	dropoff := c.Query("dropoff")
+	pickup := strings.TrimSpace(c.Query("pickup"))
+	dropoff := strings.TrimSpace(c.Query("dropoff"))
 
 	var ride models.Ride
 	err = rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&ride)
@@ -632,8 +792,28 @@ func GetRideDetails(c *gin.Context) {
 		return
 	}
 
-	ride.TakenSeats = getTakenSeats(dbCtx, ride, pickup, dropoff)
-	c.JSON(http.StatusOK, ride)
+	response := RideResponse{Ride: ride}
+	segPickup, segDropoff := pickup, dropoff
+	if pickup != "" || dropoff != "" {
+		if matched, matchType, isPartial, matchedPickup, matchedDropoff := classifyRideMatch(ride, pickup, dropoff); matched {
+			segPickup = matchedPickup
+			segDropoff = matchedDropoff
+			response.MatchType = matchType
+			response.IsPartialMatch = isPartial
+			if matchedPickup != "" && matchedDropoff != "" {
+				segPrice, segDistKm, normPickup, normDropoff := computeSegmentPricing(ride, matchedPickup, matchedDropoff)
+				response.SegmentPricePerSeat = segPrice
+				response.SegmentDistanceKm = segDistKm
+				response.MatchedPickup = normPickup
+				response.MatchedDropoff = normDropoff
+				segPickup = normPickup
+				segDropoff = normDropoff
+			}
+		}
+	}
+
+	response.TakenSeats = getTakenSeats(dbCtx, ride, segPickup, segDropoff)
+	c.JSON(http.StatusOK, response)
 }
 
 func BookRide(c *gin.Context) {
@@ -690,8 +870,27 @@ func BookRide(c *gin.Context) {
 		return
 	}
 
+	seatsCount := body.SeatsRequested
+	if seatsCount <= 0 && len(body.SeatLayout) > 0 {
+		seatsCount = len(body.SeatLayout)
+	}
+	if seatsCount <= 0 {
+		seatsCount = 1
+	}
+
+	validSegment, effectivePickup, effectiveDropoff, _, computedTotalPrice := resolveBookingSegment(rideForCheck, body.Pickup, body.Dropoff, seatsCount)
+	if !validSegment {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid pickup or dropoff for this ride's route"})
+		return
+	}
+
+	bookingPrice := strings.TrimSpace(body.Price)
+	if bookingPrice == "" && bookingType == "seat" && computedTotalPrice > 0 {
+		bookingPrice = fmt.Sprintf("%.0f", computedTotalPrice)
+	}
+
 	// Verify that requested seats are not already taken or pending approval
-	takenSeats := getTakenSeats(checkCtx, rideForCheck, body.Pickup, body.Dropoff)
+	takenSeats := getTakenSeats(checkCtx, rideForCheck, effectivePickup, effectiveDropoff)
 	takenMap := make(map[int]bool)
 	for _, seat := range takenSeats {
 		takenMap[seat] = true
@@ -722,9 +921,9 @@ func BookRide(c *gin.Context) {
 		RideID:         rideId,
 		PassengerID:    passengerId,
 		Type:           bookingType,
-		Pickup:         body.Pickup,
-		Dropoff:        body.Dropoff,
-		SeatsRequested: body.SeatsRequested,
+		Pickup:         effectivePickup,
+		Dropoff:        effectiveDropoff,
+		SeatsRequested: seatsCount,
 		SeatLayout:     body.SeatLayout,
 		RoofCarrier:    body.RoofCarrier,
 		MotionSickness: body.MotionSickness,
@@ -735,7 +934,7 @@ func BookRide(c *gin.Context) {
 		DropLocation:  body.DropLocation,
 		Notes:         body.Notes,
 		PhotoUrl:      body.PhotoUrl,
-		Price:         body.Price,
+		Price:         bookingPrice,
 		Status:        "pending",
 		CreatedAt:     time.Now(),
 	}
@@ -753,7 +952,7 @@ func BookRide(c *gin.Context) {
 	// simultaneous requests for the same seat could both pass them. Re-verify now
 	// that our booking is persisted; if it conflicts, roll it back.
 	newBookingID, _ := result.InsertedID.(primitive.ObjectID)
-	conflictMsg, verifyErr := verifyNewBooking(dbCtx, rideId, newBookingID, passengerId, bookingType, body.Pickup, body.Dropoff, body.SeatLayout)
+	conflictMsg, verifyErr := verifyNewBooking(dbCtx, rideId, newBookingID, passengerId, bookingType, effectivePickup, effectiveDropoff, body.SeatLayout)
 	if verifyErr != nil || conflictMsg != "" {
 		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, _ = bookingCollection.DeleteOne(rbCtx, bson.M{"_id": newBookingID})
