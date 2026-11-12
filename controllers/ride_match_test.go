@@ -1,10 +1,19 @@
 package controllers
 
 import (
+	"bytes"
+	"math"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
+	"time"
 
 	"raahi-backend/models"
+
+	"github.com/gin-gonic/gin"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func TestClassifyRideMatch(t *testing.T) {
@@ -441,5 +450,103 @@ func TestResolveBookingSegmentAndConsistency(t *testing.T) {
 	}
 	if dotCompiled.MatchString("AXB Road") {
 		t.Errorf("expected '.' in 'A.B. Road' to be escaped by regexp.QuoteMeta, but matched 'AXB Road'")
+	}
+}
+
+func TestBackendSecurityControls(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// 1. UpdateProfile privilege escalation block: role="admin" must be rejected with 400 Bad Request
+	if isAllowedUserProfileRole("admin") {
+		t.Errorf("expected isAllowedUserProfileRole('admin') to be false")
+	}
+	for _, validRole := range []string{"passenger", "driver", "parceller"} {
+		if !isAllowedUserProfileRole(validRole) {
+			t.Errorf("expected isAllowedUserProfileRole(%q) to be true", validRole)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("userId", primitive.NewObjectID())
+	c.Request = httptest.NewRequest(http.MethodPut, "/api/user/profile", bytes.NewBufferString(`{"name":"Mallory","role":"admin"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	UpdateProfile(c)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected UpdateProfile with role='admin' to return 400, got %d", w.Code)
+	}
+
+	// 2. KYC document tampering detection for verified drivers
+	baseVehicle := &models.Vehicle{
+		VehicleName:     "Innova",
+		VehicleNumber:   "UK04AB1234",
+		DLUrl:           "/uploads/dl1.jpg",
+		RCUrl:           "/uploads/rc1.jpg",
+		PollutionUrl:    "/uploads/puc1.jpg",
+		VehicleImageUrl: "/uploads/car1.jpg",
+	}
+	sameVehicle := &models.Vehicle{
+		VehicleName:     "Innova Crysta",
+		VehicleNumber:   "UK04AB1234",
+		DLUrl:           "/uploads/dl1.jpg",
+		RCUrl:           "/uploads/rc1.jpg",
+		PollutionUrl:    "/uploads/puc1.jpg",
+		VehicleImageUrl: "/uploads/car1.jpg",
+	}
+	tamperedVehicle := &models.Vehicle{
+		VehicleName:     "Innova",
+		VehicleNumber:   "UK04AB1234",
+		DLUrl:           "/uploads/fake_dl.jpg",
+		RCUrl:           "/uploads/rc1.jpg",
+		PollutionUrl:    "/uploads/puc1.jpg",
+		VehicleImageUrl: "/uploads/car1.jpg",
+	}
+	if hasDriverVehicleChanged(baseVehicle, sameVehicle) {
+		t.Errorf("expected unchanged KYC URLs/number to return false")
+	}
+	if !hasDriverVehicleChanged(baseVehicle, tamperedVehicle) {
+		t.Errorf("expected modified DLUrl to trigger hasDriverVehicleChanged=true")
+	}
+
+	// 3. Chat IDOR authorization helper
+	passengerID := primitive.NewObjectID()
+	driverID := primitive.NewObjectID()
+	outsiderID := primitive.NewObjectID()
+	if !isAuthorizedForBookingChat(passengerID, passengerID, driverID) {
+		t.Errorf("expected passenger to be authorized for booking chat")
+	}
+	if !isAuthorizedForBookingChat(driverID, passengerID, driverID) {
+		t.Errorf("expected driver to be authorized for booking chat")
+	}
+	if isAuthorizedForBookingChat(outsiderID, passengerID, driverID) {
+		t.Errorf("expected third-party user to be rejected from booking chat")
+	}
+	if isAuthorizedForBookingChat(primitive.NilObjectID, passengerID, driverID) {
+		t.Errorf("expected NilObjectID to be rejected from booking chat")
+	}
+
+	// 4. Auth action rate limiter (PromoteAdmin brute-force protection)
+	testKey := "test_promote:" + primitive.NewObjectID().Hex()
+	for i := 0; i < 5; i++ {
+		if !checkAuthActionRateLimit(testKey, 5, 10*time.Minute) {
+			t.Errorf("expected attempt %d to be allowed", i+1)
+		}
+	}
+	if checkAuthActionRateLimit(testKey, 5, 10*time.Minute) {
+		t.Errorf("expected 6th attempt within window to be rate-limited")
+	}
+
+	// 5. Geo coordinate validation (reject NaN, Inf, out-of-range lat/lon)
+	if !isValidGeoCoordinate(29.8370, 79.7713) {
+		t.Errorf("expected valid Uttarakhand coordinates to pass")
+	}
+	if isValidGeoCoordinate(math.NaN(), 79.0) || isValidGeoCoordinate(29.0, math.Inf(1)) || isValidGeoCoordinate(95.0, 79.0) || isValidGeoCoordinate(29.0, -185.0) {
+		t.Errorf("expected NaN/Inf/out-of-bounds coordinates to be rejected")
+	}
+
+	// 6. CSV formula injection neutralization
+	escaped := sanitizeCSV("=cmd|' /C calc'!A0")
+	if !strings.HasPrefix(escaped, "\"'=cmd") {
+		t.Errorf("expected formula prefix to be neutralized with leading single quote, got %s", escaped)
 	}
 }

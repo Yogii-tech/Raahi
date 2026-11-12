@@ -59,7 +59,7 @@ func ValidateJWT(tokenString string) (primitive.ObjectID, int, error) {
 		}
 		return getJwtSecret(), nil
 	})
-	if err != nil || !token.Valid {
+	if err != nil || token == nil || !token.Valid {
 		return primitive.NilObjectID, 0, errors.New("invalid token")
 	}
 
@@ -68,16 +68,33 @@ func ValidateJWT(tokenString string) (primitive.ObjectID, int, error) {
 		return primitive.NilObjectID, 0, errors.New("invalid claims")
 	}
 
-	userId, err := primitive.ObjectIDFromHex(claims["userId"].(string))
+	// SECURITY: Prevent token type confusion — reject refresh tokens (or any non-access token type)
+	// so a 30-day refresh token can never be used directly as a Bearer access token.
+	if tokenType, hasType := claims["type"].(string); hasType && tokenType != "" && tokenType != "access" {
+		return primitive.NilObjectID, 0, errors.New("invalid token type: refresh token cannot be used as access token")
+	}
+
+	userIdStr, ok := claims["userId"].(string)
+	if !ok || userIdStr == "" {
+		return primitive.NilObjectID, 0, errors.New("missing or invalid userId in claims")
+	}
+
+	userId, err := primitive.ObjectIDFromHex(userIdStr)
 	if err != nil {
 		return primitive.NilObjectID, 0, err
 	}
 
-	version := int(claims["version"].(float64))
-	return userId, version, nil
+	versionFloat, ok := claims["version"].(float64)
+	if !ok {
+		return primitive.NilObjectID, 0, errors.New("missing or invalid version in claims")
+	}
+
+	return userId, int(versionFloat), nil
 }
 
-// ValidateRefreshToken verifies the refresh token signature and claims.
+// ValidateRefreshToken verifies the refresh token signature, expiry, token type, and claims.
+// SECURITY: Never fall back to ValidateJWTIgnoreExpiry, which would allow expired tokens
+// (or expired access tokens) to mint new sessions indefinitely.
 func ValidateRefreshToken(tokenString string) (primitive.ObjectID, int, error) {
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -85,19 +102,36 @@ func ValidateRefreshToken(tokenString string) (primitive.ObjectID, int, error) {
 		}
 		return getJwtSecret(), nil
 	})
-	if err == nil && token != nil && token.Valid {
-		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			if userIdStr, ok := claims["userId"].(string); ok && userIdStr != "" {
-				if userId, err := primitive.ObjectIDFromHex(userIdStr); err == nil {
-					if versionFloat, ok := claims["version"].(float64); ok {
-						return userId, int(versionFloat), nil
-					}
-				}
-			}
-		}
+	if err != nil || token == nil || !token.Valid {
+		return primitive.NilObjectID, 0, errors.New("invalid or expired refresh token")
 	}
-	// Fall back to signature validation for smooth migration from legacy tokens
-	return ValidateJWTIgnoreExpiry(tokenString)
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return primitive.NilObjectID, 0, errors.New("invalid claims")
+	}
+
+	// Reject access tokens presented as refresh tokens when the "type" claim is present.
+	if tokenType, hasType := claims["type"].(string); hasType && tokenType != "" && tokenType != "refresh" {
+		return primitive.NilObjectID, 0, errors.New("invalid token type: expected refresh token")
+	}
+
+	userIdStr, ok := claims["userId"].(string)
+	if !ok || userIdStr == "" {
+		return primitive.NilObjectID, 0, errors.New("missing or invalid userId in claims")
+	}
+
+	userId, err := primitive.ObjectIDFromHex(userIdStr)
+	if err != nil {
+		return primitive.NilObjectID, 0, err
+	}
+
+	versionFloat, ok := claims["version"].(float64)
+	if !ok {
+		return primitive.NilObjectID, 0, errors.New("missing or invalid version in claims")
+	}
+
+	return userId, int(versionFloat), nil
 }
 
 // ValidateJWTIgnoreExpiry verifies token signature and extracts claims even if the token is expired.

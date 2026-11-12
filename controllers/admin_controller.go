@@ -354,10 +354,13 @@ func AdminReports(c *gin.Context) {
 		since := time.Now().AddDate(0, 0, -30)
 		cursor, _ := config.Database.Collection("bookings").Find(ctx, bson.M{"createdAt": bson.M{"$gte": since}})
 		var bookings []models.Booking
-		cursor.All(ctx, &bookings)
+		if cursor != nil {
+			cursor.All(ctx, &bookings)
+		}
 		c.String(http.StatusOK, "BookingID,Date,Route,Type,Status\n")
 		for _, b := range bookings {
-			c.String(http.StatusOK, fmt.Sprintf("%s,%s,%s → %s,%s,%s\n", b.ID.Hex(), b.CreatedAt.Format("2006-01-02"), b.Pickup, b.Dropoff, b.Type, b.Status))
+			routeStr := sanitizeCSV(fmt.Sprintf("%s → %s", b.Pickup, b.Dropoff))
+			c.String(http.StatusOK, fmt.Sprintf("%s,%s,%s,%s,%s\n", b.ID.Hex(), b.CreatedAt.Format("2006-01-02"), routeStr, sanitizeCSV(b.Type), sanitizeCSV(b.Status)))
 		}
 	case "revenue":
 		c.Header("Content-Disposition", `attachment; filename="revenue.csv"`)
@@ -789,12 +792,16 @@ func AdminDeleteDriver(c *gin.Context) {
 	// Delete all bookings associated with rides by this driver
 	ridesCursor, _ := config.Database.Collection("rides").Find(ctx, bson.M{"driverId": driverId}, options.Find().SetProjection(bson.M{"_id": 1}))
 	var rideIds []primitive.ObjectID
-	for ridesCursor.Next(ctx) {
-		var r struct {
-			ID primitive.ObjectID `bson:"_id"`
+	if ridesCursor != nil {
+		for ridesCursor.Next(ctx) {
+			var r struct {
+				ID primitive.ObjectID `bson:"_id"`
+			}
+			if ridesCursor.Decode(&r) == nil {
+				rideIds = append(rideIds, r.ID)
+			}
 		}
-		ridesCursor.Decode(&r)
-		rideIds = append(rideIds, r.ID)
+		ridesCursor.Close(ctx)
 	}
 
 	deletedBookings := int64(0)
@@ -888,9 +895,15 @@ func AdminRoutesAnalytics(c *gin.Context) {
 	}
 	var result []RouteRow
 	for _, r := range raw {
-		idMap, _ := r["_id"].(primitive.M)
-		pickup := idMap["pickup"].(string)
-		dropoff := idMap["dropoff"].(string)
+		idMap, ok := r["_id"].(primitive.M)
+		if !ok {
+			continue
+		}
+		pickup, _ := idMap["pickup"].(string)
+		dropoff, _ := idMap["dropoff"].(string)
+		totalRides, _ := r["totalRides"].(int32)
+		topDriver, _ := r["topDriver"].(string)
+		avgPrice, _ := r["avgPrice"].(float64)
 
 		cancelledCount, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{
 			"pickup":  pickup,
@@ -901,10 +914,10 @@ func AdminRoutesAnalytics(c *gin.Context) {
 		result = append(result, RouteRow{
 			ID:            "RT-" + primitive.NewObjectID().Hex()[:4],
 			Route:         pickup + " ⇄ " + dropoff,
-			Bookings:      r["totalRides"].(int32),
+			Bookings:      totalRides,
 			Cancellations: int32(cancelledCount),
-			TopDriver:     r["topDriver"].(string),
-			AvgPrice:      r["avgPrice"].(float64),
+			TopDriver:     topDriver,
+			AvgPrice:      avgPrice,
 			Status:        "Active",
 		})
 	}

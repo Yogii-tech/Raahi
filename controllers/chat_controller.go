@@ -22,6 +22,14 @@ func InitializeChatCollection() {
 	chatCollection = config.Database.Collection("chats")
 }
 
+// isAuthorizedForBookingChat returns true if callerID is either the booking's passenger or the ride's driver.
+func isAuthorizedForBookingChat(callerID, passengerID, driverID primitive.ObjectID) bool {
+	if callerID.IsZero() {
+		return false
+	}
+	return callerID == passengerID || callerID == driverID
+}
+
 // GetMessages returns all messages for a booking, validating the caller is party to the booking.
 func GetMessages(c *gin.Context) {
 	callerID := c.MustGet("userId").(primitive.ObjectID)
@@ -51,7 +59,7 @@ func GetMessages(c *gin.Context) {
 		return
 	}
 
-	if callerID != booking.PassengerID && callerID != ride.DriverID {
+	if !isAuthorizedForBookingChat(callerID, booking.PassengerID, ride.DriverID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized to view this chat"})
 		return
 	}
@@ -170,6 +178,25 @@ func MarkMessagesRead(c *gin.Context) {
 
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
+
+	// SECURITY (IDOR Fix): Verify caller is the booking's passenger or the ride's driver
+	// before allowing them to mark messages in this booking's chat as read.
+	var booking models.Booking
+	if err := bookingCollection.FindOne(dbCtx, bson.M{"_id": bookingID}).Decode(&booking); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
+		return
+	}
+
+	var ride models.Ride
+	if err := rideCollection.FindOne(dbCtx, bson.M{"_id": booking.RideID}).Decode(&ride); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+		return
+	}
+
+	if !isAuthorizedForBookingChat(callerID, booking.PassengerID, ride.DriverID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized to modify this chat"})
+		return
+	}
 
 	now := time.Now()
 	// Mark all messages NOT sent by the caller as read (i.e. messages the other person sent)

@@ -51,9 +51,21 @@ func UpdateTrustedContacts(c *gin.Context) {
 		return
 	}
 
-	// Limit to 2 contacts
+	// Limit to 2 contacts and sanitize fields
 	if len(contacts) > 2 {
 		contacts = contacts[:2]
+	}
+	for i := range contacts {
+		contacts[i].Name = strings.TrimSpace(contacts[i].Name)
+		contacts[i].Name = strings.ReplaceAll(contacts[i].Name, "<", "&lt;")
+		contacts[i].Name = strings.ReplaceAll(contacts[i].Name, ">", "&gt;")
+		if len(contacts[i].Name) > 100 {
+			contacts[i].Name = contacts[i].Name[:100]
+		}
+		contacts[i].Phone = strings.TrimSpace(contacts[i].Phone)
+		if len(contacts[i].Phone) > 20 {
+			contacts[i].Phone = contacts[i].Phone[:20]
+		}
 	}
 
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -73,6 +85,30 @@ func UpdateTrustedContacts(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Trusted contacts updated successfully", "contacts": contacts})
 }
 
+// isAllowedUserProfileRole strictly enforces that user profile updates can only assign
+// standard non-privileged roles ("passenger", "driver", "parceller") and NEVER "admin".
+func isAllowedUserProfileRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "passenger", "driver", "parceller":
+		return true
+	default:
+		return false
+	}
+}
+
+// hasDriverVehicleChanged checks whether KYC-critical vehicle fields or document URLs changed.
+func hasDriverVehicleChanged(oldV, newV *models.Vehicle) bool {
+	if oldV == nil || newV == nil {
+		return oldV != newV
+	}
+	return strings.TrimSpace(oldV.VehicleNumber) != strings.TrimSpace(newV.VehicleNumber) ||
+		strings.TrimSpace(oldV.DLUrl) != strings.TrimSpace(newV.DLUrl) ||
+		strings.TrimSpace(oldV.RCUrl) != strings.TrimSpace(newV.RCUrl) ||
+		strings.TrimSpace(oldV.PollutionUrl) != strings.TrimSpace(newV.PollutionUrl) ||
+		strings.TrimSpace(oldV.VehicleImageUrl) != strings.TrimSpace(newV.VehicleImageUrl) ||
+		strings.TrimSpace(oldV.OwnershipUrl) != strings.TrimSpace(newV.OwnershipUrl)
+}
+
 func UpdateProfile(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
@@ -83,6 +119,17 @@ func UpdateProfile(c *gin.Context) {
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	body.Name = strings.TrimSpace(body.Name)
+	body.Name = strings.ReplaceAll(body.Name, "<", "&lt;")
+	body.Name = strings.ReplaceAll(body.Name, ">", "&gt;")
+	body.Role = strings.ToLower(strings.TrimSpace(body.Role))
+
+	// SECURITY: Explicit defense-in-depth check to prevent privilege escalation to "admin"
+	if !isAllowedUserProfileRole(body.Role) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid role. Allowed roles: passenger, driver, parceller"})
 		return
 	}
 
@@ -97,15 +144,20 @@ func UpdateProfile(c *gin.Context) {
 	}
 
 	// Prevent role change if it's already set to something else
-	// (Except if admin is somehow updating profile, but /profile is standard user endpoint)
+	// (Except if admin is somehow updating profile, in which case keep role as "admin")
 	if currentUser.Role != "" && currentUser.Role != "admin" && currentUser.Role != body.Role {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Roles cannot be changed after registering it one time"})
 		return
 	}
 
+	effectiveRole := body.Role
+	if currentUser.Role == "admin" {
+		effectiveRole = "admin"
+	}
+
 	setMap := bson.M{
 		"name": body.Name,
-		"role": body.Role,
+		"role": effectiveRole,
 	}
 
 	if body.Vehicle != nil {
@@ -115,17 +167,17 @@ func UpdateProfile(c *gin.Context) {
 	isFirstSubmission := false
 	isResubmission := false
 
-	if body.Role == "driver" && body.Vehicle != nil {
+	if effectiveRole == "driver" && body.Vehicle != nil {
 		if currentUser.VerificationStatus == "" {
 			setMap["verification_status"] = "pending"
 			setMap["submitted_at"] = time.Now()
 			isFirstSubmission = true
-		} else if currentUser.VerificationStatus == "rejected" {
+		} else if currentUser.VerificationStatus == "rejected" || (currentUser.VerificationStatus == "verified" && hasDriverVehicleChanged(currentUser.Vehicle, body.Vehicle)) {
 			setMap["verification_status"] = "pending"
 			setMap["submitted_at"] = time.Now()
 			isResubmission = true
 		}
-		// If verification_status is already "pending" or "verified", we do not reset it just because they update profile.
+		// If verification_status is already "pending", or "verified" with unchanged KYC vehicle docs, keep it as-is.
 	}
 
 	update := bson.M{

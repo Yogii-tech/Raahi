@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"raahi-backend/config"
@@ -21,7 +22,34 @@ import (
 
 var (
 	userCollection *mongo.Collection
+	authRateMu     sync.Mutex
+	authRateStore  = make(map[string][]time.Time)
 )
+
+// checkAuthActionRateLimit enforces an in-controller sliding-window rate limit
+// for sensitive auth actions (e.g. PromoteAdmin, RefreshToken).
+func checkAuthActionRateLimit(key string, maxAttempts int, window time.Duration) bool {
+	now := time.Now()
+	cutoff := now.Add(-window)
+
+	authRateMu.Lock()
+	defer authRateMu.Unlock()
+
+	entries := authRateStore[key]
+	var active []time.Time
+	for _, t := range entries {
+		if t.After(cutoff) {
+			active = append(active, t)
+		}
+	}
+	if len(active) >= maxAttempts {
+		authRateStore[key] = active
+		return false
+	}
+	active = append(active, now)
+	authRateStore[key] = active
+	return true
+}
 
 func InitializeAuthCollection() {
 	userCollection = config.Database.Collection("users")
@@ -151,7 +179,11 @@ func VerifyFirebaseToken(c *gin.Context) {
 		return
 	}
 
-	refreshToken, _ := utils.GenerateRefreshToken(user.ID, user.TokenVersion)
+	refreshToken, err := utils.GenerateRefreshToken(user.ID, user.TokenVersion)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"token":         jwtToken,
@@ -162,7 +194,24 @@ func VerifyFirebaseToken(c *gin.Context) {
 
 func PromoteAdmin(c *gin.Context) {
 	// Must be protected by generic AuthMiddleware so we know WHO to promote
-	userId := c.MustGet("userId").(primitive.ObjectID)
+	userIdVal, exists := c.Get("userId")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userId, ok := userIdVal.(primitive.ObjectID)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// SECURITY: Rate-limit admin promotion attempts (max 5 per 10 minutes per user/IP)
+	// to prevent brute-forcing ADMIN_SECRET_KEY.
+	rateKey := "promote_admin:" + userId.Hex() + ":" + c.ClientIP()
+	if !checkAuthActionRateLimit(rateKey, 5, 10*time.Minute) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many admin promotion attempts. Please try again later."})
+		return
+	}
 
 	var body struct {
 		SecretKey string `json:"secret_key"`
@@ -191,13 +240,13 @@ func PromoteAdmin(c *gin.Context) {
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	_, err := userCollection.UpdateOne(
+	res, err := userCollection.UpdateOne(
 		dbCtx,
 		bson.M{"_id": userId},
 		bson.M{"$set": bson.M{"role": "admin"}},
 	)
 
-	if err != nil {
+	if err != nil || res.MatchedCount == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to promote user to admin"})
 		return
 	}
@@ -206,6 +255,12 @@ func PromoteAdmin(c *gin.Context) {
 }
 
 func RefreshToken(c *gin.Context) {
+	// SECURITY: Rate-limit refresh token requests (max 30 per minute per IP)
+	if !checkAuthActionRateLimit("refresh:"+c.ClientIP(), 30, 1*time.Minute) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many token refresh requests. Please slow down."})
+		return
+	}
+
 	var body struct {
 		RefreshToken string `json:"refresh_token"`
 	}
@@ -228,7 +283,7 @@ func RefreshToken(c *gin.Context) {
 
 	userId, tokenVersion, err := utils.ValidateRefreshToken(tokenStr)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token format or signature"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired refresh token"})
 		return
 	}
 
@@ -251,7 +306,11 @@ func RefreshToken(c *gin.Context) {
 		return
 	}
 
-	newRefreshToken, _ := utils.GenerateRefreshToken(user.ID, user.TokenVersion)
+	newRefreshToken, err := utils.GenerateRefreshToken(user.ID, user.TokenVersion)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"token":         newToken,

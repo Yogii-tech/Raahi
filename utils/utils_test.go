@@ -72,6 +72,48 @@ func TestJWTGenerationAndValidation(t *testing.T) {
 	if err == nil {
 		t.Errorf("Expected signature validation failure for fake secret key on refresh")
 	}
+
+	// Negative Scenario 3: Token Type Confusion — Refresh token MUST be rejected by ValidateJWT
+	_, _, err = ValidateJWT(refreshStr)
+	if err == nil {
+		t.Errorf("Expected ValidateJWT to reject a refresh token (type=refresh), got nil")
+	}
+
+	// Negative Scenario 4: Token Type Confusion — Access token MUST be rejected by ValidateRefreshToken
+	_, _, err = ValidateRefreshToken(tokenStr)
+	if err == nil {
+		t.Errorf("Expected ValidateRefreshToken to reject an access token (type=access), got nil")
+	}
+
+	// Negative Scenario 5: Expired Refresh Token MUST be rejected by ValidateRefreshToken
+	expiredRefresh := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"userId":  userID.Hex(),
+		"version": tokenVersion,
+		"type":    "refresh",
+		"exp":     time.Now().Add(-1 * time.Hour).Unix(),
+	})
+	expiredRefreshStr, _ := expiredRefresh.SignedString(getJwtSecret())
+	if _, _, err := ValidateRefreshToken(expiredRefreshStr); err == nil {
+		t.Errorf("Expected ValidateRefreshToken to reject expired refresh token, got nil")
+	}
+
+	// Negative Scenario 6: Malformed claims (missing userId/version or wrong types) must NOT panic in ValidateJWT
+	malformedClaimsCases := []jwt.MapClaims{
+		{"version": tokenVersion, "exp": time.Now().Add(1 * time.Hour).Unix()},                         // missing userId
+		{"userId": 12345, "version": tokenVersion, "exp": time.Now().Add(1 * time.Hour).Unix()},        // non-string userId
+		{"userId": userID.Hex(), "exp": time.Now().Add(1 * time.Hour).Unix()},                          // missing version
+		{"userId": userID.Hex(), "version": "not-an-int", "exp": time.Now().Add(1 * time.Hour).Unix()}, // non-numeric version
+	}
+	for i, mc := range malformedClaimsCases {
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, mc)
+		signed, _ := tok.SignedString(getJwtSecret())
+		if _, _, err := ValidateJWT(signed); err == nil {
+			t.Errorf("Case %d: expected ValidateJWT error for malformed claims, got nil", i)
+		}
+		if _, _, err := ValidateRefreshToken(signed); err == nil {
+			t.Errorf("Case %d: expected ValidateRefreshToken error for malformed claims, got nil", i)
+		}
+	}
 }
 
 // TestCalculateSegmentPrice tests proportional segment pricing

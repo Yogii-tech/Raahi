@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -15,6 +16,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func isValidGeoCoordinate(lat, lon float64) bool {
+	if math.IsNaN(lat) || math.IsInf(lat, 0) || math.IsNaN(lon) || math.IsInf(lon, 0) {
+		return false
+	}
+	return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
+}
+
 func GetNearbyLandmarks(c *gin.Context) {
 	latStr := c.Query("lat")
 	lonStr := c.Query("lon")
@@ -22,7 +30,7 @@ func GetNearbyLandmarks(c *gin.Context) {
 	lat, errLat := strconv.ParseFloat(latStr, 64)
 	lon, errLon := strconv.ParseFloat(lonStr, 64)
 
-	if errLat != nil || errLon != nil {
+	if errLat != nil || errLon != nil || !isValidGeoCoordinate(lat, lon) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or missing lat/lon parameters"})
 		return
 	}

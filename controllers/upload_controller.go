@@ -17,7 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const maxUploadSize = 10 << 20 // 10MB
+const maxUploadSize = 5 << 20 // 5MB
 
 var allowedExtensions = map[string]bool{
 	".jpg":  true,
@@ -54,8 +54,9 @@ func generateSafeFilename(ext string) string {
 // UploadFile handles file uploads by streaming them to Google Cloud Storage (if configured)
 // or falling back to local file storage.
 func UploadFile(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUploadSize+64*1024)
 	if err := c.Request.ParseMultipartForm(maxUploadSize); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File size exceeds 10MB limit"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File size exceeds 5MB limit"})
 		return
 	}
 
@@ -65,6 +66,11 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 	defer file.Close()
+
+	if header.Size > maxUploadSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File size exceeds 5MB limit"})
+		return
+	}
 
 	// SECURITY: Validate actual file content via magic bytes (MIME sniffing prevention).
 	// Read the first 512 bytes to detect the real content type.
@@ -119,9 +125,14 @@ func UploadFile(c *gin.Context) {
 		//   allUsers → roles/storage.objectViewer
 		// To change visibility, update the bucket IAM policy — not per-object ACLs.
 
-		if _, copyErr := io.Copy(wc, file); copyErr != nil {
+		written, copyErr := io.Copy(wc, io.LimitReader(file, maxUploadSize+1))
+		if copyErr != nil {
 			log.Printf("[Upload] GCS stream copy failed: %v", copyErr)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload file to storage. Please try again."})
+			return
+		}
+		if written > maxUploadSize {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "File size exceeds 5MB limit"})
 			return
 		}
 		if closeErr := wc.Close(); closeErr != nil {
@@ -153,8 +164,15 @@ func UploadFile(c *gin.Context) {
 	}
 	defer out.Close()
 
-	if _, err = io.Copy(out, file); err != nil {
+	written, err := io.Copy(out, io.LimitReader(file, maxUploadSize+1))
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write file content"})
+		return
+	}
+	if written > maxUploadSize {
+		out.Close()
+		_ = os.Remove(dstPath)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File size exceeds 5MB limit"})
 		return
 	}
 

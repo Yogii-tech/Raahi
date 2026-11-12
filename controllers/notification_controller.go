@@ -153,13 +153,17 @@ func MarkNotificationRead(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	_, err = notificationCollection.UpdateOne(
+	res, err := notificationCollection.UpdateOne(
 		ctx,
 		bson.M{"_id": notifId, "userId": userId},
 		bson.M{"$set": bson.M{"read": true}},
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to mark read"})
+		return
+	}
+	if res.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Notification not found"})
 		return
 	}
 

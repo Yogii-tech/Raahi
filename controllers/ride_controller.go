@@ -123,9 +123,10 @@ func CreateRide(c *gin.Context) {
 	findCtx, findCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer findCancel()
 
-	// Fetch driver Name and VerificationStatus
+	// Fetch driver Name, Role, and VerificationStatus
 	var driver struct {
 		Name               string `bson:"name"`
+		Role               string `bson:"role"`
 		VerificationStatus string `bson:"verification_status"`
 	}
 	err = config.Database.Collection("users").FindOne(findCtx, bson.M{"_id": userId}).Decode(&driver)
@@ -134,8 +135,13 @@ func CreateRide(c *gin.Context) {
 		return
 	}
 
-	if driver.VerificationStatus != "verified" {
+	if (driver.Role != "driver" && driver.Role != "admin") || driver.VerificationStatus != "verified" {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Only verified drivers can post rides"})
+		return
+	}
+
+	if math.IsNaN(body.PricePerSeat) || math.IsInf(body.PricePerSeat, 0) || body.PricePerSeat < 0 || body.PricePerSeat > 100000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid price per seat"})
 		return
 	}
 
@@ -902,11 +908,11 @@ func BookRide(c *gin.Context) {
 	}
 
 	bookingPrice := strings.TrimSpace(body.Price)
-	if bookingPrice == "" && bookingType == "seat" && computedTotalPrice > 0 {
+	if bookingType == "seat" && computedTotalPrice > 0 {
 		bookingPrice = fmt.Sprintf("%.0f", computedTotalPrice)
 	}
 
-	// Verify that requested seats are not already taken or pending approval
+	// Verify that requested seats are valid, unique, and not already taken or pending approval
 	takenSeats := getTakenSeats(checkCtx, rideForCheck, effectivePickup, effectiveDropoff)
 	takenMap := make(map[int]bool)
 	for _, seat := range takenSeats {
@@ -927,7 +933,17 @@ func BookRide(c *gin.Context) {
 		}
 	}
 
+	seenRequestedSeats := make(map[int]bool, len(body.SeatLayout))
 	for _, requestedSeat := range body.SeatLayout {
+		if requestedSeat < 0 || requestedSeat > rideForCheck.SeatsTotal {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid seat index"})
+			return
+		}
+		if seenRequestedSeats[requestedSeat] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Duplicate seat selection is not allowed"})
+			return
+		}
+		seenRequestedSeats[requestedSeat] = true
 		if takenMap[requestedSeat] {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Seat %d is already taken or pending approval", requestedSeat+1)})
 			return
@@ -1594,6 +1610,14 @@ func CompleteRide(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Only the driver can complete this ride"})
 		return
 	}
+	if ride.Status == "cancelled" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Cannot complete a cancelled ride"})
+		return
+	}
+	if ride.Status == "completed" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Ride is already completed"})
+		return
+	}
 
 	now := time.Now()
 	_, err = rideCollection.UpdateOne(
@@ -1669,6 +1693,10 @@ func StartRide(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Only the driver can start this ride"})
 		return
 	}
+	if ride.Status == "cancelled" || ride.Status == "completed" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Cannot start a ride that is already " + ride.Status})
+		return
+	}
 
 	_, err = rideCollection.UpdateOne(
 		dbCtx,
@@ -1729,12 +1757,22 @@ func MarkNotificationsViewed(c *gin.Context) {
 
 	if role == "driver" {
 		// Driver sees requests for THEIR rides
-		cursor, _ := rideCollection.Find(dbCtx, bson.M{"driverId": userId})
+		cursor, err := rideCollection.Find(dbCtx, bson.M{"driverId": userId})
+		if err != nil || cursor == nil {
+			c.JSON(http.StatusOK, gin.H{"message": "Notifications marked as viewed"})
+			return
+		}
 		var rideIds []primitive.ObjectID
 		for cursor.Next(dbCtx) {
 			var r models.Ride
-			cursor.Decode(&r)
-			rideIds = append(rideIds, r.ID)
+			if cursor.Decode(&r) == nil {
+				rideIds = append(rideIds, r.ID)
+			}
+		}
+		cursor.Close(dbCtx)
+		if len(rideIds) == 0 {
+			c.JSON(http.StatusOK, gin.H{"message": "Notifications marked as viewed"})
+			return
 		}
 		filter = bson.M{"rideId": bson.M{"$in": rideIds}, "viewedByDriver": false}
 		update = bson.M{"$set": bson.M{"viewedByDriver": true}}

@@ -75,10 +75,10 @@ func OTPRateLimiter() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		clientIP := c.ClientIP()
 
-		// Read body to extract phone number if present
+		// Read body to extract phone number if present (bounded to 1MB for safety)
 		var bodyBytes []byte
 		if c.Request.Body != nil {
-			bodyBytes, _ = io.ReadAll(c.Request.Body)
+			bodyBytes, _ = io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
 			// Restore body so downstream handlers can read it
 			c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
@@ -176,7 +176,7 @@ func init() {
 		defer ticker.Stop()
 		for range ticker.C {
 			globalLimiterStore.mu.Lock()
-			cutoff := time.Now().Add(-1 * time.Minute)
+			cutoff := time.Now().Add(-10 * time.Minute)
 			for k, times := range globalLimiterStore.buckets {
 				var active []time.Time
 				for _, t := range times {
@@ -210,7 +210,11 @@ func GlobalRateLimiter(maxRequests int, window time.Duration, label ...string) g
 		// Prefer userId (set by AuthMiddleware); fall back to IP
 		base := c.ClientIP()
 		if uid, exists := c.Get("userId"); exists {
-			base = "user:" + uid.(interface{ Hex() string }).Hex()
+			if hexer, ok := uid.(interface{ Hex() string }); ok {
+				base = "user:" + hexer.Hex()
+			} else if s, ok := uid.(string); ok && s != "" {
+				base = "user:" + s
+			}
 		}
 		key := base + suffix
 

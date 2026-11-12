@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"raahi-backend/config"
@@ -29,12 +30,19 @@ func SubmitReview(c *gin.Context) {
 	var body struct {
 		RideID  string `json:"rideId" binding:"required"`
 		Rating  int    `json:"rating" binding:"required,min=1,max=5"`
-		Comment string `json:"comment"`
+		Comment string `json:"comment" binding:"max=1000"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input. Rating must be 1-5."})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input. Rating must be 1-5 and comment up to 1000 characters."})
 		return
 	}
+
+	sanitizedComment := strings.TrimSpace(body.Comment)
+	if len(sanitizedComment) > 1000 {
+		sanitizedComment = sanitizedComment[:1000]
+	}
+	sanitizedComment = strings.ReplaceAll(sanitizedComment, "<", "&lt;")
+	sanitizedComment = strings.ReplaceAll(sanitizedComment, ">", "&gt;")
 
 	rideId, err := primitive.ObjectIDFromHex(body.RideID)
 	if err != nil {
@@ -49,6 +57,10 @@ func SubmitReview(c *gin.Context) {
 	var ride models.Ride
 	if err := config.Database.Collection("rides").FindOne(ctx, bson.M{"_id": rideId}).Decode(&ride); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+		return
+	}
+	if passengerID == ride.DriverID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Drivers cannot review their own ride"})
 		return
 	}
 	if ride.Status != "completed" {
@@ -88,7 +100,7 @@ func SubmitReview(c *gin.Context) {
 		PassengerID:   passengerID,
 		RideID:        rideId,
 		Rating:        body.Rating,
-		Comment:       body.Comment,
+		Comment:       sanitizedComment,
 		PassengerName: passenger.Name,
 		CreatedAt:     time.Now(),
 	}

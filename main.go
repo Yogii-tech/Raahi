@@ -64,8 +64,8 @@ func main() {
 	}
 	r := gin.Default()
 
-	// SECURITY: Set request body size limit (1MB for JSON, uploads have their own limit)
-	r.MaxMultipartMemory = 10 << 20 // 10 MB for file uploads
+	// SECURITY: Set request body size limit (1MB for JSON, uploads have their own 5MB limit)
+	r.MaxMultipartMemory = 5 << 20 // 5 MB for file uploads
 
 	// SECURITY: Global security headers middleware
 	r.Use(func(c *gin.Context) {
@@ -79,10 +79,10 @@ func main() {
 		c.Next()
 	})
 
-	// SECURITY: Global request body size limiter (1MB for non-upload JSON endpoints)
+	// SECURITY: Global request body size limiter (1MB for non-upload JSON endpoints, 5MB+64KB for uploads)
 	r.Use(func(c *gin.Context) {
-		// Skip size limit for upload endpoint (it has its own 10MB limit)
 		if c.Request.URL.Path == "/api/upload" {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, (5<<20)+(64<<10))
 			c.Next()
 			return
 		}
@@ -130,8 +130,8 @@ func main() {
 	// served as attachments to prevent inline script execution.
 	r.GET("/uploads/:filename", func(c *gin.Context) {
 		filename := c.Param("filename")
-		// Prevent path traversal
-		if filename == "" || filename[0] == '.' || len(filename) > 255 {
+		// Prevent path traversal (including Windows backslashes)
+		if filename == "" || filename[0] == '.' || len(filename) > 255 || filename != filepath.Base(filename) || strings.ContainsAny(filename, "/\\") {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid filename"})
 			return
 		}
