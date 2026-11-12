@@ -71,7 +71,8 @@ func RegisterRoutes(r *gin.Engine) {
 		location.GET("/search", controllers.SearchLocations)
 	}
 
-	api.POST("/upload", middleware.AuthMiddleware(), middleware.GlobalRateLimiter(10, 1*time.Minute), controllers.UploadFile)
+	// A driver registration needs 4-5 documents; allow retries/re-picks without hitting the limit.
+	api.POST("/upload", middleware.AuthMiddleware(), middleware.GlobalRateLimiter(30, 1*time.Minute), controllers.UploadFile)
 
 	chat := api.Group("/chat")
 	chat.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(60, 1*time.Minute))
