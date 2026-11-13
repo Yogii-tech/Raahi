@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -408,6 +409,31 @@ func PromoteAdmin(c *gin.Context) {
 	if res.MatchedCount == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
+	}
+
+	if res.ModifiedCount > 0 {
+		var promoted models.User
+		if fetchErr := userCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&promoted); fetchErr == nil {
+			actorLabel := strings.TrimSpace(promoted.Name)
+			if actorLabel == "" {
+				actorLabel = promoted.PhoneNumber
+			}
+			NotifyAdminsAsync(AdminNotificationInput{
+				Title:          "New Admin Promoted",
+				Message:        fmt.Sprintf("%s (%s) was granted admin access.", actorLabel, promoted.PhoneNumber),
+				Type:           models.NotifTypeAdminPromoted,
+				Category:       models.NotifCategorySystem,
+				TargetView:     models.AdminViewAdminUsers,
+				RelatedID:      userId.Hex(),
+				ExcludeAdminID: userId,
+				Metadata: map[string]string{
+					"userId":     userId.Hex(),
+					"actorName":  promoted.Name,
+					"actorPhone": promoted.PhoneNumber,
+					"role":       "admin",
+				},
+			})
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Successfully promoted to admin"})

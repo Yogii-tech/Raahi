@@ -599,10 +599,11 @@ func CollectionIndexSpecs() []CollectionIndexSpec {
 			},
 		},
 		{
-			// Notifications: Per-user feed + 30-day TTL auto-expiration
+			// Notifications: Per-user feed, unread count query, + 30-day TTL auto-expiration
 			Collection: "notifications",
 			Models: []mongo.IndexModel{
 				{Keys: bson.D{{Key: "userId", Value: 1}, {Key: "createdAt", Value: -1}}},
+				{Keys: bson.D{{Key: "userId", Value: 1}, {Key: "read", Value: 1}, {Key: "createdAt", Value: -1}}},
 				{
 					Keys:    bson.D{{Key: "createdAt", Value: 1}},
 					Options: options.Index().SetExpireAfterSeconds(30 * 24 * 3600),

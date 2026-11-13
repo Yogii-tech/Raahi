@@ -192,6 +192,44 @@ func removeFCMToken(token string) {
 
 const fcmMulticastBatchSize = 500
 
+func cloneFCMData(title, body string, data map[string]string) map[string]string {
+	cloned := make(map[string]string, len(data)+2)
+	for k, v := range data {
+		if k == "" {
+			continue
+		}
+		cloned[k] = v
+	}
+	if _, ok := cloned["title"]; !ok && title != "" {
+		cloned["title"] = title
+	}
+	if _, ok := cloned["body"]; !ok && body != "" {
+		cloned["body"] = body
+	}
+	return cloned
+}
+
+func buildWebpushTag(data map[string]string) string {
+	if data == nil {
+		return ""
+	}
+	notifType := strings.TrimSpace(data["type"])
+	if notifType == "" {
+		notifType = "general"
+	}
+	key := strings.TrimSpace(data["relatedId"])
+	if key == "" {
+		key = strings.TrimSpace(data["bookingId"])
+	}
+	if key == "" {
+		key = strings.TrimSpace(data["notificationId"])
+	}
+	if key == "" {
+		return ""
+	}
+	return notifType + "-" + key
+}
+
 func buildFCMPlatformConfigs(title, body string, data map[string]string) (*messaging.AndroidConfig, *messaging.APNSConfig, *messaging.WebpushConfig) {
 	targetLink := webAppURL()
 	if u, ok := data["url"]; ok && u != "" {
@@ -227,19 +265,24 @@ func buildFCMPlatformConfigs(title, body string, data map[string]string) (*messa
 		},
 	}
 
+	webNotif := &messaging.WebpushNotification{
+		Title:              title,
+		Body:               body,
+		RequireInteraction: true,
+		// Icon and Badge MUST be absolute HTTPS URLs — relative paths are rejected by Chrome.
+		Icon:  absURL("/logo192.png"),
+		Badge: absURL("/logo192.png"),
+	}
+	if tag := buildWebpushTag(data); tag != "" {
+		webNotif.Tag = tag
+	}
+
 	webpushCfg := &messaging.WebpushConfig{
 		Headers: map[string]string{
 			"Urgency": "high",
 			"TTL":     "86400",
 		},
-		Notification: &messaging.WebpushNotification{
-			Title:              title,
-			Body:               body,
-			RequireInteraction: true,
-			// Icon and Badge MUST be absolute HTTPS URLs — relative paths are rejected by Chrome.
-			Icon:  absURL("/logo192.png"),
-			Badge: absURL("/logo192.png"),
-		},
+		Notification: webNotif,
 		FCMOptions: &messaging.WebpushFCMOptions{
 			Link: targetLink,
 		},
@@ -260,14 +303,15 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 		return fmt.Errorf("FCM token is empty")
 	}
 
-	androidCfg, apnsCfg, webpushCfg := buildFCMPlatformConfigs(title, body, data)
+	payloadData := cloneFCMData(title, body, data)
+	androidCfg, apnsCfg, webpushCfg := buildFCMPlatformConfigs(title, body, payloadData)
 	msg := &messaging.Message{
 		Token: fcmToken,
 		Notification: &messaging.Notification{
 			Title: title,
 			Body:  body,
 		},
-		Data:    data,
+		Data:    payloadData,
 		Android: androidCfg,
 		APNS:    apnsCfg,
 		Webpush: webpushCfg,
@@ -322,7 +366,8 @@ func SendMulticastPushErr(tokens []string, title, body string, data map[string]s
 		return fmt.Errorf("no valid FCM tokens provided")
 	}
 
-	androidCfg, apnsCfg, webpushCfg := buildFCMPlatformConfigs(title, body, data)
+	payloadData := cloneFCMData(title, body, data)
+	androidCfg, apnsCfg, webpushCfg := buildFCMPlatformConfigs(title, body, payloadData)
 	var staleTokens []string
 	var totalSuccess, totalFailure int
 	var firstErr error
@@ -340,7 +385,7 @@ func SendMulticastPushErr(tokens []string, title, body string, data map[string]s
 				Title: title,
 				Body:  body,
 			},
-			Data:    data,
+			Data:    payloadData,
 			Android: androidCfg,
 			APNS:    apnsCfg,
 			Webpush: webpushCfg,

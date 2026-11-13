@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -375,6 +376,10 @@ func UpdateProfile(c *gin.Context) {
 		return
 	}
 
+	isNewProfileRegistration := currentUser.Role == "" && effectiveRole != ""
+	vehicleAddedOrUpdated := (currentUser.Vehicle == nil && body.Vehicle != nil) ||
+		(effectiveRole == "driver" && body.Vehicle != nil && currentUser.Vehicle != nil && currentUser.Vehicle.RatePerKm != body.Vehicle.RatePerKm)
+
 	if isFirstSubmission {
 		go CreateNotification(
 			userId,
@@ -384,12 +389,27 @@ func UpdateProfile(c *gin.Context) {
 			"",
 			nil,
 		)
-		
-		go NotifyAdmins(
-			"New Driver Application",
-			"A new driver ("+body.Name+") has submitted their documents for review.",
-			"admin_alert",
-		)
+
+		meta := map[string]string{
+			"driverId":   userId.Hex(),
+			"userId":     userId.Hex(),
+			"actorName":  body.Name,
+			"actorPhone": currentUser.PhoneNumber,
+			"status":     string(models.VerificationStatusPending),
+		}
+		if body.Vehicle != nil {
+			meta["vehicleName"] = body.Vehicle.VehicleName
+			meta["vehicleNumber"] = body.Vehicle.VehicleNumber
+		}
+		NotifyAdminsAsync(AdminNotificationInput{
+			Title:      "New Driver Application",
+			Message:    fmt.Sprintf("New driver %s (%s) submitted KYC documents for review.", body.Name, currentUser.PhoneNumber),
+			Type:       models.NotifTypeDriverKYCSubmitted,
+			Category:   models.NotifCategoryDrivers,
+			TargetView: models.AdminViewDriverVerification,
+			RelatedID:  userId.Hex(),
+			Metadata:   meta,
+		})
 	} else if isResubmission {
 		go CreateNotification(
 			userId,
@@ -399,12 +419,63 @@ func UpdateProfile(c *gin.Context) {
 			"",
 			nil,
 		)
-		
-		go NotifyAdmins(
-			"Driver Resubmitted Documents",
-			"Driver ("+body.Name+") has resubmitted their documents for review after a previous rejection.",
-			"admin_alert",
-		)
+
+		meta := map[string]string{
+			"driverId":   userId.Hex(),
+			"userId":     userId.Hex(),
+			"actorName":  body.Name,
+			"actorPhone": currentUser.PhoneNumber,
+			"status":     string(models.VerificationStatusPending),
+		}
+		if body.Vehicle != nil {
+			meta["vehicleName"] = body.Vehicle.VehicleName
+			meta["vehicleNumber"] = body.Vehicle.VehicleNumber
+		}
+		NotifyAdminsAsync(AdminNotificationInput{
+			Title:      "Driver Resubmitted Documents",
+			Message:    fmt.Sprintf("Driver %s (%s) resubmitted KYC documents for review.", body.Name, currentUser.PhoneNumber),
+			Type:       models.NotifTypeDriverKYCResubmitted,
+			Category:   models.NotifCategoryDrivers,
+			TargetView: models.AdminViewDriverVerification,
+			RelatedID:  userId.Hex(),
+			Metadata:   meta,
+		})
+	} else {
+		if isNewProfileRegistration {
+			NotifyAdminsAsync(AdminNotificationInput{
+				Title:      "New User Registered",
+				Message:    fmt.Sprintf("%s joined GoRaahi as %s (%s).", body.Name, effectiveRole, currentUser.PhoneNumber),
+				Type:       models.NotifTypeUserRegistered,
+				Category:   models.NotifCategoryUsers,
+				TargetView: models.AdminViewAdminUsers,
+				RelatedID:  userId.Hex(),
+				Metadata: map[string]string{
+					"userId":     userId.Hex(),
+					"actorName":  body.Name,
+					"actorPhone": currentUser.PhoneNumber,
+					"role":       effectiveRole,
+				},
+			})
+		}
+		if vehicleAddedOrUpdated && body.Vehicle != nil {
+			NotifyAdminsAsync(AdminNotificationInput{
+				Title:      "Vehicle Details Updated",
+				Message:    fmt.Sprintf("%s (%s) updated vehicle %s (%s) — ₹%.0f/km.", body.Name, currentUser.PhoneNumber, body.Vehicle.VehicleName, body.Vehicle.VehicleNumber, body.Vehicle.RatePerKm),
+				Type:       models.NotifTypeVehicleUpdated,
+				Category:   models.NotifCategoryDrivers,
+				TargetView: models.AdminViewVehicles,
+				RelatedID:  userId.Hex(),
+				Metadata: map[string]string{
+					"driverId":      userId.Hex(),
+					"userId":        userId.Hex(),
+					"actorName":     body.Name,
+					"actorPhone":    currentUser.PhoneNumber,
+					"vehicleName":   body.Vehicle.VehicleName,
+					"vehicleNumber": body.Vehicle.VehicleNumber,
+					"ratePerKm":     fmt.Sprintf("%.2f", body.Vehicle.RatePerKm),
+				},
+			})
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Profile updated successfully"})

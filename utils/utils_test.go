@@ -300,3 +300,98 @@ func TestCollectTokens(t *testing.T) {
 		t.Errorf("expected 0 tokens for empty input, got %v", empty)
 	}
 }
+
+func TestAbsURL(t *testing.T) {
+	t.Setenv("WEB_APP_URL", "https://admin.goraahi.in/")
+
+	if got := absURL("/logo192.png"); got != "https://admin.goraahi.in/logo192.png" {
+		t.Errorf("absURL(/logo192.png) = %q", got)
+	}
+	if got := absURL("/?adminView=bookings&relatedId=123"); got != "https://admin.goraahi.in/?adminView=bookings&relatedId=123" {
+		t.Errorf("absURL(query) = %q", got)
+	}
+	if got := absURL("https://other.example.com/a"); got != "https://other.example.com/a" {
+		t.Errorf("absURL(absolute) = %q", got)
+	}
+}
+
+func TestCloneFCMData(t *testing.T) {
+	original := map[string]string{
+		"type":      "ride_created",
+		"relatedId": "r1",
+		"":          "drop-me",
+	}
+	cloned := cloneFCMData("New Ride", "Rishikesh -> Delhi", original)
+
+	if cloned["title"] != "New Ride" || cloned["body"] != "Rishikesh -> Delhi" {
+		t.Errorf("title/body fallback missing: %#v", cloned)
+	}
+	if _, hasEmpty := cloned[""]; hasEmpty {
+		t.Errorf("empty key should be skipped")
+	}
+	if _, mutated := original["title"]; mutated {
+		t.Errorf("caller map should not be mutated")
+	}
+
+	// Caller-supplied title/body should be preserved
+	withExplicit := cloneFCMData("Ignored", "IgnoredBody", map[string]string{
+		"title": "ExplicitTitle",
+		"body":  "ExplicitBody",
+	})
+	if withExplicit["title"] != "ExplicitTitle" || withExplicit["body"] != "ExplicitBody" {
+		t.Errorf("explicit title/body overwritten: %#v", withExplicit)
+	}
+}
+
+func TestBuildWebpushTag(t *testing.T) {
+	if got := buildWebpushTag(nil); got != "" {
+		t.Errorf("nil map = %q, want empty", got)
+	}
+	if got := buildWebpushTag(map[string]string{"type": "ride_created", "relatedId": "r1", "bookingId": "b1"}); got != "ride_created-r1" {
+		t.Errorf("relatedId precedence failed: %q", got)
+	}
+	if got := buildWebpushTag(map[string]string{"type": "booking_status", "bookingId": "b1", "notificationId": "n1"}); got != "booking_status-b1" {
+		t.Errorf("bookingId fallback failed: %q", got)
+	}
+	if got := buildWebpushTag(map[string]string{"notificationId": "n1"}); got != "general-n1" {
+		t.Errorf("notificationId + default type fallback failed: %q", got)
+	}
+}
+
+func TestBuildFCMPlatformConfigs(t *testing.T) {
+	t.Setenv("WEB_APP_URL", "https://goraahi.in")
+	data := map[string]string{
+		"type":      "driver_kyc_submitted",
+		"relatedId": "drv-42",
+		"url":       "/?adminView=driver_verification&relatedId=drv-42&notificationId=n1",
+	}
+
+	androidCfg, apnsCfg, webpushCfg := buildFCMPlatformConfigs("KYC Submitted", "Driver submitted KYC", data)
+
+	if androidCfg == nil || androidCfg.Notification == nil || androidCfg.Notification.ChannelID != "raahi_high_importance" {
+		t.Fatalf("unexpected android config: %#v", androidCfg)
+	}
+	if apnsCfg == nil || apnsCfg.Payload == nil || apnsCfg.Payload.Aps == nil || apnsCfg.Payload.Aps.Alert == nil {
+		t.Fatalf("unexpected apns config: %#v", apnsCfg)
+	}
+	if apnsCfg.Payload.Aps.Alert.Title != "KYC Submitted" || apnsCfg.Payload.Aps.Alert.Body != "Driver submitted KYC" {
+		t.Errorf("unexpected apns alert: %#v", apnsCfg.Payload.Aps.Alert)
+	}
+
+	if webpushCfg == nil || webpushCfg.Notification == nil || webpushCfg.FCMOptions == nil {
+		t.Fatalf("unexpected webpush config: %#v", webpushCfg)
+	}
+	wantLink := "https://goraahi.in/?adminView=driver_verification&relatedId=drv-42&notificationId=n1"
+	if webpushCfg.FCMOptions.Link != wantLink {
+		t.Errorf("webpush Link = %q, want %q", webpushCfg.FCMOptions.Link, wantLink)
+	}
+	if webpushCfg.Notification.Icon != "https://goraahi.in/logo192.png" || webpushCfg.Notification.Badge != "https://goraahi.in/logo192.png" {
+		t.Errorf("webpush icon/badge must be absolute HTTPS URLs: %#v", webpushCfg.Notification)
+	}
+	if !webpushCfg.Notification.RequireInteraction {
+		t.Errorf("expected webpush RequireInteraction=true")
+	}
+	if webpushCfg.Notification.Tag != "driver_kyc_submitted-drv-42" {
+		t.Errorf("webpush Tag = %q, want driver_kyc_submitted-drv-42", webpushCfg.Notification.Tag)
+	}
+}

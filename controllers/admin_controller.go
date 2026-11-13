@@ -370,6 +370,18 @@ func incompleteUserCleanupCutoff(force bool, now time.Time) time.Time {
 	return now.Add(-24 * time.Hour)
 }
 
+func callerAdminID(c *gin.Context) primitive.ObjectID {
+	if c == nil {
+		return primitive.NilObjectID
+	}
+	if val, ok := c.Get("userId"); ok {
+		if oid, ok := val.(primitive.ObjectID); ok {
+			return oid
+		}
+	}
+	return primitive.NilObjectID
+}
+
 // AdminCleanupIncompleteUsers deletes abandoned registrations (missing name or role)
 // while always excluding admin accounts, users with rides/bookings, and enforcing
 // a minimum grace window even when force=true.
@@ -384,6 +396,20 @@ func AdminCleanupIncompleteUsers(c *gin.Context) {
 	if err != nil {
 		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to delete incomplete user registrations"})
 		return
+	}
+
+	if deletedCount > 0 {
+		NotifyAdminsAsync(AdminNotificationInput{
+			Title:          "Incomplete Users Cleaned Up",
+			Message:        fmt.Sprintf("Purged %d abandoned user registration(s).", deletedCount),
+			Type:           models.NotifTypeIncompleteUsersCleaned,
+			Category:       models.NotifCategorySystem,
+			TargetView:     models.AdminViewAdminUsers,
+			ExcludeAdminID: callerAdminID(c),
+			Metadata: map[string]string{
+				"deletedCount": fmt.Sprintf("%d", deletedCount),
+			},
+		})
 	}
 
 	log.Printf("[ADMIN CLEANUP] Deleted %d incomplete user records (force=%v)", deletedCount, force)
@@ -956,6 +982,7 @@ func AdminVerifyDriver(c *gin.Context) {
 		return
 	}
 	sendRetiredRideNotices(retiredNotices)
+	notifyAdminsForRetiredBookings(retiredNotices, "driver verification changed")
 
 	// Send Notification to Driver after transaction commits
 	var title, msg string
@@ -968,6 +995,44 @@ func AdminVerifyDriver(c *gin.Context) {
 	}
 	if title != "" {
 		CreateNotification(driverId, title, msg, "document_verification", "", nil)
+	}
+
+	actingAdmin := callerAdminID(c)
+	if body.Status == string(models.VerificationStatusVerified) {
+		NotifyAdminsAsync(AdminNotificationInput{
+			Title:          "Driver Approved",
+			Message:        fmt.Sprintf("Driver %s (%s) KYC documents were approved.", driver.Name, driver.PhoneNumber),
+			Type:           models.NotifTypeDriverVerified,
+			Category:       models.NotifCategoryDrivers,
+			TargetView:     models.AdminViewDrivers,
+			RelatedID:      driverId.Hex(),
+			ExcludeAdminID: actingAdmin,
+			Metadata: map[string]string{
+				"driverId":   driverId.Hex(),
+				"userId":     driverId.Hex(),
+				"actorName":  driver.Name,
+				"actorPhone": driver.PhoneNumber,
+				"status":     string(models.VerificationStatusVerified),
+			},
+		})
+	} else if body.Status == string(models.VerificationStatusRejected) {
+		NotifyAdminsAsync(AdminNotificationInput{
+			Title:          "Driver Rejected",
+			Message:        fmt.Sprintf("Driver %s (%s) KYC documents were rejected.", driver.Name, driver.PhoneNumber),
+			Type:           models.NotifTypeDriverRejected,
+			Category:       models.NotifCategoryDrivers,
+			TargetView:     models.AdminViewDriverVerification,
+			RelatedID:      driverId.Hex(),
+			ExcludeAdminID: actingAdmin,
+			Metadata: map[string]string{
+				"driverId":   driverId.Hex(),
+				"userId":     driverId.Hex(),
+				"actorName":  driver.Name,
+				"actorPhone": driver.PhoneNumber,
+				"status":     string(models.VerificationStatusRejected),
+				"reason":     reasonToSet,
+			},
+		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Driver verification status updated", "status": body.Status})
@@ -1046,12 +1111,31 @@ func AdminRequestReKYC(c *gin.Context) {
 		return
 	}
 	sendRetiredRideNotices(rekycNotices)
+	notifyAdminsForRetiredBookings(rekycNotices, "driver Re-KYC requested")
 
 	// Send Push & In-app Notification to Driver after transaction commits
 	title := "Re-KYC Required"
 	msg := reason
 	CreateNotification(driverId, title, msg, "document_verification", "", map[string]string{
 		"action": "rekyc",
+	})
+
+	NotifyAdminsAsync(AdminNotificationInput{
+		Title:          "Driver Re-KYC Requested",
+		Message:        fmt.Sprintf("Re-KYC was requested for driver %s (%s).", driver.Name, driver.PhoneNumber),
+		Type:           models.NotifTypeDriverReKYCRequested,
+		Category:       models.NotifCategoryDrivers,
+		TargetView:     models.AdminViewDriverVerification,
+		RelatedID:      driverId.Hex(),
+		ExcludeAdminID: callerAdminID(c),
+		Metadata: map[string]string{
+			"driverId":   driverId.Hex(),
+			"userId":     driverId.Hex(),
+			"actorName":  driver.Name,
+			"actorPhone": driver.PhoneNumber,
+			"status":     string(models.VerificationStatusRejected),
+			"reason":     reason,
+		},
 	})
 
 	c.JSON(http.StatusOK, gin.H{"message": "Re-KYC request and notification sent to driver successfully"})
@@ -1185,6 +1269,22 @@ func AdminDeleteDriver(c *gin.Context) {
 		respondTxError(c, err, "Failed to delete driver")
 		return
 	}
+
+	NotifyAdminsAsync(AdminNotificationInput{
+		Title:          "Driver Account Deleted",
+		Message:        fmt.Sprintf("Driver %s (%s) was permanently deleted (%d rides, %d bookings removed).", driver.Name, driver.PhoneNumber, deletedRides, deletedBookings),
+		Type:           models.NotifTypeDriverDeleted,
+		Category:       models.NotifCategoryDrivers,
+		TargetView:     models.AdminViewDrivers,
+		RelatedID:      driverId.Hex(),
+		ExcludeAdminID: callerAdminID(c),
+		Metadata: map[string]string{
+			"driverId":   driverId.Hex(),
+			"userId":     driverId.Hex(),
+			"actorName":  driver.Name,
+			"actorPhone": driver.PhoneNumber,
+		},
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":         fmt.Sprintf("Driver %s deleted successfully", driver.Name),

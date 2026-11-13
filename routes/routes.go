@@ -47,6 +47,8 @@ func RegisterRoutes(r *gin.Engine) {
 	notifs.Use(middleware.AuthMiddleware(), middleware.GlobalRateLimiter(60, 1*time.Minute))
 	{
 		notifs.GET("/", controllers.GetMyNotifications)
+		notifs.GET("/unread-count", controllers.GetUnreadNotificationCount)
+		notifs.PUT("/read-all", controllers.MarkAllNotificationsRead)
 		notifs.PUT("/:id/read", controllers.MarkNotificationRead)
 		notifs.DELETE("/clear", controllers.ClearAllNotifications)
 		notifs.POST("/test-push", controllers.TestPushNotification)

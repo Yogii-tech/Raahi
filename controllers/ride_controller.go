@@ -165,9 +165,10 @@ func CreateRide(c *gin.Context) {
 	findCtx, findCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer findCancel()
 
-	// Fetch driver Name, Role, and VerificationStatus
+	// Fetch driver Name, PhoneNumber, Role, and VerificationStatus
 	var driver struct {
 		Name               string `bson:"name"`
+		PhoneNumber        string `bson:"phone_number"`
 		Role               string `bson:"role"`
 		VerificationStatus string `bson:"verification_status"`
 	}
@@ -270,7 +271,9 @@ func CreateRide(c *gin.Context) {
 		route = append(route, body.Dropoff) // Always end with dropoff
 	}
 
+	rideID := primitive.NewObjectID()
 	ride := models.Ride{
+		ID:              rideID,
 		DriverID:        userId,
 		DriverName:      driver.Name,
 		Pickup:          body.Pickup,
@@ -327,6 +330,33 @@ func CreateRide(c *gin.Context) {
 	}
 
 	sendRetiredRideNotices(retiredNotices)
+	notifyAdminsForRetiredBookings(retiredNotices, "driver posted a replacement ride")
+
+	driverLabel := strings.TrimSpace(driver.Name)
+	if driverLabel == "" {
+		driverLabel = driver.PhoneNumber
+	}
+	NotifyAdminsAsync(AdminNotificationInput{
+		Title:      "New Ride Posted",
+		Message:    fmt.Sprintf("%s posted a ride: %s → %s (%s at %s, %d seats @ ₹%.0f).", driverLabel, ride.Pickup, ride.Dropoff, ride.Date, ride.DepartureTime, ride.SeatsTotal, ride.PricePerSeat),
+		Type:       models.NotifTypeRideCreated,
+		Category:   models.NotifCategoryRides,
+		TargetView: models.AdminViewActiveRides,
+		RelatedID:  ride.ID.Hex(),
+		Metadata: map[string]string{
+			"rideId":        ride.ID.Hex(),
+			"driverId":      userId.Hex(),
+			"actorName":     driver.Name,
+			"actorPhone":    driver.PhoneNumber,
+			"vehicleName":   ride.VehicleModel,
+			"vehicleNumber": ride.VehicleNumber,
+			"pickup":        ride.Pickup,
+			"dropoff":       ride.Dropoff,
+			"date":          ride.Date,
+			"departureTime": ride.DepartureTime,
+			"status":        string(models.RideStatusAvailable),
+		},
+	})
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message":         "Ride created successfully",
@@ -1321,10 +1351,27 @@ func BookRide(c *gin.Context) {
 		msg = "Parcel pickup request sent to driver"
 	}
 
-	// Notify the driver via FCM push (fire-and-forget)
+	// Notify the driver and admins via DB + FCM push (fire-and-forget)
 	go func() {
 		fcmCtx, fcmCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer fcmCancel()
+
+		var passenger struct {
+			Name        string `bson:"name"`
+			PhoneNumber string `bson:"phone_number"`
+		}
+		if usersCollection != nil {
+			_ = usersCollection.FindOne(fcmCtx, bson.M{"_id": passengerId}).Decode(&passenger)
+		}
+
+		actorLabel := strings.TrimSpace(passenger.Name)
+		if actorLabel == "" {
+			actorLabel = strings.TrimSpace(passenger.PhoneNumber)
+		}
+		if actorLabel == "" {
+			actorLabel = "A user"
+		}
+
 		var ride models.Ride
 		if err := rideCollection.FindOne(fcmCtx, bson.M{"_id": rideId}).Decode(&ride); err == nil {
 			var driver struct {
@@ -1370,6 +1417,57 @@ func BookRide(c *gin.Context) {
 			}
 		} else {
 			log.Printf("[FCM] Ride lookup error for ride %s: %v", rideId.Hex(), err)
+			ride = rideForCheck
+		}
+
+		if bookingType == "parcel" {
+			NotifyAdminsAsync(AdminNotificationInput{
+				Title:      "New Parcel Booking",
+				Message:    fmt.Sprintf("%s booked a %s parcel (%s → %s) for %s.", actorLabel, cleanSize, booking.Pickup, booking.Dropoff, cleanRecipient),
+				Type:       models.NotifTypeParcelCreated,
+				Category:   models.NotifCategoryParcels,
+				TargetView: models.AdminViewParcels,
+				RelatedID:  newBookingID.Hex(),
+				Metadata: map[string]string{
+					"bookingId":     newBookingID.Hex(),
+					"rideId":        rideId.Hex(),
+					"driverId":      ride.DriverID.Hex(),
+					"driverName":    ride.DriverName,
+					"userId":        passengerId.Hex(),
+					"actorName":     passenger.Name,
+					"actorPhone":    passenger.PhoneNumber,
+					"pickup":        booking.Pickup,
+					"dropoff":       booking.Dropoff,
+					"status":        string(models.BookingStatusPending),
+					"bookingType":   "parcel",
+					"parcelSize":    cleanSize,
+					"recipientName": cleanRecipient,
+					"contactNumber": cleanContact,
+				},
+			})
+		} else {
+			NotifyAdminsAsync(AdminNotificationInput{
+				Title:      "New Seat Booking",
+				Message:    fmt.Sprintf("%s requested %d seat(s): %s → %s.", actorLabel, seatsCount, booking.Pickup, booking.Dropoff),
+				Type:       models.NotifTypeBookingCreated,
+				Category:   models.NotifCategoryBookings,
+				TargetView: models.AdminViewBookings,
+				RelatedID:  newBookingID.Hex(),
+				Metadata: map[string]string{
+					"bookingId":      newBookingID.Hex(),
+					"rideId":         rideId.Hex(),
+					"driverId":       ride.DriverID.Hex(),
+					"driverName":     ride.DriverName,
+					"userId":         passengerId.Hex(),
+					"actorName":      passenger.Name,
+					"actorPhone":     passenger.PhoneNumber,
+					"pickup":         booking.Pickup,
+					"dropoff":        booking.Dropoff,
+					"status":         string(models.BookingStatusPending),
+					"bookingType":    "seat",
+					"seatsRequested": fmt.Sprintf("%d", seatsCount),
+				},
+			})
 		}
 	}()
 
@@ -1694,6 +1792,7 @@ func UpdateBookingStatus(c *gin.Context) {
 	defer cancel()
 
 	var booking models.Booking
+	var ride models.Ride
 	var generatedBID string
 
 	if err := config.RunInTransaction(dbCtx, func(txCtx context.Context) error {
@@ -1711,7 +1810,7 @@ func UpdateBookingStatus(c *gin.Context) {
 		}
 
 		// Authorization check IDOR & ride status check
-		var ride models.Ride
+		ride = models.Ride{}
 		if err := rideCollection.FindOne(txCtx, bson.M{"_id": booking.RideID}).Decode(&ride); err != nil {
 			if errors.Is(err, mongo.ErrNoDocuments) {
 				return newTxErr(http.StatusForbidden, "Not authorized")
@@ -1912,8 +2011,14 @@ func UpdateBookingStatus(c *gin.Context) {
 		return
 	}
 
-	// Capture status before goroutine so the closure doesn't race on body
+	// Capture status and immutable snapshots before goroutines so closures don't race
 	capturedStatus := body.Status
+	capturedBooking := booking
+	capturedBooking.Status = capturedStatus
+	if capturedBooking.BookingID == "" && generatedBID != "" {
+		capturedBooking.BookingID = generatedBID
+	}
+	capturedRide := ride
 
 	// Notify passenger of decision via DB notification + FCM Push (after commit)
 	go func() {
@@ -1939,6 +2044,16 @@ func UpdateBookingStatus(c *gin.Context) {
 			"url":       "/?openTrips=true",
 		})
 	}()
+
+	go func(b models.Booking, r models.Ride, status string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var passenger models.User
+		if usersCol := getRideUsersCollection(); usersCol != nil && !b.PassengerID.IsZero() {
+			_ = usersCol.FindOne(ctx, bson.M{"_id": b.PassengerID}, options.FindOne().SetProjection(bson.M{"name": 1, "phone_number": 1})).Decode(&passenger)
+		}
+		notifyAdminForBookingLifecycle(b, r, status, "", passenger.Name, passenger.PhoneNumber)
+	}(capturedBooking, capturedRide, capturedStatus)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Booking status updated", "bookingId": booking.BookingID})
 }
@@ -2158,10 +2273,14 @@ func CompleteRide(c *gin.Context) {
 
 	var ride models.Ride
 	var completedPassengerIDs []primitive.ObjectID
+	var acceptedBookings []models.Booking
+	var pendingBookings []models.Booking
 
 	if err := config.RunInTransaction(dbCtx, func(txCtx context.Context) error {
 		now := time.Now()
 		completedPassengerIDs = nil
+		acceptedBookings = nil
+		pendingBookings = nil
 
 		err := rideCollection.FindOneAndUpdate(
 			txCtx,
@@ -2210,33 +2329,39 @@ func CompleteRide(c *gin.Context) {
 			}
 		}
 
-		// Collect accepted passenger IDs BEFORE updating booking statuses
+		// Collect accepted & pending bookings BEFORE updating booking statuses
 		pcursor, pcursorErr := bookingCollection.Find(
 			txCtx,
-			bson.M{"rideId": rideId, "status": string(models.BookingStatusAccepted)},
-			options.Find().SetProjection(bson.M{"passengerId": 1}),
+			bson.M{"rideId": rideId, "status": bson.M{"$in": []string{
+				string(models.BookingStatusAccepted),
+				string(models.BookingStatusPending),
+			}}},
 		)
 		if pcursorErr != nil {
-			return fmt.Errorf("fetch accepted bookings for completion: %w", pcursorErr)
+			return fmt.Errorf("fetch bookings for completion: %w", pcursorErr)
 		}
-		var acceptedRows []struct {
-			PassengerID primitive.ObjectID `bson:"passengerId"`
-		}
-		decErr := pcursor.All(txCtx, &acceptedRows)
+		var rideBookings []models.Booking
+		decErr := pcursor.All(txCtx, &rideBookings)
 		curErr := pcursor.Err()
 		pcursor.Close(txCtx)
 		if decErr != nil {
-			return fmt.Errorf("decode accepted bookings for completion: %w", decErr)
+			return fmt.Errorf("decode bookings for completion: %w", decErr)
 		}
 		if curErr != nil {
-			return fmt.Errorf("iterate accepted bookings for completion: %w", curErr)
+			return fmt.Errorf("iterate bookings for completion: %w", curErr)
 		}
 
-		seen := make(map[primitive.ObjectID]bool, len(acceptedRows))
-		for _, row := range acceptedRows {
-			if !row.PassengerID.IsZero() && !seen[row.PassengerID] {
-				seen[row.PassengerID] = true
-				completedPassengerIDs = append(completedPassengerIDs, row.PassengerID)
+		seen := make(map[primitive.ObjectID]bool, len(rideBookings))
+		for _, row := range rideBookings {
+			switch row.Status {
+			case string(models.BookingStatusAccepted):
+				acceptedBookings = append(acceptedBookings, row)
+				if !row.PassengerID.IsZero() && !seen[row.PassengerID] {
+					seen[row.PassengerID] = true
+					completedPassengerIDs = append(completedPassengerIDs, row.PassengerID)
+				}
+			case string(models.BookingStatusPending):
+				pendingBookings = append(pendingBookings, row)
 			}
 		}
 
@@ -2268,6 +2393,48 @@ func CompleteRide(c *gin.Context) {
 		go CreateNotification(pid, "🏁 Ride Completed!",
 			"Your ride from "+ride.Pickup+" to "+ride.Dropoff+" is complete. Tap to rate your experience.",
 			"ride_completed", rideId.Hex(), nil)
+	}
+
+	// Notify admins of completed ride and transitioned bookings/parcels
+	NotifyAdminsAsync(AdminNotificationInput{
+		Title:      "🏁 Ride Completed",
+		Message:    fmt.Sprintf("Driver %s completed ride %s → %s (%d completed bookings, %d pending cancelled).", displayDriverLabel(ride.DriverName), ride.Pickup, ride.Dropoff, len(acceptedBookings), len(pendingBookings)),
+		Type:       models.NotifTypeRideCompleted,
+		Category:   models.NotifCategoryRides,
+		TargetView: models.AdminViewCompletedRides,
+		RelatedID:  rideId.Hex(),
+		Metadata: map[string]string{
+			"rideId":        rideId.Hex(),
+			"driverId":      ride.DriverID.Hex(),
+			"actorName":     ride.DriverName,
+			"vehicleName":   ride.VehicleModel,
+			"vehicleNumber": ride.VehicleNumber,
+			"pickup":        ride.Pickup,
+			"dropoff":       ride.Dropoff,
+			"status":        string(models.RideStatusCompleted),
+		},
+	})
+	if len(acceptedBookings) > 0 || len(pendingBookings) > 0 {
+		go func(r models.Ride, accepted, pending []models.Booking) {
+			passengerIDs := make([]primitive.ObjectID, 0, len(accepted)+len(pending))
+			for _, b := range accepted {
+				passengerIDs = append(passengerIDs, b.PassengerID)
+			}
+			for _, b := range pending {
+				passengerIDs = append(passengerIDs, b.PassengerID)
+			}
+			passengers := lookupPassengerSummaries(passengerIDs)
+			for _, ab := range accepted {
+				ab.Status = string(models.BookingStatusCompleted)
+				p := passengers[ab.PassengerID]
+				notifyAdminForBookingLifecycle(ab, r, string(models.BookingStatusCompleted), "", p.Name, p.PhoneNumber)
+			}
+			for _, pb := range pending {
+				pb.Status = string(models.BookingStatusCancelled)
+				p := passengers[pb.PassengerID]
+				notifyAdminForBookingLifecycle(pb, r, string(models.BookingStatusCancelled), "Ride completed before confirmation", p.Name, p.PhoneNumber)
+			}
+		}(ride, acceptedBookings, pendingBookings)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Ride completed successfully"})
@@ -2350,6 +2517,25 @@ func StartRide(c *gin.Context) {
 			log.Printf("[StartRide] Cursor error notifying passengers for ride %s: %v", startedRideId.Hex(), err)
 		}
 	}(rideId, ride.Pickup, ride.Dropoff)
+
+	NotifyAdminsAsync(AdminNotificationInput{
+		Title:      "🚀 Ride Started",
+		Message:    fmt.Sprintf("Driver %s started ride %s → %s.", displayDriverLabel(ride.DriverName), ride.Pickup, ride.Dropoff),
+		Type:       models.NotifTypeRideStarted,
+		Category:   models.NotifCategoryRides,
+		TargetView: models.AdminViewActiveRides,
+		RelatedID:  rideId.Hex(),
+		Metadata: map[string]string{
+			"rideId":        rideId.Hex(),
+			"driverId":      ride.DriverID.Hex(),
+			"actorName":     ride.DriverName,
+			"vehicleName":   ride.VehicleModel,
+			"vehicleNumber": ride.VehicleNumber,
+			"pickup":        ride.Pickup,
+			"dropoff":       ride.Dropoff,
+			"status":        string(models.RideStatusOngoing),
+		},
+	})
 
 	c.JSON(http.StatusOK, gin.H{"message": "Ride started successfully"})
 }
@@ -2599,6 +2785,268 @@ func sendRetiredRideNotices(notices []retiredBookingNotice) {
 				"url":       "/?openTrips=true",
 			})
 	}
+}
+
+func getRideUsersCollection() *mongo.Collection {
+	if usersCollection != nil {
+		return usersCollection
+	}
+	if config.Database != nil {
+		return config.Database.Collection("users")
+	}
+	return nil
+}
+
+func lookupPassengerSummaries(passengerIDs []primitive.ObjectID) map[primitive.ObjectID]models.User {
+	result := make(map[primitive.ObjectID]models.User)
+	usersCol := getRideUsersCollection()
+	if usersCol == nil || len(passengerIDs) == 0 {
+		return result
+	}
+
+	seen := make(map[primitive.ObjectID]bool, len(passengerIDs))
+	uniqueIDs := make([]primitive.ObjectID, 0, len(passengerIDs))
+	for _, id := range passengerIDs {
+		if !id.IsZero() && !seen[id] {
+			seen[id] = true
+			uniqueIDs = append(uniqueIDs, id)
+		}
+	}
+	if len(uniqueIDs) == 0 {
+		return result
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cursor, err := usersCol.Find(
+		ctx,
+		bson.M{"_id": bson.M{"$in": uniqueIDs}},
+		options.Find().SetProjection(bson.M{"name": 1, "phone_number": 1}),
+	)
+	if err != nil {
+		return result
+	}
+	defer cursor.Close(ctx)
+
+	var users []models.User
+	if err := cursor.All(ctx, &users); err != nil {
+		return result
+	}
+	for _, u := range users {
+		result[u.ID] = u
+	}
+	return result
+}
+
+func displayDriverLabel(name string) string {
+	if trimmed := strings.TrimSpace(name); trimmed != "" {
+		return trimmed
+	}
+	return "a driver"
+}
+
+func buildBookingLifecycleAdminNotification(
+	b models.Booking,
+	r models.Ride,
+	status string,
+	reason string,
+	passengerName string,
+	passengerPhone string,
+) (AdminNotificationInput, bool) {
+	isParcel := strings.EqualFold(strings.TrimSpace(b.Type), "parcel")
+	bookingHex := b.ID.Hex()
+	bid := strings.TrimSpace(b.BookingID)
+	bookingLabel := bid
+	if bookingLabel == "" {
+		bookingLabel = bookingHex
+	}
+
+	category := models.NotifCategoryBookings
+	targetView := models.AdminViewBookings
+	bookingType := "seat"
+	if isParcel {
+		category = models.NotifCategoryParcels
+		targetView = models.AdminViewParcels
+		bookingType = "parcel"
+	}
+
+	var notifType, title, message string
+	switch status {
+	case string(models.BookingStatusAccepted):
+		if isParcel {
+			notifType = models.NotifTypeParcelConfirmed
+			title = "✅ Parcel Booking Confirmed"
+			message = fmt.Sprintf("Driver %s confirmed parcel %s (%s → %s).", displayDriverLabel(r.DriverName), bookingLabel, b.Pickup, b.Dropoff)
+		} else {
+			notifType = models.NotifTypeBookingConfirmed
+			title = "✅ Booking Confirmed"
+			message = fmt.Sprintf("Driver %s confirmed booking %s (%d seats, %s → %s).", displayDriverLabel(r.DriverName), bookingLabel, maxInt(1, b.SeatsRequested), b.Pickup, b.Dropoff)
+		}
+	case string(models.BookingStatusRejected):
+		if isParcel {
+			notifType = models.NotifTypeParcelRejected
+			title = "❌ Parcel Booking Declined"
+			message = fmt.Sprintf("Driver %s declined parcel %s (%s → %s).", displayDriverLabel(r.DriverName), bookingLabel, b.Pickup, b.Dropoff)
+		} else {
+			notifType = models.NotifTypeBookingRejected
+			title = "❌ Booking Declined"
+			message = fmt.Sprintf("Driver %s declined booking %s (%d seats, %s → %s).", displayDriverLabel(r.DriverName), bookingLabel, maxInt(1, b.SeatsRequested), b.Pickup, b.Dropoff)
+		}
+	case string(models.BookingStatusCompleted):
+		if isParcel {
+			notifType = models.NotifTypeParcelCompleted
+			title = "📦 Parcel Completed"
+			message = fmt.Sprintf("Parcel %s (%s → %s) marked completed.", bookingLabel, b.Pickup, b.Dropoff)
+		} else {
+			notifType = models.NotifTypeBookingCompleted
+			title = "🏁 Booking Completed"
+			message = fmt.Sprintf("Booking %s (%d seats, %s → %s) marked completed.", bookingLabel, maxInt(1, b.SeatsRequested), b.Pickup, b.Dropoff)
+		}
+	case string(models.BookingStatusCancelled):
+		reasonSuffix := ""
+		if strings.TrimSpace(reason) != "" {
+			reasonSuffix = " Reason: " + strings.TrimSpace(reason) + "."
+		}
+		if isParcel {
+			notifType = models.NotifTypeParcelCancelled
+			title = "❌ Parcel Cancelled"
+			message = fmt.Sprintf("Parcel %s (%s → %s) was cancelled.%s", bookingLabel, b.Pickup, b.Dropoff, reasonSuffix)
+		} else {
+			notifType = models.NotifTypeBookingCancelled
+			title = "❌ Booking Cancelled"
+			message = fmt.Sprintf("Booking %s (%d seats, %s → %s) was cancelled.%s", bookingLabel, maxInt(1, b.SeatsRequested), b.Pickup, b.Dropoff, reasonSuffix)
+		}
+	default:
+		return AdminNotificationInput{}, false
+	}
+
+	// Keep actorName / actorPhone strictly referring to the passenger (booker/sender),
+	// matching BookRide, while driverName carries r.DriverName separately so UI context tags
+	// and Parcel search filters never mix driver name with passenger phone.
+	cleanPassengerName := strings.TrimSpace(passengerName)
+	cleanPassengerPhone := strings.TrimSpace(passengerPhone)
+	cleanDriverName := strings.TrimSpace(r.DriverName)
+
+	meta := map[string]string{
+		"bookingId":     bookingHex,
+		"bid":           bid,
+		"pickup":        b.Pickup,
+		"dropoff":       b.Dropoff,
+		"status":        status,
+		"bookingType":   bookingType,
+		"vehicleName":   r.VehicleModel,
+		"vehicleNumber": r.VehicleNumber,
+		"parcelSize":    b.ParcelSize,
+		"recipientName": b.RecipientName,
+		"contactNumber": b.ContactNumber,
+		"reason":        strings.TrimSpace(reason),
+	}
+	if !r.ID.IsZero() {
+		meta["rideId"] = r.ID.Hex()
+	}
+	if !r.DriverID.IsZero() {
+		meta["driverId"] = r.DriverID.Hex()
+	}
+	if cleanDriverName != "" {
+		meta["driverName"] = cleanDriverName
+	}
+	if !b.PassengerID.IsZero() {
+		meta["userId"] = b.PassengerID.Hex()
+	}
+	if cleanPassengerName != "" {
+		meta["actorName"] = cleanPassengerName
+		meta["passengerName"] = cleanPassengerName
+	}
+	if cleanPassengerPhone != "" {
+		meta["actorPhone"] = cleanPassengerPhone
+	}
+
+	return AdminNotificationInput{
+		Title:      title,
+		Message:    message,
+		Type:       notifType,
+		Category:   category,
+		TargetView: targetView,
+		RelatedID:  bookingHex,
+		Metadata:   meta,
+	}, true
+}
+
+func notifyAdminForBookingLifecycle(
+	b models.Booking,
+	r models.Ride,
+	status string,
+	reason string,
+	passengerName string,
+	passengerPhone string,
+) {
+	input, ok := buildBookingLifecycleAdminNotification(b, r, status, reason, passengerName, passengerPhone)
+	if !ok {
+		return
+	}
+	NotifyAdminsAsync(input)
+}
+
+func notifyAdminsForRetiredBookings(notices []retiredBookingNotice, reason string) {
+	if len(notices) == 0 {
+		return
+	}
+	copied := make([]retiredBookingNotice, len(notices))
+	copy(copied, notices)
+
+	go func(items []retiredBookingNotice, rawReason string) {
+		seenRides := make(map[primitive.ObjectID]bool, len(items))
+		trimmedReason := strings.TrimSpace(rawReason)
+		passengerIDs := make([]primitive.ObjectID, 0, len(items))
+		for _, item := range items {
+			passengerIDs = append(passengerIDs, item.Booking.PassengerID)
+		}
+		passengers := lookupPassengerSummaries(passengerIDs)
+
+		for _, item := range items {
+			r := item.Ride
+			if !r.ID.IsZero() && !seenRides[r.ID] {
+				seenRides[r.ID] = true
+				msg := fmt.Sprintf("Ride %s → %s (driver: %s) was cancelled.", r.Pickup, r.Dropoff, displayDriverLabel(r.DriverName))
+				if trimmedReason != "" {
+					msg = fmt.Sprintf("Ride %s → %s (driver: %s) was cancelled (%s).", r.Pickup, r.Dropoff, displayDriverLabel(r.DriverName), trimmedReason)
+				}
+				NotifyAdminsAsync(AdminNotificationInput{
+					Title:      "❌ Ride Cancelled",
+					Message:    msg,
+					Type:       models.NotifTypeRideCancelled,
+					Category:   models.NotifCategoryRides,
+					TargetView: models.AdminViewCancelledRides,
+					RelatedID:  r.ID.Hex(),
+					Metadata: map[string]string{
+						"rideId":        r.ID.Hex(),
+						"driverId":      r.DriverID.Hex(),
+						"driverName":    r.DriverName,
+						"actorName":     r.DriverName,
+						"vehicleName":   r.VehicleModel,
+						"vehicleNumber": r.VehicleNumber,
+						"pickup":        r.Pickup,
+						"dropoff":       r.Dropoff,
+						"status":        string(models.RideStatusCancelled),
+						"reason":        trimmedReason,
+					},
+				})
+			}
+
+			b := item.Booking
+			b.Status = string(models.BookingStatusCancelled)
+			p := passengers[b.PassengerID]
+			notifyAdminForBookingLifecycle(b, r, string(models.BookingStatusCancelled), trimmedReason, p.Name, p.PhoneNumber)
+		}
+	}(copied, reason)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // retireOpenRidesInTx soft-cancels all "available" rides belonging to driverID

@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"strings"
@@ -131,6 +132,45 @@ func SubmitReview(c *gin.Context) {
 		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to save review"})
 		return
 	}
+
+	reviewerName := strings.TrimSpace(passenger.Name)
+	if reviewerName == "" {
+		reviewerName = "A passenger"
+	}
+	driverLabel := strings.TrimSpace(ride.DriverName)
+	if driverLabel == "" {
+		driverLabel = "Driver"
+	}
+	reviewTitle := "⭐ New Ride Review"
+	if body.Rating <= 2 {
+		reviewTitle = "⚠️ Low Driver Rating Alert"
+	}
+	reviewMsg := fmt.Sprintf("%s rated %s %d★ (%s → %s)", reviewerName, driverLabel, body.Rating, ride.Pickup, ride.Dropoff)
+	if sanitizedComment != "" {
+		preview := sanitizedComment
+		if len(preview) > 80 {
+			preview = preview[:77] + "..."
+		}
+		reviewMsg += fmt.Sprintf(": %q", preview)
+	}
+	NotifyAdminsAsync(AdminNotificationInput{
+		Title:      reviewTitle,
+		Message:    reviewMsg,
+		Type:       models.NotifTypeReviewSubmitted,
+		Category:   models.NotifCategoryReviews,
+		TargetView: models.AdminViewDrivers,
+		RelatedID:  ride.DriverID.Hex(),
+		Metadata: map[string]string{
+			"rideId":     rideId.Hex(),
+			"driverId":   ride.DriverID.Hex(),
+			"userId":     passengerID.Hex(),
+			"actorName":  passenger.Name,
+			"driverName": ride.DriverName,
+			"pickup":     ride.Pickup,
+			"dropoff":    ride.Dropoff,
+			"rating":     fmt.Sprintf("%d", body.Rating),
+		},
+	})
 
 	c.JSON(http.StatusCreated, gin.H{"message": "Review submitted successfully"})
 }
