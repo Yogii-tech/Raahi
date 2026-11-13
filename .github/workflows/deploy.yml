@@ -27,7 +27,7 @@ jobs:
 
     - name: Validate Production Storage Secrets
       env:
-        GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+        GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME || 'raahi-documents-137804375265' }}
         GCS_REPLICA_BUCKET_NAME: ${{ secrets.GCS_REPLICA_BUCKET_NAME }}
         GCS_REQUIRE_REPLICA: ${{ secrets.GCS_REQUIRE_REPLICA }}
       run: |-
@@ -80,7 +80,7 @@ jobs:
         ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
         SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         APP_ENV: production
-        GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+        GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME || 'raahi-documents-137804375265' }}
         # Optional (recommended): secondary GCS replica/backup bucket in another region with Object Versioning + Retention
         GCS_REPLICA_BUCKET_NAME: ${{ secrets.GCS_REPLICA_BUCKET_NAME }}
         # Optional: set to "true" to fail uploads if replication to GCS_REPLICA_BUCKET_NAME fails after retries
