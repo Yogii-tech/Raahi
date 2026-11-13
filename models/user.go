@@ -5,6 +5,46 @@ import (
 	"time"
 )
 
+// VerificationStatus represents the explicit driver KYC verification state.
+type VerificationStatus string
+
+const (
+	VerificationStatusNone     VerificationStatus = ""
+	VerificationStatusPending  VerificationStatus = "pending"
+	VerificationStatusVerified VerificationStatus = "verified"
+	VerificationStatusRejected VerificationStatus = "rejected"
+)
+
+var validVerificationTransitions = map[VerificationStatus]map[VerificationStatus]bool{
+	VerificationStatusNone: {
+		VerificationStatusPending:  true,
+		VerificationStatusVerified: true,
+		VerificationStatusRejected: true,
+	},
+	VerificationStatusPending: {
+		VerificationStatusVerified: true,
+		VerificationStatusRejected: true,
+	},
+	VerificationStatusVerified: {
+		VerificationStatusPending:  true,
+		VerificationStatusRejected: true,
+	},
+	VerificationStatusRejected: {
+		VerificationStatusPending:  true,
+		VerificationStatusVerified: true,
+	},
+}
+
+// CanTransitionVerificationStatus reports whether transitioning driver KYC
+// verification status from `from` to `to` is allowed.
+func CanTransitionVerificationStatus(from, to VerificationStatus) bool {
+	allowed, ok := validVerificationTransitions[from]
+	if !ok {
+		return false
+	}
+	return allowed[to]
+}
+
 type Contact struct {
 	Name  string `bson:"name" json:"name"`
 	Phone string `bson:"phone" json:"phone"`
@@ -32,6 +72,7 @@ type User struct {
 	OTPExpiry          time.Time          `bson:"otp_expiry" json:"-"` // OTP valid for 10 minutes
 	TrustedContacts    []Contact          `bson:"trusted_contacts" json:"trusted_contacts"`
 	Role               string             `bson:"role" json:"role"`
+	Language           string             `bson:"language,omitempty" json:"language,omitempty"`
 	Location           string             `bson:"location,omitempty" json:"location"`
 	VerificationStatus string             `bson:"verification_status,omitempty" json:"verification_status"` // "pending", "verified", "rejected"
 	RejectionReason    string             `bson:"rejection_reason,omitempty" json:"rejection_reason"`

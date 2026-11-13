@@ -86,6 +86,26 @@ func TestJWTGenerationAndValidation(t *testing.T) {
 		t.Errorf("Expected ValidateRefreshToken to reject an access token (type=access), got nil")
 	}
 
+	// Negative Scenario 4b: Missing or empty "type" claim MUST be rejected by both validators
+	for _, typeVal := range []interface{}{nil, ""} {
+		claims := jwt.MapClaims{
+			"userId":  userID.Hex(),
+			"version": tokenVersion,
+			"exp":     time.Now().Add(1 * time.Hour).Unix(),
+		}
+		if typeVal != nil {
+			claims["type"] = typeVal
+		}
+		untypedTok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		untypedStr, _ := untypedTok.SignedString(getJwtSecret())
+		if _, _, err := ValidateJWT(untypedStr); err == nil {
+			t.Errorf("Expected ValidateJWT to reject token with type=%v", typeVal)
+		}
+		if _, _, err := ValidateRefreshToken(untypedStr); err == nil {
+			t.Errorf("Expected ValidateRefreshToken to reject token with type=%v", typeVal)
+		}
+	}
+
 	// Negative Scenario 5: Expired Refresh Token MUST be rejected by ValidateRefreshToken
 	expiredRefresh := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"userId":  userID.Hex(),

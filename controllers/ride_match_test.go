@@ -481,14 +481,25 @@ func TestBackendSecurityControls(t *testing.T) {
 	baseVehicle := &models.Vehicle{
 		VehicleName:     "Innova",
 		VehicleNumber:   "UK04AB1234",
+		RatePerKm:       15,
 		DLUrl:           "/uploads/dl1.jpg",
 		RCUrl:           "/uploads/rc1.jpg",
 		PollutionUrl:    "/uploads/puc1.jpg",
 		VehicleImageUrl: "/uploads/car1.jpg",
 	}
 	sameVehicle := &models.Vehicle{
+		VehicleName:     "Innova",
+		VehicleNumber:   "UK04AB1234",
+		RatePerKm:       20, // pricing updates must not trigger re-KYC
+		DLUrl:           "/uploads/dl1.jpg",
+		RCUrl:           "/uploads/rc1.jpg",
+		PollutionUrl:    "/uploads/puc1.jpg",
+		VehicleImageUrl: "/uploads/car1.jpg",
+	}
+	renamedVehicle := &models.Vehicle{
 		VehicleName:     "Innova Crysta",
 		VehicleNumber:   "UK04AB1234",
+		RatePerKm:       15,
 		DLUrl:           "/uploads/dl1.jpg",
 		RCUrl:           "/uploads/rc1.jpg",
 		PollutionUrl:    "/uploads/puc1.jpg",
@@ -503,7 +514,10 @@ func TestBackendSecurityControls(t *testing.T) {
 		VehicleImageUrl: "/uploads/car1.jpg",
 	}
 	if hasDriverVehicleChanged(baseVehicle, sameVehicle) {
-		t.Errorf("expected unchanged KYC URLs/number to return false")
+		t.Errorf("expected unchanged KYC URLs/specs (with only RatePerKm changed) to return false")
+	}
+	if !hasDriverVehicleChanged(baseVehicle, renamedVehicle) {
+		t.Errorf("expected modified VehicleName to trigger hasDriverVehicleChanged=true")
 	}
 	if !hasDriverVehicleChanged(baseVehicle, tamperedVehicle) {
 		t.Errorf("expected modified DLUrl to trigger hasDriverVehicleChanged=true")

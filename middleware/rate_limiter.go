@@ -160,13 +160,45 @@ func OTPRateLimiter() gin.HandlerFunc {
 // SECURITY: Global per-user rate limiter for authenticated API endpoints
 // ──────────────────────────────────────────────────────────────────────
 
+type rateBucket struct {
+	timestamps []time.Time
+	window     time.Duration
+}
+
 type userRateLimiterStore struct {
 	mu      sync.Mutex
-	buckets map[string][]time.Time
+	buckets map[string]rateBucket
 }
 
 var globalLimiterStore = &userRateLimiterStore{
-	buckets: make(map[string][]time.Time),
+	buckets: make(map[string]rateBucket),
+}
+
+// cleanupGlobalLimiterStore evicts timestamps older than each bucket's configured window
+// and deletes empty buckets.
+func cleanupGlobalLimiterStore(now time.Time) {
+	globalLimiterStore.mu.Lock()
+	defer globalLimiterStore.mu.Unlock()
+
+	for k, bucket := range globalLimiterStore.buckets {
+		w := bucket.window
+		if w <= 0 {
+			w = 10 * time.Minute
+		}
+		cutoff := now.Add(-w)
+		var active []time.Time
+		for _, t := range bucket.timestamps {
+			if t.After(cutoff) {
+				active = append(active, t)
+			}
+		}
+		if len(active) == 0 {
+			delete(globalLimiterStore.buckets, k)
+		} else {
+			bucket.timestamps = active
+			globalLimiterStore.buckets[k] = bucket
+		}
+	}
 }
 
 // Cleanup goroutine for the global limiter
@@ -175,22 +207,7 @@ func init() {
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			globalLimiterStore.mu.Lock()
-			cutoff := time.Now().Add(-10 * time.Minute)
-			for k, times := range globalLimiterStore.buckets {
-				var active []time.Time
-				for _, t := range times {
-					if t.After(cutoff) {
-						active = append(active, t)
-					}
-				}
-				if len(active) == 0 {
-					delete(globalLimiterStore.buckets, k)
-				} else {
-					globalLimiterStore.buckets[k] = active
-				}
-			}
-			globalLimiterStore.mu.Unlock()
+			cleanupGlobalLimiterStore(time.Now())
 		}
 	}()
 }
@@ -222,15 +239,20 @@ func GlobalRateLimiter(maxRequests int, window time.Duration, label ...string) g
 		cutoff := now.Add(-window)
 
 		globalLimiterStore.mu.Lock()
-		requests := globalLimiterStore.buckets[key]
+		bucket := globalLimiterStore.buckets[key]
+		if window > bucket.window {
+			bucket.window = window
+		}
 		var active []time.Time
-		for _, t := range requests {
+		for _, t := range bucket.timestamps {
 			if t.After(cutoff) {
 				active = append(active, t)
 			}
 		}
 
 		if len(active) >= maxRequests {
+			bucket.timestamps = active
+			globalLimiterStore.buckets[key] = bucket
 			globalLimiterStore.mu.Unlock()
 			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error":       "Rate limit exceeded. Please slow down.",
@@ -241,7 +263,8 @@ func GlobalRateLimiter(maxRequests int, window time.Duration, label ...string) g
 		}
 
 		active = append(active, now)
-		globalLimiterStore.buckets[key] = active
+		bucket.timestamps = active
+		globalLimiterStore.buckets[key] = bucket
 		globalLimiterStore.mu.Unlock()
 
 		c.Next()

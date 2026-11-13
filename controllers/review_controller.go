@@ -63,7 +63,7 @@ func SubmitReview(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Drivers cannot review their own ride"})
 		return
 	}
-	if ride.Status != "completed" {
+	if ride.Status != string(models.RideStatusCompleted) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Ride is not completed yet"})
 		return
 	}
@@ -73,7 +73,7 @@ func SubmitReview(c *gin.Context) {
 	if err := config.Database.Collection("bookings").FindOne(ctx, bson.M{
 		"rideId":      rideId,
 		"passengerId": passengerID,
-		"status":      bson.M{"$in": []string{"accepted", "completed"}},
+		"status":      bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
 	}).Decode(&booking); err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You can only review rides you were part of"})
 		return
@@ -106,6 +106,10 @@ func SubmitReview(c *gin.Context) {
 	}
 
 	if _, err := reviewCollection.InsertOne(ctx, review); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "You have already reviewed this ride"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save review"})
 		return
 	}
@@ -188,7 +192,11 @@ func CheckCanReview(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "ride_not_found"})
 		return
 	}
-	if ride.Status != "completed" {
+	if passengerID == ride.DriverID {
+		c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "own_ride"})
+		return
+	}
+	if ride.Status != string(models.RideStatusCompleted) {
 		c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "ride_not_completed"})
 		return
 	}
@@ -197,7 +205,7 @@ func CheckCanReview(c *gin.Context) {
 	if err := config.Database.Collection("bookings").FindOne(ctx, bson.M{
 		"rideId":      rideId,
 		"passengerId": passengerID,
-		"status":      bson.M{"$in": []string{"accepted", "completed"}},
+		"status":      bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
 	}).Decode(&booking); err != nil {
 		c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "no_booking"})
 		return

@@ -165,19 +165,19 @@ func removeFCMToken(token string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := config.Database.Collection("users").UpdateMany(
+	usersCol := config.Database.Collection("users")
+	_, pullErr := usersCol.UpdateMany(
 		ctx,
-		bson.M{"$or": []bson.M{
-			{"fcm_token": token},
-			{"fcm_tokens": token},
-		}},
-		bson.M{
-			"$unset": bson.M{"fcm_token": ""},
-			"$pull":  bson.M{"fcm_tokens": token},
-		},
+		bson.M{"fcm_tokens": token},
+		bson.M{"$pull": bson.M{"fcm_tokens": token}},
 	)
-	if err != nil {
-		log.Printf("[FCM] Failed to remove stale token from DB: %v", err)
+	_, unsetErr := usersCol.UpdateMany(
+		ctx,
+		bson.M{"fcm_token": token},
+		bson.M{"$unset": bson.M{"fcm_token": ""}},
+	)
+	if pullErr != nil || unsetErr != nil {
+		log.Printf("[FCM] Failed to remove stale token from DB (pull=%v, unset=%v)", pullErr, unsetErr)
 	} else {
 		log.Printf("[FCM] Successfully removed stale token from DB")
 	}
@@ -388,19 +388,19 @@ func SendMulticastPush(tokens []string, title, body string, data map[string]stri
 				ctxCleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 
-				_, cleanupErr := config.Database.Collection("users").UpdateMany(
+				usersCol := config.Database.Collection("users")
+				_, pullErr := usersCol.UpdateMany(
 					ctxCleanup,
-					bson.M{"$or": []bson.M{
-						{"fcm_token": bson.M{"$in": tokensToRemove}},
-						{"fcm_tokens": bson.M{"$in": tokensToRemove}},
-					}},
-					bson.M{
-						"$unset": bson.M{"fcm_token": ""},
-						"$pull":  bson.M{"fcm_tokens": bson.M{"$in": tokensToRemove}},
-					},
+					bson.M{"fcm_tokens": bson.M{"$in": tokensToRemove}},
+					bson.M{"$pull": bson.M{"fcm_tokens": bson.M{"$in": tokensToRemove}}},
 				)
-				if cleanupErr != nil {
-					log.Printf("[FCM] Failed to bulk remove stale tokens: %v", cleanupErr)
+				_, unsetErr := usersCol.UpdateMany(
+					ctxCleanup,
+					bson.M{"fcm_token": bson.M{"$in": tokensToRemove}},
+					bson.M{"$unset": bson.M{"fcm_token": ""}},
+				)
+				if pullErr != nil || unsetErr != nil {
+					log.Printf("[FCM] Failed to bulk remove stale tokens (pull=%v, unset=%v)", pullErr, unsetErr)
 				} else {
 					log.Printf("[FCM] Successfully removed %d stale tokens", len(tokensToRemove))
 				}

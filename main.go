@@ -32,7 +32,7 @@ func main() {
 	}
 
 	appEnv := os.Getenv("APP_ENV")
-	isDev := appEnv == "development" || appEnv == ""
+	isDev := !config.IsProductionEnv(appEnv)
 
 	// Initialize Sentry — DSN must be set as environment variable
 	sentryDsn := os.Getenv("SENTRY_DSN")

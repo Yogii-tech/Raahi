@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"raahi-backend/config"
+
 	"cloud.google.com/go/storage"
 	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
@@ -71,6 +73,7 @@ var (
 type objectStorage interface {
 	UploadObject(ctx context.Context, bucket, object, contentType string, r io.Reader, maxBytes int64) (int64, error)
 	CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject, contentType string) error
+	DeleteObject(ctx context.Context, bucket, object string) error
 }
 
 type gcsObjectStorage struct {
@@ -122,6 +125,12 @@ func (s *gcsObjectStorage) CopyObject(ctx context.Context, srcBucket, srcObject,
 	return nil
 }
 
+func (s *gcsObjectStorage) DeleteObject(ctx context.Context, bucket, object string) error {
+	delCtx, cancel := context.WithTimeout(ctx, defaultGCSCopyTimeout)
+	defer cancel()
+	return s.client.Bucket(bucket).Object(object).Delete(delCtx)
+}
+
 // getSharedGCSClient returns a lazily initialized, package-level *storage.Client.
 // Reusing a single client enables HTTP/2/TLS connection pooling across requests.
 // Uses context.Background() because oauth2 token sources bind to the init context
@@ -164,12 +173,7 @@ type storageConfig struct {
 }
 
 func isProductionAppEnv(appEnv string) bool {
-	switch strings.ToLower(strings.TrimSpace(appEnv)) {
-	case "production", "prod", "staging":
-		return true
-	default:
-		return false
-	}
+	return config.IsProductionEnv(appEnv)
 }
 
 func parseEnvBool(val string) bool {
@@ -462,6 +466,11 @@ func uploadFileWithDeps(c *gin.Context, deps uploadDeps) {
 			)
 			if repErr != nil {
 				if cfg.requireReplica {
+					delCtx, delCancel := context.WithTimeout(context.Background(), defaultGCSCopyTimeout)
+					if delErr := store.DeleteObject(delCtx, cfg.bucketName, objectName); delErr != nil {
+						log.Printf("[Upload][WARN] Failed to delete orphaned primary GCS object gs://%s/%s after strict replica failure: %v", cfg.bucketName, objectName, delErr)
+					}
+					delCancel()
 					msg := fmt.Sprintf("[Upload][ERROR] GCS replica copy failed after %d attempts and GCS_REQUIRE_REPLICA=true (src=gs://%s/%s dst=gs://%s/%s): %v", attempts, cfg.bucketName, objectName, cfg.replicaBucket, objectName, repErr)
 					log.Println(msg)
 					sentry.CaptureMessage(msg)

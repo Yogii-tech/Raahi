@@ -29,15 +29,18 @@ func AdminStats(c *gin.Context) {
 
 	// --- Rides ---
 	totalRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{})
-	availableRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": "available"})
-	completedRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": "completed"})
-	cancelledRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": "cancelled"})
+	availableRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": string(models.RideStatusAvailable)})
+	ongoingRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": string(models.RideStatusOngoing)})
+	completedRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": string(models.RideStatusCompleted)})
+	cancelledRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": string(models.RideStatusCancelled)})
 
 	// --- Bookings ---
 	totalBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{})
-	pendingBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": "pending"})
-	acceptedBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": "accepted"})
-	rejectedBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": "rejected"})
+	pendingBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusPending)})
+	acceptedBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusAccepted)})
+	rejectedBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusRejected)})
+	completedBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusCompleted)})
+	cancelledBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusCancelled)})
 
 	// --- Users ---
 	totalUsers, _ := config.Database.Collection("users").CountDocuments(ctx, bson.M{})
@@ -89,14 +92,17 @@ func AdminStats(c *gin.Context) {
 		"rides": bson.M{
 			"total":     totalRides,
 			"available": availableRides,
+			"ongoing":   ongoingRides,
 			"completed": completedRides,
 			"cancelled": cancelledRides,
 		},
 		"bookings": bson.M{
-			"total":    totalBookings,
-			"pending":  pendingBookings,
-			"accepted": acceptedBookings,
-			"rejected": rejectedBookings,
+			"total":     totalBookings,
+			"pending":   pendingBookings,
+			"accepted":  acceptedBookings,
+			"rejected":  rejectedBookings,
+			"completed": completedBookings,
+			"cancelled": cancelledBookings,
 		},
 		"parcels": bson.M{
 			"total":   totalParcels,
@@ -380,7 +386,9 @@ func AdminReports(c *gin.Context) {
 			c.String(http.StatusOK, fmt.Sprintf("%s,%s,%s,%s,%s\n", b.ID.Hex(), b.CreatedAt.Format("2006-01-02"), routeStr, sanitizeCSV(b.Type), sanitizeCSV(b.Status)))
 		}
 	case "revenue":
-		cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
+		cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{
+			"status": bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
+		})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch revenue report"})
 			return
@@ -415,7 +423,9 @@ func AdminReports(c *gin.Context) {
 			c.String(http.StatusOK, fmt.Sprintf("%s,%d,%.2f\n", sanitizeCSV(routeKey), agg.count, agg.total))
 		}
 	case "payouts":
-		cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{"status": "accepted"})
+		cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{
+			"status": bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
+		})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch payouts report"})
 			return
@@ -814,30 +824,77 @@ func AdminVerifyDriver(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+
+	var driver models.User
+	err = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": driverId, "role": "driver"}).Decode(&driver)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Driver not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver"})
+		return
+	}
+
+	fromStatus := models.VerificationStatus(driver.VerificationStatus)
+	toStatus := models.VerificationStatus(body.Status)
+	if !models.CanTransitionVerificationStatus(fromStatus, toStatus) {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Invalid driver verification transition from %q to %q", fromStatus, toStatus)})
+		return
+	}
+	if fromStatus == models.VerificationStatusNone && toStatus == models.VerificationStatusVerified && driver.Vehicle == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot verify driver without submitted vehicle documents"})
+		return
+	}
+
+	reasonToSet := strings.TrimSpace(body.Reason)
+	if toStatus == models.VerificationStatusVerified {
+		reasonToSet = ""
+	}
+
+	filter := bson.M{"_id": driverId, "role": "driver"}
+	if driver.VerificationStatus == "" {
+		filter["$or"] = []bson.M{
+			{"verification_status": ""},
+			{"verification_status": bson.M{"$exists": false}},
+		}
+	} else {
+		filter["verification_status"] = driver.VerificationStatus
+	}
 
 	update := bson.M{
 		"$set": bson.M{
 			"verification_status": body.Status,
-			"rejection_reason":    body.Reason,
+			"rejection_reason":    reasonToSet,
 		},
 	}
 
-	res, err := config.Database.Collection("users").UpdateOne(ctx, bson.M{"_id": driverId}, update)
-	if err != nil || res.MatchedCount == 0 {
+	res, err := config.Database.Collection("users").UpdateOne(ctx, filter, update)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update driver verification status"})
 		return
+	}
+	if res.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Driver verification status changed concurrently. Please refresh and try again."})
+		return
+	}
+
+	if fromStatus == models.VerificationStatusVerified && toStatus != models.VerificationStatusVerified {
+		if retireErr := retireOpenRides(ctx, driverId); retireErr != nil {
+			log.Printf("[AdminVerifyDriver] Failed to retire open rides for demoted driver %s: %v", driverId.Hex(), retireErr)
+		}
 	}
 
 	// Send Notification to Driver
 	var title, msg string
-	if body.Status == "verified" {
+	if body.Status == string(models.VerificationStatusVerified) {
 		title = "Documents Approved"
 		msg = "Your documents have been verified. You can now post rides and accept bookings!"
-	} else if body.Status == "rejected" {
+	} else if body.Status == string(models.VerificationStatusRejected) {
 		title = "Documents Rejected"
-		msg = "Your documents were rejected. Reason: " + body.Reason
+		msg = "Your documents were rejected. Reason: " + reasonToSet
 	}
 	if title != "" {
 		CreateNotification(driverId, title, msg, "document_verification", "", nil)
@@ -892,6 +949,10 @@ func AdminRequestReKYC(c *gin.Context) {
 	if err != nil || res.MatchedCount == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update driver or driver not found"})
 		return
+	}
+
+	if retireErr := retireOpenRides(ctx, driverId); retireErr != nil {
+		log.Printf("[AdminRequestReKYC] Failed to retire open rides for driver %s: %v", driverId.Hex(), retireErr)
 	}
 
 	// Send Push & In-app Notification to Driver

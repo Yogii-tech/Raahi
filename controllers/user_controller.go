@@ -106,6 +106,7 @@ func hasDriverVehicleChanged(oldV, newV *models.Vehicle) bool {
 		return oldV != newV
 	}
 	return oldV.Seats != newV.Seats ||
+		strings.TrimSpace(oldV.VehicleName) != strings.TrimSpace(newV.VehicleName) ||
 		strings.TrimSpace(oldV.VehicleType) != strings.TrimSpace(newV.VehicleType) ||
 		strings.TrimSpace(oldV.SeatingLayout) != strings.TrimSpace(newV.SeatingLayout) ||
 		strings.TrimSpace(oldV.VehicleNumber) != strings.TrimSpace(newV.VehicleNumber) ||
@@ -116,13 +117,40 @@ func hasDriverVehicleChanged(oldV, newV *models.Vehicle) bool {
 		strings.TrimSpace(oldV.OwnershipUrl) != strings.TrimSpace(newV.OwnershipUrl)
 }
 
+func validateDriverVehicleKYC(v *models.Vehicle) string {
+	if v == nil {
+		return ""
+	}
+	if v.Seats < 1 {
+		return "Vehicle seats must be at least 1"
+	}
+	if strings.TrimSpace(v.DLUrl) == "" ||
+		strings.TrimSpace(v.RCUrl) == "" ||
+		strings.TrimSpace(v.PollutionUrl) == "" ||
+		strings.TrimSpace(v.VehicleImageUrl) == "" {
+		return "All required vehicle documents (DL, RC, Pollution, Vehicle Image) must be uploaded"
+	}
+	return ""
+}
+
+func normalizeLanguage(lang string) (string, bool) {
+	clean := strings.ToLower(strings.TrimSpace(lang))
+	switch clean {
+	case "en", "hi":
+		return clean, true
+	default:
+		return "", false
+	}
+}
+
 func UpdateProfile(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
 	var body struct {
-		Name    string          `json:"name" binding:"required,min=2,max=100"`
-		Role    string          `json:"role" binding:"required,oneof=passenger driver parceller"` // admin role only via /promote-admin
-		Vehicle *models.Vehicle `json:"vehicle"`
+		Name     string          `json:"name" binding:"required,min=2,max=100"`
+		Role     string          `json:"role" binding:"required,oneof=passenger driver parceller"` // admin role only via /promote-admin
+		Language string          `json:"language"`
+		Vehicle  *models.Vehicle `json:"vehicle"`
 	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
@@ -138,6 +166,16 @@ func UpdateProfile(c *gin.Context) {
 	if !isAllowedUserProfileRole(body.Role) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid role. Allowed roles: passenger, driver, parceller"})
 		return
+	}
+
+	var normalizedLang string
+	if strings.TrimSpace(body.Language) != "" {
+		var ok bool
+		normalizedLang, ok = normalizeLanguage(body.Language)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid language. Allowed values: en, hi"})
+			return
+		}
 	}
 
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -162,9 +200,20 @@ func UpdateProfile(c *gin.Context) {
 		effectiveRole = "admin"
 	}
 
+	if effectiveRole == "driver" && body.Vehicle != nil {
+		if kycErr := validateDriverVehicleKYC(body.Vehicle); kycErr != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": kycErr})
+			return
+		}
+	}
+
 	setMap := bson.M{
 		"name": body.Name,
 		"role": effectiveRole,
+	}
+
+	if normalizedLang != "" {
+		setMap["language"] = normalizedLang
 	}
 
 	if body.Vehicle != nil {
@@ -175,30 +224,49 @@ func UpdateProfile(c *gin.Context) {
 	isResubmission := false
 
 	if effectiveRole == "driver" && body.Vehicle != nil {
-		if currentUser.VerificationStatus == "" {
-			setMap["verification_status"] = "pending"
+		currentStatus := models.VerificationStatus(currentUser.VerificationStatus)
+		if currentStatus == models.VerificationStatusNone {
+			setMap["verification_status"] = string(models.VerificationStatusPending)
 			setMap["submitted_at"] = time.Now()
+			setMap["rejection_reason"] = ""
 			isFirstSubmission = true
-		} else if currentUser.VerificationStatus == "rejected" || (currentUser.VerificationStatus == "verified" && hasDriverVehicleChanged(currentUser.Vehicle, body.Vehicle)) {
-			setMap["verification_status"] = "pending"
-			setMap["submitted_at"] = time.Now()
-			isResubmission = true
+		} else if currentStatus == models.VerificationStatusRejected || (currentStatus == models.VerificationStatusVerified && hasDriverVehicleChanged(currentUser.Vehicle, body.Vehicle)) {
+			if models.CanTransitionVerificationStatus(currentStatus, models.VerificationStatusPending) {
+				setMap["verification_status"] = string(models.VerificationStatusPending)
+				setMap["submitted_at"] = time.Now()
+				setMap["rejection_reason"] = ""
+				isResubmission = true
+			}
 		}
 		// If verification_status is already "pending", or "verified" with unchanged KYC vehicle docs, keep it as-is.
+	}
+
+	filter := bson.M{"_id": userId}
+	if isFirstSubmission {
+		filter["$or"] = []bson.M{
+			{"verification_status": ""},
+			{"verification_status": bson.M{"$exists": false}},
+		}
+	} else if isResubmission {
+		filter["verification_status"] = currentUser.VerificationStatus
 	}
 
 	update := bson.M{
 		"$set": setMap,
 	}
 
-	_, err = userProfileCollection.UpdateOne(
+	res, err := userProfileCollection.UpdateOne(
 		dbCtx,
-		bson.M{"_id": userId},
+		filter,
 		update,
 	)
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update profile"})
+		return
+	}
+	if res.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Profile verification state changed concurrently. Please refresh and try again."})
 		return
 	}
 
@@ -331,21 +399,33 @@ func RemoveFCMToken(c *gin.Context) {
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	var update bson.M
 	if token != "" {
-		update = bson.M{
-			"$pull": bson.M{"fcm_tokens": token},
+		if _, err := userProfileCollection.UpdateOne(
+			dbCtx,
+			bson.M{"_id": userId},
+			bson.M{"$pull": bson.M{"fcm_tokens": token}},
+		); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove FCM token"})
+			return
+		}
+		if _, err := userProfileCollection.UpdateOne(
+			dbCtx,
+			bson.M{"_id": userId, "fcm_token": token},
+			bson.M{"$unset": bson.M{"fcm_token": ""}},
+		); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove FCM token"})
+			return
 		}
 	} else {
-		update = bson.M{
-			"$unset": bson.M{"fcm_token": "", "fcm_tokens": ""},
+		_, err := userProfileCollection.UpdateOne(
+			dbCtx,
+			bson.M{"_id": userId},
+			bson.M{"$unset": bson.M{"fcm_token": "", "fcm_tokens": ""}},
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove FCM token"})
+			return
 		}
-	}
-
-	_, err := userProfileCollection.UpdateOne(dbCtx, bson.M{"_id": userId}, update)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove FCM token"})
-		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "FCM token removed"})

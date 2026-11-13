@@ -6,6 +6,87 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
+// RideStatus represents the explicit lifecycle state of a Ride.
+type RideStatus string
+
+const (
+	RideStatusAvailable RideStatus = "available"
+	RideStatusOngoing   RideStatus = "ongoing"
+	RideStatusCompleted RideStatus = "completed"
+	RideStatusCancelled RideStatus = "cancelled"
+)
+
+var validRideTransitions = map[RideStatus]map[RideStatus]bool{
+	RideStatusAvailable: {
+		RideStatusOngoing:   true,
+		RideStatusCompleted: true,
+		RideStatusCancelled: true,
+	},
+	RideStatusOngoing: {
+		RideStatusCompleted: true,
+	},
+	RideStatusCompleted: {},
+	RideStatusCancelled: {},
+}
+
+// IsValidRideStatus reports whether s is a recognized RideStatus value.
+func IsValidRideStatus(s RideStatus) bool {
+	_, ok := validRideTransitions[s]
+	return ok
+}
+
+// CanTransitionRideStatus reports whether transitioning a Ride from `from` to `to`
+// is permitted by the explicit Ride state machine.
+func CanTransitionRideStatus(from, to RideStatus) bool {
+	allowed, ok := validRideTransitions[from]
+	if !ok {
+		return false
+	}
+	return allowed[to]
+}
+
+// BookingStatus represents the explicit lifecycle state of a Booking.
+type BookingStatus string
+
+const (
+	BookingStatusPending   BookingStatus = "pending"
+	BookingStatusAccepted  BookingStatus = "accepted"
+	BookingStatusRejected  BookingStatus = "rejected"
+	BookingStatusCompleted BookingStatus = "completed"
+	BookingStatusCancelled BookingStatus = "cancelled"
+)
+
+var validBookingTransitions = map[BookingStatus]map[BookingStatus]bool{
+	BookingStatusPending: {
+		BookingStatusAccepted:  true,
+		BookingStatusRejected:  true,
+		BookingStatusCancelled: true,
+	},
+	BookingStatusAccepted: {
+		BookingStatusCompleted: true,
+		BookingStatusCancelled: true,
+	},
+	BookingStatusRejected:  {},
+	BookingStatusCompleted: {},
+	BookingStatusCancelled: {},
+}
+
+// IsValidBookingStatus reports whether s is a recognized BookingStatus value.
+func IsValidBookingStatus(s BookingStatus) bool {
+	_, ok := validBookingTransitions[s]
+	return ok
+}
+
+// CanTransitionBookingStatus reports whether transitioning a Booking from `from` to `to`
+// is permitted by the explicit Booking state machine.
+func CanTransitionBookingStatus(from, to BookingStatus) bool {
+	allowed, ok := validBookingTransitions[from]
+	if !ok {
+		return false
+	}
+	return allowed[to]
+}
+
 type StopInfo struct {
 	Name      string  `bson:"name" json:"name"`
 	DistanceM float64 `bson:"distanceM" json:"distanceM"` // Distance from start in meters
@@ -32,8 +113,10 @@ type Ride struct {
 	TakenSeats         []int              `bson:"takenSeats" json:"takenSeats"`
 	ManualBlockedSeats []int              `bson:"manualBlockedSeats" json:"manualBlockedSeats"`
 	DriverName         string             `bson:"driverName" json:"driverName"`
-	Status             string             `bson:"status" json:"status"` // "available", "completed", "cancelled"
+	Status             string             `bson:"status" json:"status"` // "available", "ongoing", "completed", "cancelled"
+	StartedAt          time.Time          `bson:"startedAt,omitempty" json:"startedAt,omitempty"`
 	CompletedAt        time.Time          `bson:"completedAt,omitempty" json:"completedAt,omitempty"`
+	CancelledAt        time.Time          `bson:"cancelledAt,omitempty" json:"cancelledAt,omitempty"`
 	CreatedAt          time.Time          `bson:"createdAt" json:"createdAt"`
 }
 
@@ -56,9 +139,10 @@ type Booking struct {
 	Notes             string             `bson:"notes,omitempty" json:"notes,omitempty"`
 	PhotoUrl          string             `bson:"photoUrl,omitempty" json:"photoUrl,omitempty"`
 	Price             string             `bson:"price,omitempty" json:"price,omitempty"`
-	Status            string             `bson:"status" json:"status"` // "pending", "accepted", "rejected"
+	Status            string             `bson:"status" json:"status"` // "pending", "accepted", "rejected", "completed", "cancelled"
 	ViewedByPassenger bool               `bson:"viewedByPassenger" json:"viewedByPassenger"`
 	ViewedByDriver    bool               `bson:"viewedByDriver" json:"viewedByDriver"`
 	CompletedAt       time.Time          `bson:"completedAt,omitempty" json:"completedAt,omitempty"`
+	CancelledAt       time.Time          `bson:"cancelledAt,omitempty" json:"cancelledAt,omitempty"`
 	CreatedAt         time.Time          `bson:"createdAt" json:"createdAt"`
 }

@@ -53,8 +53,10 @@ type mockObjectStorage struct {
 	uploadErr    error
 	copyFailures int // fail first N CopyObject calls, then succeed
 	copyErr      error
+	deleteErr    error
 	uploads      []uploadedRecord
 	copies       []copyRecord
+	deletes      []string
 	copyAttempts int
 }
 
@@ -101,6 +103,16 @@ func (m *mockObjectStorage) CopyObject(_ context.Context, srcBucket, srcObject, 
 		dstObject:   dstObject,
 		contentType: contentType,
 	})
+	return nil
+}
+
+func (m *mockObjectStorage) DeleteObject(_ context.Context, bucket, object string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	m.deletes = append(m.deletes, bucket+"/"+object)
 	return nil
 }
 
@@ -500,6 +512,9 @@ func TestUploadFile_GCSReplicaFailure_BestEffortVsStrict(t *testing.T) {
 		}
 		if _, hasURL := resp["url"]; hasURL {
 			t.Errorf("expected no url returned when strict replication fails, got %v", resp["url"])
+		}
+		if len(store.deletes) != 1 {
+			t.Errorf("expected orphaned primary object to be deleted when strict replication fails, got %d deletes", len(store.deletes))
 		}
 	})
 }

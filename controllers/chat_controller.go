@@ -129,6 +129,11 @@ func SendMessage(c *gin.Context) {
 		return
 	}
 
+	if booking.Status == string(models.BookingStatusRejected) || booking.Status == string(models.BookingStatusCancelled) {
+		c.JSON(http.StatusConflict, gin.H{"error": "Cannot send messages for a " + booking.Status + " booking"})
+		return
+	}
+
 	// SECURITY: Sanitize HTML to prevent stored XSS
 	sanitizedText := strings.ReplaceAll(body.Text, "<", "&lt;")
 	sanitizedText = strings.ReplaceAll(sanitizedText, ">", "&gt;")

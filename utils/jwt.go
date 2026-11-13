@@ -68,10 +68,11 @@ func ValidateJWT(tokenString string) (primitive.ObjectID, int, error) {
 		return primitive.NilObjectID, 0, errors.New("invalid claims")
 	}
 
-	// SECURITY: Prevent token type confusion — reject refresh tokens (or any non-access token type)
-	// so a 30-day refresh token can never be used directly as a Bearer access token.
-	if tokenType, hasType := claims["type"].(string); hasType && tokenType != "" && tokenType != "access" {
-		return primitive.NilObjectID, 0, errors.New("invalid token type: refresh token cannot be used as access token")
+	// SECURITY: Prevent token type confusion — require explicit "access" token type
+	// so refresh tokens or untyped legacy tokens can never be used as Bearer access tokens.
+	tokenType, _ := claims["type"].(string)
+	if tokenType != "access" {
+		return primitive.NilObjectID, 0, errors.New("invalid token type: expected access token")
 	}
 
 	userIdStr, ok := claims["userId"].(string)
@@ -111,8 +112,9 @@ func ValidateRefreshToken(tokenString string) (primitive.ObjectID, int, error) {
 		return primitive.NilObjectID, 0, errors.New("invalid claims")
 	}
 
-	// Reject access tokens presented as refresh tokens when the "type" claim is present.
-	if tokenType, hasType := claims["type"].(string); hasType && tokenType != "" && tokenType != "refresh" {
+	// Require explicit "refresh" token type unconditionally.
+	tokenType, _ := claims["type"].(string)
+	if tokenType != "refresh" {
 		return primitive.NilObjectID, 0, errors.New("invalid token type: expected refresh token")
 	}
 
