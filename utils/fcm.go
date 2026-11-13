@@ -146,15 +146,22 @@ func CollectTokens(legacyToken string, tokenList []string) []string {
 
 // SendPushToTokens sends a push notification to one or multiple FCM device tokens.
 func SendPushToTokens(tokens []string, title, body string, data map[string]string) {
+	if err := SendPushToTokensErr(tokens, title, body, data); err != nil {
+		log.Printf("[FCM] SendPushToTokens warning: %v", err)
+	}
+}
+
+// SendPushToTokensErr sends a push notification to one or multiple FCM tokens
+// and returns an error if dispatch fails.
+func SendPushToTokensErr(tokens []string, title, body string, data map[string]string) error {
 	validTokens := CollectTokens("", tokens)
 	if len(validTokens) == 0 {
-		return
+		return fmt.Errorf("no valid FCM tokens provided")
 	}
 	if len(validTokens) == 1 {
-		_ = SendPushNotification(validTokens[0], title, body, data)
-	} else {
-		SendMulticastPush(validTokens, title, body, data)
+		return SendPushNotification(validTokens[0], title, body, data)
 	}
+	return SendMulticastPushErr(validTokens, title, body, data)
 }
 
 // removeFCMToken cleans up stale tokens from the database when a user uninstalls the app or token expires
@@ -183,10 +190,67 @@ func removeFCMToken(token string) {
 	}
 }
 
+const fcmMulticastBatchSize = 500
+
+func buildFCMPlatformConfigs(title, body string, data map[string]string) (*messaging.AndroidConfig, *messaging.APNSConfig, *messaging.WebpushConfig) {
+	targetLink := webAppURL()
+	if u, ok := data["url"]; ok && u != "" {
+		targetLink = absURL(u)
+	}
+
+	androidCfg := &messaging.AndroidConfig{
+		Priority: "high",
+		Notification: &messaging.AndroidNotification{
+			ChannelID:             "raahi_high_importance",
+			Sound:                 "default",
+			DefaultSound:          true,
+			DefaultVibrateTimings: true,
+		},
+	}
+
+	apnsCfg := &messaging.APNSConfig{
+		Headers: map[string]string{
+			"apns-priority":  "10",
+			"apns-push-type": "alert",
+		},
+		Payload: &messaging.APNSPayload{
+			Aps: &messaging.Aps{
+				Alert: &messaging.ApsAlert{
+					Title: title,
+					Body:  body,
+				},
+				Sound:            "default",
+				Badge:            intPtr(1),
+				MutableContent:   true,
+				ContentAvailable: true,
+			},
+		},
+	}
+
+	webpushCfg := &messaging.WebpushConfig{
+		Headers: map[string]string{
+			"Urgency": "high",
+			"TTL":     "86400",
+		},
+		Notification: &messaging.WebpushNotification{
+			Title:              title,
+			Body:               body,
+			RequireInteraction: true,
+			// Icon and Badge MUST be absolute HTTPS URLs — relative paths are rejected by Chrome.
+			Icon:  absURL("/logo192.png"),
+			Badge: absURL("/logo192.png"),
+		},
+		FCMOptions: &messaging.WebpushFCMOptions{
+			Link: targetLink,
+		},
+	}
+
+	return androidCfg, apnsCfg, webpushCfg
+}
+
 // SendPushNotification sends a push notification to a single FCM device token.
 // The notification block makes the OS display it on the lock screen even when the app is closed.
 // The data block carries extra key-value pairs for deep-linking inside the app.
-// If fcmToken is empty or FCM is not initialized, this is a no-op.
 func SendPushNotification(fcmToken, title, body string, data map[string]string) error {
 	if fcmClient == nil {
 		log.Printf("[FCM] Error: FCM client is nil!")
@@ -196,79 +260,31 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 		return fmt.Errorf("FCM token is empty")
 	}
 
+	androidCfg, apnsCfg, webpushCfg := buildFCMPlatformConfigs(title, body, data)
 	msg := &messaging.Message{
 		Token: fcmToken,
 		Notification: &messaging.Notification{
 			Title: title,
 			Body:  body,
 		},
-		Data: data,
-		Android: &messaging.AndroidConfig{
-			Priority: "high",
-			Notification: &messaging.AndroidNotification{
-				ChannelID:             "raahi_high_importance",
-				Sound:                 "default",
-				DefaultSound:         true,
-				DefaultVibrateTimings: true,
-			},
-		},
-		APNS: &messaging.APNSConfig{
-			Headers: map[string]string{
-				"apns-priority":  "10",
-				"apns-push-type": "alert",
-			},
-			Payload: &messaging.APNSPayload{
-				Aps: &messaging.Aps{
-					Alert: &messaging.ApsAlert{
-						Title: title,
-						Body:  body,
-					},
-					Sound:            "default",
-					Badge:            intPtr(1),
-					MutableContent:   true,
-					ContentAvailable: true,
-				},
-			},
-		},
-		Webpush: &messaging.WebpushConfig{
-			Headers: map[string]string{
-				"Urgency": "high",
-				"TTL":     "86400",
-			},
-			Notification: &messaging.WebpushNotification{
-				Title:              title,
-				Body:               body,
-				RequireInteraction: true,
-				// Icon and Badge MUST be absolute HTTPS URLs — the OS fetches them
-				// directly to display on the lock-screen notification tile.
-				Icon:               absURL("/logo192.png"),
-				Badge:              absURL("/logo192.png"),
-			},
-			FCMOptions: &messaging.WebpushFCMOptions{
-				// FCMOptions.Link MUST be an absolute HTTPS URL.
-				// Chrome silently drops web push messages that have a relative
-				// or missing link, so the lock-screen notification never appears.
-				Link: func() string {
-					if u, ok := data["url"]; ok && u != "" {
-						return absURL(u)
-					}
-					return webAppURL()
-				}(),
-			},
-		},
+		Data:    data,
+		Android: androidCfg,
+		APNS:    apnsCfg,
+		Webpush: webpushCfg,
 	}
 
-	ctx := context.Background()
 	var err error
 	var resp string
 
 	for attempt := 1; attempt <= 2; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		resp, err = fcmClient.Send(ctx, msg)
+		cancel()
 		if err == nil {
 			log.Printf("[FCM] Push sent successfully: %s", resp)
 			return nil
 		}
-		
+
 		if messaging.IsUnregistered(err) {
 			log.Printf("[FCM] Token is unregistered. Cleaning up DB...")
 			go removeFCMToken(fcmToken)
@@ -290,123 +306,107 @@ func SendPushNotification(fcmToken, title, body string, data map[string]string) 
 
 // SendMulticastPush sends the same notification to multiple FCM tokens (e.g. admin broadcast).
 func SendMulticastPush(tokens []string, title, body string, data map[string]string) {
-	if fcmClient == nil || len(tokens) == 0 {
-		return
+	if err := SendMulticastPushErr(tokens, title, body, data); err != nil {
+		log.Printf("[FCM] Multicast push warning: %v", err)
 	}
+}
 
-	// Filter out empty tokens
-	validTokens := make([]string, 0, len(tokens))
-	for _, t := range tokens {
-		if t != "" {
-			validTokens = append(validTokens, t)
-		}
+// SendMulticastPushErr sends the same notification to multiple FCM tokens in batches of 500
+// and returns an error if FCM is uninitialized or dispatch fails.
+func SendMulticastPushErr(tokens []string, title, body string, data map[string]string) error {
+	if fcmClient == nil {
+		return fmt.Errorf("FCM client is not initialized on server")
 	}
+	validTokens := CollectTokens("", tokens)
 	if len(validTokens) == 0 {
-		return
+		return fmt.Errorf("no valid FCM tokens provided")
 	}
 
-	msg := &messaging.MulticastMessage{
-		Tokens: validTokens,
-		Notification: &messaging.Notification{
-			Title: title,
-			Body:  body,
-		},
-		Data: data,
-		Android: &messaging.AndroidConfig{
-			Priority: "high",
-			Notification: &messaging.AndroidNotification{
-				ChannelID:             "raahi_high_importance",
-				Sound:                 "default",
-				DefaultSound:         true,
-				DefaultVibrateTimings: true,
+	androidCfg, apnsCfg, webpushCfg := buildFCMPlatformConfigs(title, body, data)
+	var staleTokens []string
+	var totalSuccess, totalFailure int
+	var firstErr error
+
+	for start := 0; start < len(validTokens); start += fcmMulticastBatchSize {
+		end := start + fcmMulticastBatchSize
+		if end > len(validTokens) {
+			end = len(validTokens)
+		}
+		batch := validTokens[start:end]
+
+		msg := &messaging.MulticastMessage{
+			Tokens: batch,
+			Notification: &messaging.Notification{
+				Title: title,
+				Body:  body,
 			},
-		},
-		APNS: &messaging.APNSConfig{
-			Headers: map[string]string{
-				"apns-priority":  "10",
-				"apns-push-type": "alert",
-			},
-			Payload: &messaging.APNSPayload{
-				Aps: &messaging.Aps{
-					Alert: &messaging.ApsAlert{
-						Title: title,
-						Body:  body,
-					},
-					Sound:            "default",
-					Badge:            intPtr(1),
-					MutableContent:   true,
-					ContentAvailable: true,
-				},
-			},
-		},
-		Webpush: &messaging.WebpushConfig{
-			Headers: map[string]string{
-				"Urgency": "high",
-				"TTL":     "86400",
-			},
-			Notification: &messaging.WebpushNotification{
-				Title:              title,
-				Body:               body,
-				RequireInteraction: true,
-				// Must be absolute HTTPS URLs — relative paths are rejected by Chrome.
-				Icon:               absURL("/logo192.png"),
-				Badge:              absURL("/logo192.png"),
-			},
-			FCMOptions: &messaging.WebpushFCMOptions{
-				Link: func() string {
-					if u, ok := data["url"]; ok && u != "" {
-						return absURL(u)
+			Data:    data,
+			Android: androidCfg,
+			APNS:    apnsCfg,
+			Webpush: webpushCfg,
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := fcmClient.SendEachForMulticast(ctx, msg)
+		cancel()
+		if err != nil {
+			log.Printf("[FCM] Multicast push batch (%d-%d) failed: %v", start, end, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		totalSuccess += resp.SuccessCount
+		totalFailure += resp.FailureCount
+
+		if resp.FailureCount > 0 {
+			for i, response := range resp.Responses {
+				if response.Error != nil {
+					if firstErr == nil {
+						firstErr = response.Error
 					}
-					return webAppURL()
-				}(),
-			},
-		},
-	}
-
-	ctx := context.Background()
-	resp, err := fcmClient.SendEachForMulticast(ctx, msg)
-	if err != nil {
-		log.Printf("[FCM] Multicast push failed: %v", err)
-		return
-	}
-	log.Printf("[FCM] Multicast push: %d success, %d failure", resp.SuccessCount, resp.FailureCount)
-
-	// Clean up any stale tokens in bulk
-	if resp.FailureCount > 0 {
-		var staleTokens []string
-		for i, response := range resp.Responses {
-			if response.Error != nil && messaging.IsUnregistered(response.Error) {
-				staleTokens = append(staleTokens, validTokens[i])
+					if messaging.IsUnregistered(response.Error) {
+						staleTokens = append(staleTokens, batch[i])
+					}
+				}
 			}
 		}
-
-		if len(staleTokens) > 0 {
-			go func(tokensToRemove []string) {
-				if config.Database == nil {
-					return
-				}
-				ctxCleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-
-				usersCol := config.Database.Collection("users")
-				_, pullErr := usersCol.UpdateMany(
-					ctxCleanup,
-					bson.M{"fcm_tokens": bson.M{"$in": tokensToRemove}},
-					bson.M{"$pull": bson.M{"fcm_tokens": bson.M{"$in": tokensToRemove}}},
-				)
-				_, unsetErr := usersCol.UpdateMany(
-					ctxCleanup,
-					bson.M{"fcm_token": bson.M{"$in": tokensToRemove}},
-					bson.M{"$unset": bson.M{"fcm_token": ""}},
-				)
-				if pullErr != nil || unsetErr != nil {
-					log.Printf("[FCM] Failed to bulk remove stale tokens (pull=%v, unset=%v)", pullErr, unsetErr)
-				} else {
-					log.Printf("[FCM] Successfully removed %d stale tokens", len(tokensToRemove))
-				}
-			}(staleTokens)
-		}
 	}
+
+	log.Printf("[FCM] Multicast push: %d success, %d failure (tokens=%d)", totalSuccess, totalFailure, len(validTokens))
+
+	// Clean up any stale tokens in bulk
+	if len(staleTokens) > 0 {
+		go func(tokensToRemove []string) {
+			if config.Database == nil {
+				return
+			}
+			ctxCleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			usersCol := config.Database.Collection("users")
+			_, pullErr := usersCol.UpdateMany(
+				ctxCleanup,
+				bson.M{"fcm_tokens": bson.M{"$in": tokensToRemove}},
+				bson.M{"$pull": bson.M{"fcm_tokens": bson.M{"$in": tokensToRemove}}},
+			)
+			_, unsetErr := usersCol.UpdateMany(
+				ctxCleanup,
+				bson.M{"fcm_token": bson.M{"$in": tokensToRemove}},
+				bson.M{"$unset": bson.M{"fcm_token": ""}},
+			)
+			if pullErr != nil || unsetErr != nil {
+				log.Printf("[FCM] Failed to bulk remove stale tokens (pull=%v, unset=%v)", pullErr, unsetErr)
+			} else {
+				log.Printf("[FCM] Successfully removed %d stale tokens", len(tokensToRemove))
+			}
+		}(staleTokens)
+	}
+
+	if totalSuccess == 0 && firstErr != nil {
+		return firstErr
+	}
+	return nil
 }
 
 func intPtr(i int) *int {

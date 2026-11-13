@@ -20,6 +20,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var (
@@ -94,6 +95,108 @@ func InitializeAuthCollection() {
 	StartIncompleteUserCleanupTask()
 }
 
+// BuildIncompleteUserCleanupFilter builds the MongoDB filter for abandoned/incomplete
+// registrations older than cutoff, always excluding admin accounts.
+func BuildIncompleteUserCleanupFilter(cutoff time.Time) bson.M {
+	return bson.M{
+		"$and": []bson.M{
+			{"role": bson.M{"$ne": "admin"}},
+			{"submitted_at": bson.M{"$lt": cutoff}},
+			{
+				"$or": []bson.M{
+					{"name": ""},
+					{"name": bson.M{"$exists": false}},
+					{"role": ""},
+					{"role": bson.M{"$exists": false}},
+				},
+			},
+		},
+	}
+}
+
+func purgeIncompleteUsers(ctx context.Context, cutoff time.Time) (int64, error) {
+	if userCollection == nil {
+		return 0, errors.New("user collection is not initialized")
+	}
+
+	filter := BuildIncompleteUserCleanupFilter(cutoff)
+	cursor, err := userCollection.Find(ctx, filter, options.Find().SetProjection(bson.M{"_id": 1}).SetLimit(1000))
+	if err != nil {
+		return 0, err
+	}
+	defer cursor.Close(ctx)
+
+	var candidates []struct {
+		ID primitive.ObjectID `bson:"_id"`
+	}
+	if err := cursor.All(ctx, &candidates); err != nil {
+		return 0, err
+	}
+	if err := cursor.Err(); err != nil {
+		return 0, err
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	candidateIDs := make([]primitive.ObjectID, len(candidates))
+	for i, cand := range candidates {
+		candidateIDs[i] = cand.ID
+	}
+
+	referenced := make(map[primitive.ObjectID]bool)
+	ridesCol := rideCollection
+	if ridesCol == nil && config.Database != nil {
+		ridesCol = config.Database.Collection("rides")
+	}
+	if ridesCol != nil {
+		driverIDs, err := ridesCol.Distinct(ctx, "driverId", bson.M{"driverId": bson.M{"$in": candidateIDs}})
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range driverIDs {
+			if oid, ok := v.(primitive.ObjectID); ok {
+				referenced[oid] = true
+			}
+		}
+	}
+
+	bookingsCol := bookingCollection
+	if bookingsCol == nil && config.Database != nil {
+		bookingsCol = config.Database.Collection("bookings")
+	}
+	if bookingsCol != nil {
+		passengerIDs, err := bookingsCol.Distinct(ctx, "passengerId", bson.M{"passengerId": bson.M{"$in": candidateIDs}})
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range passengerIDs {
+			if oid, ok := v.(primitive.ObjectID); ok {
+				referenced[oid] = true
+			}
+		}
+	}
+
+	var safeIDs []primitive.ObjectID
+	for _, id := range candidateIDs {
+		if !referenced[id] {
+			safeIDs = append(safeIDs, id)
+		}
+	}
+	if len(safeIDs) == 0 {
+		return 0, nil
+	}
+
+	res, err := userCollection.DeleteMany(ctx, bson.M{
+		"_id":  bson.M{"$in": safeIDs},
+		"role": bson.M{"$ne": "admin"},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return res.DeletedCount, nil
+}
+
 func StartIncompleteUserCleanupTask() {
 	go func() {
 		// Run first check after 1 minute, then repeat every 6 hours
@@ -101,19 +204,11 @@ func StartIncompleteUserCleanupTask() {
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			cutoff := time.Now().Add(-24 * time.Hour)
-			filter := bson.M{
-				"$or": []bson.M{
-					{"name": "", "submitted_at": bson.M{"$lt": cutoff}},
-					{"name": bson.M{"$exists": false}, "submitted_at": bson.M{"$lt": cutoff}},
-					{"role": "", "submitted_at": bson.M{"$lt": cutoff}},
-					{"role": bson.M{"$exists": false}, "submitted_at": bson.M{"$lt": cutoff}},
-				},
-			}
-			res, err := userCollection.DeleteMany(ctx, filter)
+			deleted, err := purgeIncompleteUsers(ctx, cutoff)
 			if err != nil {
 				log.Printf("[BACKGROUND CLEANUP] Error deleting incomplete user records: %v", err)
-			} else if res.DeletedCount > 0 {
-				log.Printf("[BACKGROUND CLEANUP] Automatically purged %d abandoned/incomplete user registrations", res.DeletedCount)
+			} else if deleted > 0 {
+				log.Printf("[BACKGROUND CLEANUP] Automatically purged %d abandoned/incomplete user registrations", deleted)
 			}
 			cancel()
 
@@ -191,22 +286,44 @@ func VerifyFirebaseToken(c *gin.Context) {
 	}).Decode(&user)
 
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			newUser := models.User{
-				ID:          primitive.NewObjectID(),
-				PhoneNumber: cleanPhone,
-				SubmittedAt: time.Now(),
-			}
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			now := time.Now()
+			newUserID := primitive.NewObjectID()
 			dbCtx2, cancel2 := context.WithTimeout(c.Request.Context(), 5*time.Second)
 			defer cancel2()
-			_, insertErr := userCollection.InsertOne(dbCtx2, newUser)
-			if insertErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user record"})
-				return
+
+			upsertOpts := options.FindOneAndUpdate().
+				SetUpsert(true).
+				SetReturnDocument(options.After)
+			upsertErr := userCollection.FindOneAndUpdate(
+				dbCtx2,
+				bson.M{"phone_number": cleanPhone},
+				bson.M{
+					"$setOnInsert": models.User{
+						ID:          newUserID,
+						PhoneNumber: cleanPhone,
+						SubmittedAt: now,
+					},
+				},
+				upsertOpts,
+			).Decode(&user)
+
+			if upsertErr != nil {
+				// Handle duplicate key race condition on concurrent first login cleanly by re-fetching.
+				if mongo.IsDuplicateKeyError(upsertErr) {
+					dbCtx3, cancel3 := context.WithTimeout(c.Request.Context(), 5*time.Second)
+					defer cancel3()
+					if refetchErr := userCollection.FindOne(dbCtx3, bson.M{"phone_number": cleanPhone}).Decode(&user); refetchErr != nil {
+						c.JSON(config.DBErrorHTTPStatus(refetchErr), gin.H{"error": "Database query error"})
+						return
+					}
+				} else {
+					c.JSON(config.DBErrorHTTPStatus(upsertErr), gin.H{"error": "Failed to create user record"})
+					return
+				}
 			}
-			user = newUser
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database query error"})
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Database query error"})
 			return
 		}
 	}
@@ -284,8 +401,12 @@ func PromoteAdmin(c *gin.Context) {
 		bson.M{"$set": bson.M{"role": "admin"}},
 	)
 
-	if err != nil || res.MatchedCount == 0 {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to promote user to admin"})
+	if err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to promote user to admin"})
+		return
+	}
+	if res.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
 
@@ -338,7 +459,15 @@ func RefreshToken(c *gin.Context) {
 		TokenVersion int                `bson:"token_version"`
 	}
 	err = userCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&user)
-	if err != nil || user.TokenVersion != tokenVersion {
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Session revoked or user not found"})
+			return
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Authentication service temporarily unavailable"})
+		return
+	}
+	if user.TokenVersion != tokenVersion {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Session revoked or user not found"})
 		return
 	}

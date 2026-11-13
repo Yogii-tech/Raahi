@@ -256,3 +256,47 @@ func TestDecodePolyline(t *testing.T) {
 		})
 	}
 }
+
+func TestGetJwtSecret_ProductionGuard(t *testing.T) {
+	prodEnvs := []string{"prod", "staging", "PRODUCTION", "production"}
+	for _, env := range prodEnvs {
+		t.Run("panics in "+env+" when JWT_SECRET empty", func(t *testing.T) {
+			t.Setenv("APP_ENV", env)
+			t.Setenv("JWT_SECRET", "")
+
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("expected getJwtSecret() to panic when APP_ENV=%q and JWT_SECRET is empty", env)
+				}
+			}()
+			_ = getJwtSecret()
+		})
+	}
+
+	t.Run("allows dev fallback when APP_ENV=dev", func(t *testing.T) {
+		t.Setenv("APP_ENV", "dev")
+		t.Setenv("JWT_SECRET", "")
+
+		got := getJwtSecret()
+		if len(got) == 0 {
+			t.Fatal("expected non-empty development fallback secret")
+		}
+	})
+}
+
+func TestCollectTokens(t *testing.T) {
+	got := CollectTokens("tok-1", []string{"", "tok-1", "tok-2", "tok-3", "tok-2", ""})
+	expected := []string{"tok-1", "tok-2", "tok-3"}
+	if len(got) != len(expected) {
+		t.Fatalf("CollectTokens len = %d (%v), want %d (%v)", len(got), got, len(expected), expected)
+	}
+	for i := range expected {
+		if got[i] != expected[i] {
+			t.Errorf("got[%d] = %q, want %q", i, got[i], expected[i])
+		}
+	}
+
+	if empty := CollectTokens("", nil); len(empty) != 0 {
+		t.Errorf("expected 0 tokens for empty input, got %v", empty)
+	}
+}

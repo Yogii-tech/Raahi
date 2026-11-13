@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"math"
 	"net/http"
 	"strings"
@@ -56,7 +57,11 @@ func SubmitReview(c *gin.Context) {
 	// Verify the ride exists and is completed
 	var ride models.Ride
 	if err := config.Database.Collection("rides").FindOne(ctx, bson.M{"_id": rideId}).Decode(&ride); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to verify ride"})
 		return
 	}
 	if passengerID == ride.DriverID {
@@ -75,15 +80,23 @@ func SubmitReview(c *gin.Context) {
 		"passengerId": passengerID,
 		"status":      bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
 	}).Decode(&booking); err != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You can only review rides you were part of"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You can only review rides you were part of"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to verify booking eligibility"})
 		return
 	}
 
 	// Prevent duplicate review for same ride by same passenger
-	existing, _ := reviewCollection.CountDocuments(ctx, bson.M{
+	existing, err := reviewCollection.CountDocuments(ctx, bson.M{
 		"rideId":      rideId,
 		"passengerId": passengerID,
 	})
+	if err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to check existing reviews"})
+		return
+	}
 	if existing > 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "You have already reviewed this ride"})
 		return
@@ -93,7 +106,12 @@ func SubmitReview(c *gin.Context) {
 	var passenger struct {
 		Name string `bson:"name"`
 	}
-	config.Database.Collection("users").FindOne(ctx, bson.M{"_id": passengerID}).Decode(&passenger)
+	if err := config.Database.Collection("users").FindOne(ctx, bson.M{"_id": passengerID}).Decode(&passenger); err != nil {
+		if !errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to load reviewer profile"})
+			return
+		}
+	}
 
 	review := models.Review{
 		DriverID:      ride.DriverID,
@@ -110,7 +128,7 @@ func SubmitReview(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "You have already reviewed this ride"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save review"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to save review"})
 		return
 	}
 
@@ -132,34 +150,64 @@ func GetDriverReviews(c *gin.Context) {
 	cursor, err := reviewCollection.Find(ctx, bson.M{"driverId": driverID},
 		options.Find().SetSort(bson.M{"createdAt": -1}).SetLimit(50))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch reviews"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch reviews"})
 		return
 	}
 	defer cursor.Close(ctx)
 
 	var reviews []models.Review
 	if err := cursor.All(ctx, &reviews); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode reviews"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode reviews"})
+		return
+	}
+	if err := cursor.Err(); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Review list stream interrupted"})
 		return
 	}
 	if reviews == nil {
 		reviews = []models.Review{}
 	}
 
-	// Compute average rating
+	// Compute average rating and total review count across ALL reviews for this driver.
+	aggPipeline := mongo.Pipeline{
+		bson.D{{Key: "$match", Value: bson.M{"driverId": driverID}}},
+		bson.D{{Key: "$group", Value: bson.M{
+			"_id":          nil,
+			"totalReviews": bson.M{"$sum": 1},
+			"avgRating":    bson.M{"$avg": "$rating"},
+		}}},
+	}
+	aggCursor, err := reviewCollection.Aggregate(ctx, aggPipeline)
+	if err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to compute review statistics"})
+		return
+	}
+	defer aggCursor.Close(ctx)
+
+	var aggStats []struct {
+		TotalReviews int     `bson:"totalReviews"`
+		AvgRating    float64 `bson:"avgRating"`
+	}
+	if err := aggCursor.All(ctx, &aggStats); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode review statistics"})
+		return
+	}
+	if err := aggCursor.Err(); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Review statistics stream interrupted"})
+		return
+	}
+
 	var avgRating float64
-	if len(reviews) > 0 {
-		sum := 0
-		for _, r := range reviews {
-			sum += r.Rating
-		}
-		avgRating = math.Round(float64(sum)/float64(len(reviews))*10) / 10
+	totalReviews := 0
+	if len(aggStats) > 0 {
+		totalReviews = aggStats[0].TotalReviews
+		avgRating = math.Round(aggStats[0].AvgRating*10) / 10
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"reviews":       reviews,
 		"averageRating": avgRating,
-		"totalReviews":  len(reviews),
+		"totalReviews":  totalReviews,
 	})
 }
 
@@ -177,10 +225,14 @@ func CheckCanReview(c *gin.Context) {
 	defer cancel()
 
 	// Check if already reviewed
-	existing, _ := reviewCollection.CountDocuments(ctx, bson.M{
+	existing, err := reviewCollection.CountDocuments(ctx, bson.M{
 		"rideId":      rideId,
 		"passengerId": passengerID,
 	})
+	if err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to check existing review"})
+		return
+	}
 	if existing > 0 {
 		c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "already_reviewed"})
 		return
@@ -189,7 +241,11 @@ func CheckCanReview(c *gin.Context) {
 	// Check if passenger was part of this ride
 	var ride models.Ride
 	if err := config.Database.Collection("rides").FindOne(ctx, bson.M{"_id": rideId}).Decode(&ride); err != nil {
-		c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "ride_not_found"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "ride_not_found"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to verify ride"})
 		return
 	}
 	if passengerID == ride.DriverID {
@@ -207,7 +263,11 @@ func CheckCanReview(c *gin.Context) {
 		"passengerId": passengerID,
 		"status":      bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
 	}).Decode(&booking); err != nil {
-		c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "no_booking"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusOK, gin.H{"canReview": false, "reason": "no_booking"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to verify booking"})
 		return
 	}
 

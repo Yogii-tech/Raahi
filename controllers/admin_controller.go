@@ -27,25 +27,46 @@ func AdminStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	// --- Rides ---
-	totalRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{})
-	availableRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": string(models.RideStatusAvailable)})
-	ongoingRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": string(models.RideStatusOngoing)})
-	completedRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": string(models.RideStatusCompleted)})
-	cancelledRides, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{"status": string(models.RideStatusCancelled)})
+	var (
+		totalRides, availableRides, ongoingRides, completedRides, cancelledRides            int64
+		totalBookings, pendingBookings, acceptedBookings, rejectedBookings                  int64
+		completedBookings, cancelledBookings                                                int64
+		totalUsers, totalDrivers, totalPassengers                                           int64
+		totalParcels, pendingParcels, shippedParcels                                        int64
+	)
 
-	// --- Bookings ---
-	totalBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{})
-	pendingBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusPending)})
-	acceptedBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusAccepted)})
-	rejectedBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusRejected)})
-	completedBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusCompleted)})
-	cancelledBookings, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"status": string(models.BookingStatusCancelled)})
+	statSpecs := []struct {
+		collection string
+		filter     bson.M
+		dest       *int64
+	}{
+		{"rides", bson.M{}, &totalRides},
+		{"rides", bson.M{"status": string(models.RideStatusAvailable)}, &availableRides},
+		{"rides", bson.M{"status": string(models.RideStatusOngoing)}, &ongoingRides},
+		{"rides", bson.M{"status": string(models.RideStatusCompleted)}, &completedRides},
+		{"rides", bson.M{"status": string(models.RideStatusCancelled)}, &cancelledRides},
+		{"bookings", bson.M{}, &totalBookings},
+		{"bookings", bson.M{"status": string(models.BookingStatusPending)}, &pendingBookings},
+		{"bookings", bson.M{"status": string(models.BookingStatusAccepted)}, &acceptedBookings},
+		{"bookings", bson.M{"status": string(models.BookingStatusRejected)}, &rejectedBookings},
+		{"bookings", bson.M{"status": string(models.BookingStatusCompleted)}, &completedBookings},
+		{"bookings", bson.M{"status": string(models.BookingStatusCancelled)}, &cancelledBookings},
+		{"users", bson.M{}, &totalUsers},
+		{"users", bson.M{"role": "driver"}, &totalDrivers},
+		{"users", bson.M{"role": "passenger"}, &totalPassengers},
+		{"bookings", bson.M{"type": "parcel"}, &totalParcels},
+		{"bookings", bson.M{"type": "parcel", "status": "pending"}, &pendingParcels},
+		{"bookings", bson.M{"type": "parcel", "status": "accepted"}, &shippedParcels},
+	}
 
-	// --- Users ---
-	totalUsers, _ := config.Database.Collection("users").CountDocuments(ctx, bson.M{})
-	totalDrivers, _ := config.Database.Collection("users").CountDocuments(ctx, bson.M{"role": "driver"})
-	totalPassengers, _ := config.Database.Collection("users").CountDocuments(ctx, bson.M{"role": "passenger"})
+	for _, spec := range statSpecs {
+		val, err := countCollectionDocs(ctx, spec.collection, spec.filter)
+		if err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to compute admin statistics"})
+			return
+		}
+		*spec.dest = val
+	}
 
 	// --- Routes (unique pickup-dropoff pairs from rides) ---
 	routePipeline := mongo.Pipeline{
@@ -53,10 +74,23 @@ func AdminStats(c *gin.Context) {
 		{{Key: "$count", Value: "count"}},
 	}
 	routeCursor, err := config.Database.Collection("rides").Aggregate(ctx, routePipeline)
+	if err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to aggregate route statistics"})
+		return
+	}
 	routeCount := int64(0)
-	if err == nil && routeCursor != nil {
+	if routeCursor != nil {
+		defer routeCursor.Close(ctx)
 		var routeResult []bson.M
-		if allErr := routeCursor.All(ctx, &routeResult); allErr == nil && len(routeResult) > 0 {
+		if allErr := routeCursor.All(ctx, &routeResult); allErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(allErr), gin.H{"error": "Failed to decode route statistics"})
+			return
+		}
+		if err := routeCursor.Err(); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to read route statistics"})
+			return
+		}
+		if len(routeResult) > 0 {
 			if v, ok := routeResult[0]["count"].(int32); ok {
 				routeCount = int64(v)
 			} else if v64, ok := routeResult[0]["count"].(int64); ok {
@@ -65,11 +99,6 @@ func AdminStats(c *gin.Context) {
 		}
 	}
 
-	// --- Parcels (Bookings with type "parcel") ---
-	totalParcels, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"type": "parcel"})
-	pendingParcels, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"type": "parcel", "status": "pending"})
-	shippedParcels, _ := config.Database.Collection("bookings").CountDocuments(ctx, bson.M{"type": "parcel", "status": "accepted"})
-
 	// --- Monthly ride trend for the past 6 months ---
 	now := time.Now()
 	monthlyTrend := make([]map[string]interface{}, 6)
@@ -77,9 +106,13 @@ func AdminStats(c *gin.Context) {
 		monthStart := time.Date(now.Year(), now.Month()-time.Month(i), 1, 0, 0, 0, 0, time.UTC)
 		monthEnd := monthStart.AddDate(0, 1, 0).Add(-time.Nanosecond)
 
-		count, _ := config.Database.Collection("rides").CountDocuments(ctx, bson.M{
+		count, err := countCollectionDocs(ctx, "rides", bson.M{
 			"createdAt": bson.M{"$gte": monthStart, "$lte": monthEnd},
 		})
+		if err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to compute monthly ride trend"})
+			return
+		}
 
 		monthlyTrend[5-i] = map[string]interface{}{
 			"month": monthStart.Format("Jan"),
@@ -131,16 +164,14 @@ func AdminParcels(c *gin.Context) {
 		options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(100),
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch parcels"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch parcels"})
 		return
 	}
 
 	var parcels []models.Booking
-	if cursor != nil {
-		if err := cursor.All(ctx, &parcels); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse parcels"})
-			return
-		}
+	if err := decodeCursorAll(ctx, cursor, &parcels); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse parcels"})
+		return
 	}
 
 	type ParcelRow struct {
@@ -171,15 +202,22 @@ func AdminParcels(c *gin.Context) {
 			bson.M{"_id": bson.M{"$in": senderIDs}},
 			options.Find().SetProjection(bson.M{"name": 1}),
 		)
-		if sErr == nil && sCursor != nil {
+		if sErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(sErr), gin.H{"error": "Failed to fetch parcel senders"})
+			return
+		}
+		if sCursor != nil {
+			defer sCursor.Close(ctx)
 			var senders []struct {
 				ID   primitive.ObjectID `bson:"_id"`
 				Name string             `bson:"name"`
 			}
-			if err := sCursor.All(ctx, &senders); err == nil {
-				for _, s := range senders {
-					senderNames[s.ID] = s.Name
-				}
+			if err := sCursor.All(ctx, &senders); err != nil {
+				c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse parcel senders"})
+				return
+			}
+			for _, s := range senders {
+				senderNames[s.ID] = s.Name
 			}
 		}
 	}
@@ -219,16 +257,14 @@ func AdminUsersList(c *gin.Context) {
 		options.Find().SetSort(bson.D{{Key: "_id", Value: -1}}).SetLimit(200),
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch users"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch users"})
 		return
 	}
 
 	var users []models.User
-	if cursor != nil {
-		if err := cursor.All(ctx, &users); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse users"})
-			return
-		}
+	if err := decodeCursorAll(ctx, cursor, &users); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse users"})
+		return
 	}
 
 	// PERF: Batch count driver rides and passenger bookings using Mongo aggregation
@@ -249,16 +285,21 @@ func AdminUsersList(c *gin.Context) {
 			{{Key: "$match", Value: bson.M{"driverId": bson.M{"$in": driverIDs}}}},
 			{{Key: "$group", Value: bson.M{"_id": "$driverId", "count": bson.M{"$sum": 1}}}},
 		}
-		if dCursor, dErr := config.Database.Collection("rides").Aggregate(ctx, pipeline); dErr == nil && dCursor != nil {
-			var dResults []struct {
-				ID    primitive.ObjectID `bson:"_id"`
-				Count int64              `bson:"count"`
-			}
-			if dCursor.All(ctx, &dResults) == nil {
-				for _, res := range dResults {
-					driverRideCounts[res.ID] = res.Count
-				}
-			}
+		dCursor, dErr := config.Database.Collection("rides").Aggregate(ctx, pipeline)
+		if dErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(dErr), gin.H{"error": "Failed to aggregate driver ride counts"})
+			return
+		}
+		var dResults []struct {
+			ID    primitive.ObjectID `bson:"_id"`
+			Count int64              `bson:"count"`
+		}
+		if err := decodeCursorAll(ctx, dCursor, &dResults); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode driver ride counts"})
+			return
+		}
+		for _, res := range dResults {
+			driverRideCounts[res.ID] = res.Count
 		}
 	}
 
@@ -268,16 +309,21 @@ func AdminUsersList(c *gin.Context) {
 			{{Key: "$match", Value: bson.M{"passengerId": bson.M{"$in": passengerIDs}}}},
 			{{Key: "$group", Value: bson.M{"_id": "$passengerId", "count": bson.M{"$sum": 1}}}},
 		}
-		if pCursor, pErr := config.Database.Collection("bookings").Aggregate(ctx, pipeline); pErr == nil && pCursor != nil {
-			var pResults []struct {
-				ID    primitive.ObjectID `bson:"_id"`
-				Count int64              `bson:"count"`
-			}
-			if pCursor.All(ctx, &pResults) == nil {
-				for _, res := range pResults {
-					passengerBookingCounts[res.ID] = res.Count
-				}
-			}
+		pCursor, pErr := config.Database.Collection("bookings").Aggregate(ctx, pipeline)
+		if pErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(pErr), gin.H{"error": "Failed to aggregate passenger booking counts"})
+			return
+		}
+		var pResults []struct {
+			ID    primitive.ObjectID `bson:"_id"`
+			Count int64              `bson:"count"`
+		}
+		if err := decodeCursorAll(ctx, pCursor, &pResults); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode passenger booking counts"})
+			return
+		}
+		for _, res := range pResults {
+			passengerBookingCounts[res.ID] = res.Count
 		}
 	}
 
@@ -315,45 +361,35 @@ func AdminUsersList(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// AdminCleanupIncompleteUsers deletes abandoned registrations (missing name or role older than 24 hours).
+const adminForceCleanupMinGrace = 15 * time.Minute
+
+func incompleteUserCleanupCutoff(force bool, now time.Time) time.Time {
+	if force {
+		return now.Add(-adminForceCleanupMinGrace)
+	}
+	return now.Add(-24 * time.Hour)
+}
+
+// AdminCleanupIncompleteUsers deletes abandoned registrations (missing name or role)
+// while always excluding admin accounts, users with rides/bookings, and enforcing
+// a minimum grace window even when force=true.
 func AdminCleanupIncompleteUsers(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	cutoff := time.Now().Add(-24 * time.Hour)
 	force := c.Query("force") == "true"
+	cutoff := incompleteUserCleanupCutoff(force, time.Now())
 
-	var filter bson.M
-	if force {
-		filter = bson.M{
-			"$or": []bson.M{
-				{"name": ""},
-				{"name": bson.M{"$exists": false}},
-				{"role": ""},
-				{"role": bson.M{"$exists": false}},
-			},
-		}
-	} else {
-		filter = bson.M{
-			"$or": []bson.M{
-				{"name": "", "submitted_at": bson.M{"$lt": cutoff}},
-				{"name": bson.M{"$exists": false}, "submitted_at": bson.M{"$lt": cutoff}},
-				{"role": "", "submitted_at": bson.M{"$lt": cutoff}},
-				{"role": bson.M{"$exists": false}, "submitted_at": bson.M{"$lt": cutoff}},
-			},
-		}
-	}
-
-	result, err := config.Database.Collection("users").DeleteMany(ctx, filter)
+	deletedCount, err := purgeIncompleteUsers(ctx, cutoff)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete incomplete user registrations"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to delete incomplete user registrations"})
 		return
 	}
 
-	log.Printf("[ADMIN CLEANUP] Deleted %d incomplete user records (force=%v)", result.DeletedCount, force)
+	log.Printf("[ADMIN CLEANUP] Deleted %d incomplete user records (force=%v)", deletedCount, force)
 	c.JSON(http.StatusOK, gin.H{
 		"message":      "Incomplete registrations cleaned up successfully",
-		"deletedCount": result.DeletedCount,
+		"deletedCount": deletedCount,
 	})
 }
 
@@ -368,15 +404,13 @@ func AdminReports(c *gin.Context) {
 		since := time.Now().AddDate(0, 0, -30)
 		cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{"createdAt": bson.M{"$gte": since}})
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings report"})
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch bookings report"})
 			return
 		}
 		var bookings []models.Booking
-		if cursor != nil {
-			if err := cursor.All(ctx, &bookings); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings report"})
-				return
-			}
+		if err := decodeCursorAll(ctx, cursor, &bookings); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse bookings report"})
+			return
 		}
 		c.Header("Content-Type", "text/csv")
 		c.Header("Content-Disposition", `attachment; filename="daily_bookings.csv"`)
@@ -390,15 +424,13 @@ func AdminReports(c *gin.Context) {
 			"status": bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
 		})
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch revenue report"})
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch revenue report"})
 			return
 		}
 		var bookings []models.Booking
-		if cursor != nil {
-			if err := cursor.All(ctx, &bookings); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse revenue report"})
-				return
-			}
+		if err := decodeCursorAll(ctx, cursor, &bookings); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse revenue report"})
+			return
 		}
 
 		c.Header("Content-Type", "text/csv")
@@ -427,15 +459,13 @@ func AdminReports(c *gin.Context) {
 			"status": bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
 		})
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch payouts report"})
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch payouts report"})
 			return
 		}
 		var bookings []models.Booking
-		if cursor != nil {
-			if err := cursor.All(ctx, &bookings); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse payouts report"})
-				return
-			}
+		if err := decodeCursorAll(ctx, cursor, &bookings); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse payouts report"})
+			return
 		}
 
 		c.Header("Content-Type", "text/csv")
@@ -488,15 +518,13 @@ func AdminBookings(c *gin.Context) {
 	defer cancel()
 	cursor, err := config.Database.Collection("bookings").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(100))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch bookings"})
 		return
 	}
 	var bookings []models.Booking
-	if cursor != nil {
-		if err := cursor.All(ctx, &bookings); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings"})
-			return
-		}
+	if err := decodeCursorAll(ctx, cursor, &bookings); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse bookings"})
+		return
 	}
 	type BookingRow struct {
 		ID             string `json:"id"`
@@ -532,14 +560,17 @@ func AdminBookings(c *gin.Context) {
 			bson.M{"_id": bson.M{"$in": passengerIDs}},
 			options.Find().SetProjection(bson.M{"name": 1, "phone_number": 1}),
 		)
-		if uErr == nil && uCursor != nil {
-			var passengers []models.User
-			if uCursor.All(ctx, &passengers) == nil {
-				for _, p := range passengers {
-					passengerMap[p.ID] = p
-				}
-			}
-			uCursor.Close(ctx)
+		if uErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(uErr), gin.H{"error": "Failed to fetch passenger details"})
+			return
+		}
+		var passengers []models.User
+		if err := decodeCursorAll(ctx, uCursor, &passengers); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode passenger details"})
+			return
+		}
+		for _, p := range passengers {
+			passengerMap[p.ID] = p
 		}
 	}
 
@@ -550,14 +581,17 @@ func AdminBookings(c *gin.Context) {
 			bson.M{"_id": bson.M{"$in": rideIDs}},
 			options.Find().SetProjection(bson.M{"driverName": 1, "pickup": 1, "dropoff": 1}),
 		)
-		if rErr == nil && rCursor != nil {
-			var rides []models.Ride
-			if rCursor.All(ctx, &rides) == nil {
-				for _, r := range rides {
-					rideMap[r.ID] = r
-				}
-			}
-			rCursor.Close(ctx)
+		if rErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(rErr), gin.H{"error": "Failed to fetch ride details"})
+			return
+		}
+		var rides []models.Ride
+		if err := decodeCursorAll(ctx, rCursor, &rides); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode ride details"})
+			return
+		}
+		for _, r := range rides {
+			rideMap[r.ID] = r
 		}
 	}
 
@@ -625,22 +659,35 @@ func AdminGetBookingDetails(c *gin.Context) {
 	var b models.Booking
 	err := config.Database.Collection("bookings").FindOne(ctx, filter).Decode(&b)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found with specified BID or ID"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found with specified BID or ID"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Database error fetching booking"})
 		return
 	}
 
 	// Fetch Passenger
 	var p models.User
-	_ = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": b.PassengerID}).Decode(&p)
+	if pErr := config.Database.Collection("users").FindOne(ctx, bson.M{"_id": b.PassengerID}).Decode(&p); pErr != nil && !errors.Is(pErr, mongo.ErrNoDocuments) {
+		c.JSON(config.DBErrorHTTPStatus(pErr), gin.H{"error": "Database error fetching passenger details"})
+		return
+	}
 
 	// Fetch Ride
 	var r models.Ride
-	_ = config.Database.Collection("rides").FindOne(ctx, bson.M{"_id": b.RideID}).Decode(&r)
+	if rErr := config.Database.Collection("rides").FindOne(ctx, bson.M{"_id": b.RideID}).Decode(&r); rErr != nil && !errors.Is(rErr, mongo.ErrNoDocuments) {
+		c.JSON(config.DBErrorHTTPStatus(rErr), gin.H{"error": "Database error fetching ride details"})
+		return
+	}
 
 	// Fetch Driver
 	var d models.User
 	if !r.DriverID.IsZero() {
-		_ = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": r.DriverID}).Decode(&d)
+		if dErr := config.Database.Collection("users").FindOne(ctx, bson.M{"_id": r.DriverID}).Decode(&d); dErr != nil && !errors.Is(dErr, mongo.ErrNoDocuments) {
+			c.JSON(config.DBErrorHTTPStatus(dErr), gin.H{"error": "Database error fetching driver details"})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -695,15 +742,13 @@ func AdminDrivers(c *gin.Context) {
 	defer cancel()
 	cursor, err := config.Database.Collection("users").Find(ctx, bson.M{"role": "driver"}, options.Find().SetSort(bson.D{{Key: "submitted_at", Value: -1}}))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch drivers"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch drivers"})
 		return
 	}
 	var drivers []models.User
-	if cursor != nil {
-		if err := cursor.All(ctx, &drivers); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse drivers"})
-			return
-		}
+	if err := decodeCursorAll(ctx, cursor, &drivers); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse drivers"})
+		return
 	}
 
 	type DriverRow struct {
@@ -739,17 +784,24 @@ func AdminDrivers(c *gin.Context) {
 			{{Key: "$match", Value: bson.M{"driverId": bson.M{"$in": driverIDs}}}},
 			{{Key: "$group", Value: bson.M{"_id": "$driverId", "count": bson.M{"$sum": 1}}}},
 		}
-		if dCursor, dErr := config.Database.Collection("rides").Aggregate(ctx, pipeline); dErr == nil && dCursor != nil {
+		dCursor, dErr := config.Database.Collection("rides").Aggregate(ctx, pipeline)
+		if dErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(dErr), gin.H{"error": "Failed to aggregate driver ride counts"})
+			return
+		}
+		if dCursor != nil {
+			defer dCursor.Close(ctx)
 			var counts []struct {
 				ID    primitive.ObjectID `bson:"_id"`
 				Count int64              `bson:"count"`
 			}
-			if dCursor.All(ctx, &counts) == nil {
-				for _, c := range counts {
-					driverRideCounts[c.ID] = c.Count
-				}
+			if err := dCursor.All(ctx, &counts); err != nil {
+				c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode driver ride counts"})
+				return
 			}
-			dCursor.Close(ctx)
+			for _, res := range counts {
+				driverRideCounts[res.ID] = res.Count
+			}
 		}
 	}
 
@@ -807,6 +859,21 @@ func AdminDrivers(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+func buildReKYCUpdateDoc(driver models.User, reason string) bson.M {
+	setFields := bson.M{
+		"verification_status": string(models.VerificationStatusRejected),
+		"rejection_reason":    reason,
+	}
+	if driver.Vehicle != nil {
+		setFields["vehicle.dl_url"] = ""
+		setFields["vehicle.rc_url"] = ""
+		setFields["vehicle.pollution_url"] = ""
+		setFields["vehicle.vehicle_image_url"] = ""
+		setFields["vehicle.ownership_url"] = ""
+	}
+	return bson.M{"$set": setFields}
+}
+
 func AdminVerifyDriver(c *gin.Context) {
 	driverIdHex := c.Param("driverId")
 	driverId, err := primitive.ObjectIDFromHex(driverIdHex)
@@ -830,11 +897,11 @@ func AdminVerifyDriver(c *gin.Context) {
 	var driver models.User
 	err = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": driverId, "role": "driver"}).Decode(&driver)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, mongo.ErrNoDocuments) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Driver not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch driver"})
 		return
 	}
 
@@ -844,9 +911,11 @@ func AdminVerifyDriver(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Invalid driver verification transition from %q to %q", fromStatus, toStatus)})
 		return
 	}
-	if fromStatus == models.VerificationStatusNone && toStatus == models.VerificationStatusVerified && driver.Vehicle == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot verify driver without submitted vehicle documents"})
-		return
+	if toStatus == models.VerificationStatusVerified {
+		if kycErr := validateDriverVehicleKYC(driver.Vehicle); kycErr != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": kycErr})
+			return
+		}
 	}
 
 	reasonToSet := strings.TrimSpace(body.Reason)
@@ -854,40 +923,41 @@ func AdminVerifyDriver(c *gin.Context) {
 		reasonToSet = ""
 	}
 
-	filter := bson.M{"_id": driverId, "role": "driver"}
-	if driver.VerificationStatus == "" {
-		filter["$or"] = []bson.M{
-			{"verification_status": ""},
-			{"verification_status": bson.M{"$exists": false}},
+	var retiredNotices []retiredBookingNotice
+	if err := config.RunInTransaction(ctx, func(txCtx context.Context) error {
+		filter := bson.M{"_id": driverId, "role": "driver"}
+		applyVerificationStatusCAS(filter, driver.VerificationStatus)
+
+		update := bson.M{
+			"$set": bson.M{
+				"verification_status": body.Status,
+				"rejection_reason":    reasonToSet,
+			},
 		}
-	} else {
-		filter["verification_status"] = driver.VerificationStatus
-	}
 
-	update := bson.M{
-		"$set": bson.M{
-			"verification_status": body.Status,
-			"rejection_reason":    reasonToSet,
-		},
-	}
+		res, err := config.Database.Collection("users").UpdateOne(txCtx, filter, update)
+		if err != nil {
+			return err
+		}
+		if res.MatchedCount == 0 {
+			return newTxErr(http.StatusConflict, "Driver verification status changed concurrently. Please refresh and try again.")
+		}
 
-	res, err := config.Database.Collection("users").UpdateOne(ctx, filter, update)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update driver verification status"})
+		if fromStatus == models.VerificationStatusVerified && toStatus != models.VerificationStatusVerified {
+			notices, retireErr := retireOpenRidesInTx(txCtx, driverId)
+			if retireErr != nil {
+				return fmt.Errorf("retire open rides for demoted driver %s: %w", driverId.Hex(), retireErr)
+			}
+			retiredNotices = notices
+		}
+		return nil
+	}); err != nil {
+		respondTxError(c, err, "Failed to update driver verification status")
 		return
 	}
-	if res.MatchedCount == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "Driver verification status changed concurrently. Please refresh and try again."})
-		return
-	}
+	sendRetiredRideNotices(retiredNotices)
 
-	if fromStatus == models.VerificationStatusVerified && toStatus != models.VerificationStatusVerified {
-		if retireErr := retireOpenRides(ctx, driverId); retireErr != nil {
-			log.Printf("[AdminVerifyDriver] Failed to retire open rides for demoted driver %s: %v", driverId.Hex(), retireErr)
-		}
-	}
-
-	// Send Notification to Driver
+	// Send Notification to Driver after transaction commits
 	var title, msg string
 	if body.Status == string(models.VerificationStatusVerified) {
 		title = "Documents Approved"
@@ -927,35 +997,57 @@ func AdminRequestReKYC(c *gin.Context) {
 		reason = "Admin requested KYC re-verification. Please re-upload your driving license, vehicle RC, and other documents."
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	// Update verification status to 'rejected' so the driver app displays the
-	// Action Required banner and the "Resubmit Documents" button.
-	// Also clear old document URLs so the driver is prompted to upload fresh files.
-	update := bson.M{
-		"$set": bson.M{
-			"verification_status":       "rejected",
-			"rejection_reason":          reason,
-			"vehicle.dl_url":            "",
-			"vehicle.rc_url":            "",
-			"vehicle.pollution_url":     "",
-			"vehicle.vehicle_image_url": "",
-			"vehicle.ownership_url":     "",
-		},
-	}
-
-	res, err := config.Database.Collection("users").UpdateOne(ctx, bson.M{"_id": driverId, "role": "driver"}, update)
-	if err != nil || res.MatchedCount == 0 {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update driver or driver not found"})
+	var driver models.User
+	err = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": driverId, "role": "driver"}).Decode(&driver)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Driver not found"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch driver"})
 		return
 	}
 
-	if retireErr := retireOpenRides(ctx, driverId); retireErr != nil {
-		log.Printf("[AdminRequestReKYC] Failed to retire open rides for driver %s: %v", driverId.Hex(), retireErr)
+	fromStatus := models.VerificationStatus(driver.VerificationStatus)
+	if !models.CanTransitionVerificationStatus(fromStatus, models.VerificationStatusRejected) {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Cannot request Re-KYC from status %q", fromStatus)})
+		return
 	}
 
-	// Send Push & In-app Notification to Driver
+	var rekycNotices []retiredBookingNotice
+	if err := config.RunInTransaction(ctx, func(txCtx context.Context) error {
+		filter := bson.M{"_id": driverId, "role": "driver"}
+		applyVerificationStatusCAS(filter, driver.VerificationStatus)
+
+		// Update verification status to 'rejected' so the driver app displays the
+		// Action Required banner and the "Resubmit Documents" button.
+		// Only clear document URLs if driver already has a Vehicle subdocument.
+		update := buildReKYCUpdateDoc(driver, reason)
+
+		res, err := config.Database.Collection("users").UpdateOne(txCtx, filter, update)
+		if err != nil {
+			return err
+		}
+		if res.MatchedCount == 0 {
+			return newTxErr(http.StatusConflict, "Driver verification status changed concurrently. Please refresh and try again.")
+		}
+
+		notices, retireErr := retireOpenRidesInTx(txCtx, driverId)
+		if retireErr != nil {
+			return fmt.Errorf("retire open rides for Re-KYC driver %s: %w", driverId.Hex(), retireErr)
+		}
+		rekycNotices = notices
+		return nil
+	}); err != nil {
+		respondTxError(c, err, "Failed to update driver for Re-KYC")
+		return
+	}
+	sendRetiredRideNotices(rekycNotices)
+
+	// Send Push & In-app Notification to Driver after transaction commits
 	title := "Re-KYC Required"
 	msg := reason
 	CreateNotification(driverId, title, msg, "document_verification", "", map[string]string{
@@ -965,7 +1057,7 @@ func AdminRequestReKYC(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Re-KYC request and notification sent to driver successfully"})
 }
 
-// AdminDeleteDriver permanently deletes a driver and all associated data (rides, bookings).
+// AdminDeleteDriver permanently deletes a driver and all associated data (rides, bookings, chats, reviews, notifications, routes).
 func AdminDeleteDriver(c *gin.Context) {
 	driverIdHex := c.Param("driverId")
 	driverId, err := primitive.ObjectIDFromHex(driverIdHex)
@@ -974,55 +1066,123 @@ func AdminDeleteDriver(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
 	// Verify the user exists and is actually a driver
 	var driver models.User
 	err = config.Database.Collection("users").FindOne(ctx, bson.M{"_id": driverId, "role": "driver"}).Decode(&driver)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Driver not found"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Driver not found"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch driver"})
 		return
 	}
 
-	// Delete all bookings associated with rides by this driver
-	ridesCursor, err := config.Database.Collection("rides").Find(ctx, bson.M{"driverId": driverId}, options.Find().SetProjection(bson.M{"_id": 1}))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver rides"})
-		return
-	}
-	var rideIds []primitive.ObjectID
-	if ridesCursor != nil {
-		for ridesCursor.Next(ctx) {
-			var r struct {
-				ID primitive.ObjectID `bson:"_id"`
-			}
-			if ridesCursor.Decode(&r) == nil {
-				rideIds = append(rideIds, r.ID)
+	var deletedBookings, deletedRides int64
+	if err := config.RunInTransaction(ctx, func(txCtx context.Context) error {
+		ridesCursor, err := config.Database.Collection("rides").Find(txCtx, bson.M{"driverId": driverId}, options.Find().SetProjection(bson.M{"_id": 1}))
+		if err != nil {
+			return fmt.Errorf("fetch driver rides: %w", err)
+		}
+		var rideRows []struct {
+			ID primitive.ObjectID `bson:"_id"`
+		}
+		if err := ridesCursor.All(txCtx, &rideRows); err != nil {
+			ridesCursor.Close(txCtx)
+			return fmt.Errorf("decode driver rides: %w", err)
+		}
+		if err := ridesCursor.Err(); err != nil {
+			ridesCursor.Close(txCtx)
+			return fmt.Errorf("iterate driver rides: %w", err)
+		}
+		ridesCursor.Close(txCtx)
+
+		rideIds := make([]primitive.ObjectID, 0, len(rideRows))
+		for _, r := range rideRows {
+			rideIds = append(rideIds, r.ID)
+		}
+
+		bookingFilter := bson.M{"passengerId": driverId}
+		if len(rideIds) > 0 {
+			bookingFilter = bson.M{
+				"$or": []bson.M{
+					{"rideId": bson.M{"$in": rideIds}},
+					{"passengerId": driverId},
+				},
 			}
 		}
-		ridesCursor.Close(ctx)
-	}
 
-	deletedBookings := int64(0)
-	if len(rideIds) > 0 {
-		bookingResult, _ := config.Database.Collection("bookings").DeleteMany(ctx, bson.M{"rideId": bson.M{"$in": rideIds}})
-		if bookingResult != nil {
-			deletedBookings = bookingResult.DeletedCount
+		bookingsCursor, err := config.Database.Collection("bookings").Find(txCtx, bookingFilter, options.Find().SetProjection(bson.M{"_id": 1}))
+		if err != nil {
+			return fmt.Errorf("fetch bookings for driver cleanup: %w", err)
 		}
-	}
+		var bookingRows []struct {
+			ID primitive.ObjectID `bson:"_id"`
+		}
+		if err := bookingsCursor.All(txCtx, &bookingRows); err != nil {
+			bookingsCursor.Close(txCtx)
+			return fmt.Errorf("decode bookings for driver cleanup: %w", err)
+		}
+		if err := bookingsCursor.Err(); err != nil {
+			bookingsCursor.Close(txCtx)
+			return fmt.Errorf("iterate bookings for driver cleanup: %w", err)
+		}
+		bookingsCursor.Close(txCtx)
 
-	// Delete all rides by this driver
-	rideResult, _ := config.Database.Collection("rides").DeleteMany(ctx, bson.M{"driverId": driverId})
-	deletedRides := int64(0)
-	if rideResult != nil {
+		bookingIds := make([]primitive.ObjectID, 0, len(bookingRows))
+		for _, b := range bookingRows {
+			bookingIds = append(bookingIds, b.ID)
+		}
+
+		if len(bookingIds) > 0 {
+			if _, err := config.Database.Collection("chats").DeleteMany(txCtx, bson.M{"bookingId": bson.M{"$in": bookingIds}}); err != nil {
+				return fmt.Errorf("delete chats: %w", err)
+			}
+		}
+
+		bookingResult, err := config.Database.Collection("bookings").DeleteMany(txCtx, bookingFilter)
+		if err != nil {
+			return fmt.Errorf("delete bookings: %w", err)
+		}
+		deletedBookings = bookingResult.DeletedCount
+
+		rideResult, err := config.Database.Collection("rides").DeleteMany(txCtx, bson.M{"driverId": driverId})
+		if err != nil {
+			return fmt.Errorf("delete rides: %w", err)
+		}
 		deletedRides = rideResult.DeletedCount
-	}
 
-	// Delete the driver user document
-	_, err = config.Database.Collection("users").DeleteOne(ctx, bson.M{"_id": driverId})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete driver"})
+		if _, err := config.Database.Collection("reviews").DeleteMany(txCtx, bson.M{
+			"$or": []bson.M{
+				{"driverId": driverId},
+				{"passengerId": driverId},
+			},
+		}); err != nil {
+			return fmt.Errorf("delete reviews: %w", err)
+		}
+
+		if _, err := config.Database.Collection("notifications").DeleteMany(txCtx, bson.M{"userId": driverId}); err != nil {
+			return fmt.Errorf("delete notifications: %w", err)
+		}
+
+		if _, err := config.Database.Collection("recent_routes").DeleteMany(txCtx, bson.M{"userId": driverId}); err != nil {
+			return fmt.Errorf("delete recent_routes: %w", err)
+		}
+
+		userRes, err := config.Database.Collection("users").DeleteOne(txCtx, bson.M{"_id": driverId, "role": "driver"})
+		if err != nil {
+			return fmt.Errorf("delete user: %w", err)
+		}
+		if userRes.DeletedCount == 0 {
+			return newTxErr(http.StatusNotFound, "Driver not found")
+		}
+
+		return nil
+	}); err != nil {
+		respondTxError(c, err, "Failed to delete driver")
 		return
 	}
 
@@ -1038,18 +1198,16 @@ func AdminRidesList(c *gin.Context) {
 	defer cancel()
 	cursor, err := config.Database.Collection("rides").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}).SetLimit(50))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch rides"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch rides"})
 		return
 	}
 	var rides []models.Ride
-	if cursor != nil {
-		if err := cursor.All(ctx, &rides); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse rides"})
-			return
-		}
+	if err := decodeCursorAll(ctx, cursor, &rides); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse rides"})
+		return
 	}
 
-	// Scope accepted bookings query to the fetched ride IDs instead of loading the entire collection.
+	// Scope accepted/completed seat bookings query to the fetched ride IDs instead of loading the entire collection.
 	rideIDs := make([]primitive.ObjectID, 0, len(rides))
 	for _, r := range rides {
 		rideIDs = append(rideIDs, r.ID)
@@ -1059,26 +1217,30 @@ func AdminRidesList(c *gin.Context) {
 	if len(rideIDs) > 0 {
 		bookingCursor, err := config.Database.Collection("bookings").Find(
 			ctx,
-			bson.M{"rideId": bson.M{"$in": rideIDs}, "status": "accepted"},
-			options.Find().SetProjection(bson.M{"rideId": 1, "seatLayout": 1}),
+			bson.M{
+				"rideId": bson.M{"$in": rideIDs},
+				"type":   "seat",
+				"status": bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
+			},
+			options.Find().SetProjection(bson.M{"rideId": 1, "type": 1, "seatLayout": 1}),
 		)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings for rides"})
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch bookings for rides"})
 			return
 		}
 		var allBookings []models.Booking
-		if bookingCursor != nil {
-			if err := bookingCursor.All(ctx, &allBookings); err != nil {
-				bookingCursor.Close(ctx)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings for rides"})
-				return
-			}
-			bookingCursor.Close(ctx)
+		if err := decodeCursorAll(ctx, bookingCursor, &allBookings); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse bookings for rides"})
+			return
 		}
 
-		// Build a map: rideId -> count of accepted booked seats (from actual SeatLayout)
+		// Group bookings per ride and count distinct physical seats consistently with UpdateBookingStatus.
+		bookingsByRide := make(map[primitive.ObjectID][]models.Booking, len(rideIDs))
 		for _, b := range allBookings {
-			bookedSeatCount[b.RideID] += len(b.SeatLayout)
+			bookingsByRide[b.RideID] = append(bookingsByRide[b.RideID], b)
+		}
+		for rideID, rideBookings := range bookingsByRide {
+			bookedSeatCount[rideID] = countDistinctAcceptedSeats(rideBookings)
 		}
 	}
 
@@ -1133,17 +1295,13 @@ func AdminRoutesAnalytics(c *gin.Context) {
 	}
 	cursor, err := config.Database.Collection("rides").Aggregate(ctx, pipeline)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch route analytics"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch route analytics"})
 		return
 	}
 	var raw []bson.M
-	if cursor != nil {
-		if err := cursor.All(ctx, &raw); err != nil {
-			cursor.Close(ctx)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse route analytics"})
-			return
-		}
-		cursor.Close(ctx)
+	if err := decodeCursorAll(ctx, cursor, &raw); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse route analytics"})
+		return
 	}
 	type RouteRow struct {
 		ID            string  `json:"id"`

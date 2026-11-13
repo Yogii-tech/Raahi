@@ -291,8 +291,12 @@ func Geocode(location string) (float64, float64, error) {
 		location, query, bestMatchIdx+1, results[bestMatchIdx].DisplayName, results[bestMatchIdx].Type, results[bestMatchIdx].Class, results[bestMatchIdx].Lat, results[bestMatchIdx].Lon)
 
 	var lat, lon float64
-	fmt.Sscanf(results[bestMatchIdx].Lat, "%f", &lat)
-	fmt.Sscanf(results[bestMatchIdx].Lon, "%f", &lon)
+	if n, scanErr := fmt.Sscanf(results[bestMatchIdx].Lat, "%f", &lat); scanErr != nil || n != 1 {
+		return 0, 0, fmt.Errorf("invalid latitude from geocoder: %q", results[bestMatchIdx].Lat)
+	}
+	if n, scanErr := fmt.Sscanf(results[bestMatchIdx].Lon, "%f", &lon); scanErr != nil || n != 1 {
+		return 0, 0, fmt.Errorf("invalid longitude from geocoder: %q", results[bestMatchIdx].Lon)
+	}
 
 	// Update cache
 	geoCacheMutex.Lock()
@@ -331,8 +335,14 @@ func DiscoverIntermediateStops(startLat, startLon, endLat, endLon float64, sampl
 		polyDistances[i] = totalPolyM
 	}
 
-	// Always add start point if geocoded successfully (at 0m)
-	startName, _ := ReverseGeocode(startLat, startLon)
+	// Always add start point (at 0m)
+	startName, err := ReverseGeocode(startLat, startLon)
+	if err != nil {
+		log.Printf("⚠️ ReverseGeocode start failed: %v", err)
+	}
+	if strings.TrimSpace(startName) == "" {
+		startName = "Origin"
+	}
 	stops = append(stops, models.StopInfo{Name: startName, DistanceM: 0, Lat: startLat, Lon: startLon})
 
 	seenNames := make(map[string]bool)
@@ -377,7 +387,13 @@ func DiscoverIntermediateStops(startLat, startLon, endLat, endLon float64, sampl
 	}
 
 	// Add end point (at totalDistM from OSRM)
-	endName, _ := ReverseGeocode(endLat, endLon)
+	endName, err := ReverseGeocode(endLat, endLon)
+	if err != nil {
+		log.Printf("⚠️ ReverseGeocode end failed: %v", err)
+	}
+	if strings.TrimSpace(endName) == "" {
+		endName = "Destination"
+	}
 	normEndName := strings.ToLower(strings.TrimSpace(endName))
 	if !seenNames[normEndName] {
 		stops = append(stops, models.StopInfo{Name: endName, DistanceM: totalDistM, Lat: endLat, Lon: endLon})

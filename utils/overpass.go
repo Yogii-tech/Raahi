@@ -234,6 +234,9 @@ out body;`, unionStr)
 
 	cacheMutex.Lock()
 	discoveryCache[cacheKey] = cacheEntry{data: villages, timestamp: time.Now()}
+	if len(discoveryCache) > 1000 {
+		discoveryCache = make(map[string]cacheEntry)
+	}
 	cacheMutex.Unlock()
 
 	return villages, nil

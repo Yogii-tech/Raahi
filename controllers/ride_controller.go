@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -32,47 +33,64 @@ func InitializeRideCollection() {
 	bookingCollection = config.Database.Collection("bookings")
 	recentRoutesCollection = config.Database.Collection("recent_routes")
 	usersCollection = config.Database.Collection("users")
-
-	// Create sparse unique index for Booking ID (BID)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, _ = bookingCollection.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "bookingId", Value: 1}},
-		Options: options.Index().SetUnique(true).SetSparse(true),
-	})
-
-	BackfillBookingIDs()
+	// Note: bookings.bookingId sparse unique index is managed declaratively in
+	// config.CollectionIndexSpecs(), and accepted bookings receive bookingId
+	// atomically during acceptance in UpdateBookingStatus (no uncoordinated startup backfill).
 }
 
 func BackfillBookingIDs() {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-		cursor, err := bookingCollection.Find(ctx, bson.M{
-			"status": "accepted",
-			"$or": []bson.M{
-				{"bookingId": ""},
-				{"bookingId": bson.M{"$exists": false}},
-			},
-		}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: 1}}))
+	cursor, err := bookingCollection.Find(ctx, bson.M{
+		"status": bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusCompleted)}},
+		"$or": []bson.M{
+			{"bookingId": ""},
+			{"bookingId": bson.M{"$exists": false}},
+		},
+	}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: 1}}))
+	if err != nil {
+		log.Printf("[BACKFILL BID] Query failed: %v", err)
+		return
+	}
+	defer cursor.Close(ctx)
 
-		if err != nil {
+	for cursor.Next(ctx) {
+		var b models.Booking
+		if err := cursor.Decode(&b); err != nil {
+			log.Printf("[BACKFILL BID] Decode error: %v", err)
+			continue
+		}
+		if b.BookingID != "" {
+			continue
+		}
+		bid, err := utils.GenerateNextBookingID(ctx)
+		if err != nil || bid == "" {
+			log.Printf("[BACKFILL BID] GenerateNextBookingID failed for %s: %v", b.ID.Hex(), err)
 			return
 		}
-		defer cursor.Close(ctx)
-
-		for cursor.Next(ctx) {
-			var b models.Booking
-			if err := cursor.Decode(&b); err == nil && b.BookingID == "" {
-				bid, err := utils.GenerateNextBookingID(ctx)
-				if err == nil && bid != "" {
-					_, _ = bookingCollection.UpdateOne(ctx, bson.M{"_id": b.ID}, bson.M{"$set": bson.M{"bookingId": bid}})
-					log.Printf("[BACKFILL BID] Assigned %s to existing accepted booking %s", bid, b.ID.Hex())
-				}
-			}
+		res, err := bookingCollection.UpdateOne(
+			ctx,
+			bson.M{
+				"_id": b.ID,
+				"$or": []bson.M{
+					{"bookingId": ""},
+					{"bookingId": bson.M{"$exists": false}},
+				},
+			},
+			bson.M{"$set": bson.M{"bookingId": bid}},
+		)
+		if err != nil {
+			log.Printf("[BACKFILL BID] Failed to update booking %s with %s: %v", b.ID.Hex(), bid, err)
+			continue
 		}
-	}()
+		if res.ModifiedCount > 0 {
+			log.Printf("[BACKFILL BID] Assigned %s to existing booking %s", bid, b.ID.Hex())
+		}
+	}
+	if err := cursor.Err(); err != nil {
+		log.Printf("[BACKFILL BID] Cursor iteration error: %v", err)
+	}
 }
 
 func CreateRide(c *gin.Context) {
@@ -95,12 +113,36 @@ func CreateRide(c *gin.Context) {
 		return
 	}
 
+	body.Pickup = strings.TrimSpace(body.Pickup)
+	body.Dropoff = strings.TrimSpace(body.Dropoff)
+	body.VehicleModel = strings.TrimSpace(body.VehicleModel)
+	body.VehicleNumber = strings.TrimSpace(body.VehicleNumber)
+	body.DepartureTime = strings.TrimSpace(body.DepartureTime)
+	body.Date = strings.TrimSpace(body.Date)
+
+	if body.DepartureTime == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Departure time is required"})
+		return
+	}
+	if _, dateErr := time.Parse("2006-01-02", body.Date); dateErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid date format. Use YYYY-MM-DD"})
+		return
+	}
+	if math.IsNaN(body.PricePerSeat) || math.IsInf(body.PricePerSeat, 0) || body.PricePerSeat < 0 || body.PricePerSeat > 100000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid price per seat"})
+		return
+	}
+
 	// 10-minute gap rule check: Prevent same driver from posting rides within 10 minutes
 	findLastCtx, findLastCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer findLastCancel()
 
 	var lastRide models.Ride
 	err := rideCollection.FindOne(findLastCtx, bson.M{"driverId": userId}, options.FindOne().SetSort(bson.D{{Key: "createdAt", Value: -1}})).Decode(&lastRide)
+	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to verify ride creation cooldown"})
+		return
+	}
 	if err == nil {
 		timeSinceLastRide := time.Since(lastRide.CreatedAt)
 		if timeSinceLastRide < 10*time.Minute {
@@ -131,7 +173,11 @@ func CreateRide(c *gin.Context) {
 	}
 	err = config.Database.Collection("users").FindOne(findCtx, bson.M{"_id": userId}).Decode(&driver)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver info"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Driver account not found"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch driver info"})
 		return
 	}
 
@@ -140,33 +186,16 @@ func CreateRide(c *gin.Context) {
 		return
 	}
 
-	if math.IsNaN(body.PricePerSeat) || math.IsInf(body.PricePerSeat, 0) || body.PricePerSeat < 0 || body.PricePerSeat > 100000 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid price per seat"})
-		return
-	}
-
 	ongoingCount, ongoingErr := rideCollection.CountDocuments(findCtx, bson.M{
 		"driverId": userId,
 		"status":   string(models.RideStatusOngoing),
 	})
 	if ongoingErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify active rides"})
+		c.JSON(config.DBErrorHTTPStatus(ongoingErr), gin.H{"error": "Failed to verify active rides"})
 		return
 	}
 	if ongoingCount > 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "Cannot create a new ride while you have an ongoing ride. Complete your current ride first."})
-		return
-	}
-
-	delCtx, delCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-	defer delCancel()
-
-	// Replace this driver's previous open rides WITHOUT orphaning passenger bookings.
-	// (Previously this hard-deleted every "available" ride, leaving booked passengers
-	// pointing at a ride that no longer existed.)
-	if err := retireOpenRides(delCtx, userId); err != nil {
-		log.Printf("[CreateRide] Failed to retire previous rides for driver %s: %v", userId.Hex(), err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset available rides"})
 		return
 	}
 
@@ -180,7 +209,7 @@ func CreateRide(c *gin.Context) {
 		sClean := strings.ToLower(strings.TrimSpace(s))
 		if sClean != "" && !seenStops[sClean] {
 			seenStops[sClean] = true
-			route = append(route, s)
+			route = append(route, strings.TrimSpace(s))
 		}
 	}
 
@@ -261,14 +290,43 @@ func CreateRide(c *gin.Context) {
 		CreatedAt:       time.Now(),
 	}
 
-	insCtx, insCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer insCancel()
+	txCtx, txCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer txCancel()
 
-	_, err = rideCollection.InsertOne(insCtx, ride)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create ride"})
+	var retiredNotices []retiredBookingNotice
+	if err := config.RunInTransaction(txCtx, func(sc context.Context) error {
+		txOngoing, txOngoingErr := rideCollection.CountDocuments(sc, bson.M{
+			"driverId": userId,
+			"status":   string(models.RideStatusOngoing),
+		})
+		if txOngoingErr != nil {
+			return txOngoingErr
+		}
+		if txOngoing > 0 {
+			return newTxErr(http.StatusConflict, "Cannot create a new ride while you have an ongoing ride. Complete your current ride first.")
+		}
+
+		// Soft-cancel driver's previous open rides and their open bookings atomically
+		// before inserting the new active ride (never hard-deletes rides).
+		notices, retireErr := retireOpenRidesInTx(sc, userId)
+		if retireErr != nil {
+			return fmt.Errorf("retire previous rides: %w", retireErr)
+		}
+		retiredNotices = notices
+
+		if _, err := rideCollection.InsertOne(sc, ride); err != nil {
+			if mongo.IsDuplicateKeyError(err) {
+				return newTxErr(http.StatusConflict, "An active ride already exists for this driver. Please try again.")
+			}
+			return err
+		}
+		return nil
+	}); err != nil {
+		respondTxError(c, err, "Failed to create ride")
 		return
 	}
+
+	sendRetiredRideNotices(retiredNotices)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message":         "Ride created successfully",
@@ -414,12 +472,8 @@ func segmentsOverlap(p1, d1, p2, d2 string, route []string) bool {
 	return d1Idx > p2Idx && d2Idx > p1Idx
 }
 
-func getTakenSeats(ctx context.Context, ride models.Ride, searchPickup, searchDropoff string) []int {
-	taken, err := queryTakenSeats(ctx, ride, searchPickup, searchDropoff, primitive.NilObjectID)
-	if err != nil {
-		return []int{}
-	}
-	return taken
+func getTakenSeats(ctx context.Context, ride models.Ride, searchPickup, searchDropoff string) ([]int, error) {
+	return queryTakenSeats(ctx, ride, searchPickup, searchDropoff, primitive.NilObjectID)
 }
 
 // computeTakenSeatsFromBookings computes the deduplicated taken seats for a ride
@@ -487,10 +541,9 @@ func batchBookingsForRides(ctx context.Context, rideIDs []primitive.ObjectID) (m
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
 
 	var bookings []models.Booking
-	if err := cursor.All(ctx, &bookings); err != nil {
+	if err := decodeCursorAll(ctx, cursor, &bookings); err != nil {
 		return nil, err
 	}
 	for _, b := range bookings {
@@ -515,10 +568,9 @@ func queryTakenSeats(ctx context.Context, ride models.Ride, searchPickup, search
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
 
 	var bookings []models.Booking
-	if err := cursor.All(ctx, &bookings); err != nil {
+	if err := decodeCursorAll(ctx, cursor, &bookings); err != nil {
 		return nil, err
 	}
 
@@ -797,13 +849,13 @@ func GetAvailableRides(c *gin.Context) {
 	cursor, err := rideCollection.Aggregate(dbCtx, pipeline)
 	if err != nil {
 		log.Printf("❌ AGGREGATION ERROR: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Search failed"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Search failed"})
 		return
 	}
 
 	var matchedRides []models.Ride
-	if err := cursor.All(dbCtx, &matchedRides); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse matching rides"})
+	if err := decodeCursorAll(dbCtx, cursor, &matchedRides); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse matching rides"})
 		return
 	}
 
@@ -834,7 +886,7 @@ func GetAvailableRides(c *gin.Context) {
 	bookingsByRide, err := batchBookingsForRides(dbCtx, candidateRideIDs)
 	if err != nil {
 		log.Printf("❌ BATCH BOOKINGS ERROR: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check seat availability"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to check seat availability"})
 		return
 	}
 
@@ -893,7 +945,11 @@ func GetRideDetails(c *gin.Context) {
 	var ride models.Ride
 	err = rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&ride)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch ride details"})
 		return
 	}
 
@@ -917,7 +973,12 @@ func GetRideDetails(c *gin.Context) {
 		}
 	}
 
-	response.TakenSeats = getTakenSeats(dbCtx, ride, segPickup, segDropoff)
+	takenSeats, takenErr := getTakenSeats(dbCtx, ride, segPickup, segDropoff)
+	if takenErr != nil {
+		c.JSON(config.DBErrorHTTPStatus(takenErr), gin.H{"error": "Failed to verify seat availability"})
+		return
+	}
+	response.TakenSeats = takenSeats
 	c.JSON(http.StatusOK, response)
 }
 
@@ -968,6 +1029,64 @@ func shouldReserveSeatsForBooking(booking models.Booking) (bool, int) {
 	return true, requestedSeats
 }
 
+var nonDigitRegex = regexp.MustCompile(`[^0-9]`)
+
+func sanitizePlainText(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	if maxLen > 0 && len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return s
+}
+
+func validateAndSanitizeParcelBooking(
+	parcelSize, recipientName, contactNumber, dropLocation, notes, photoUrl, price string,
+) (cleanSize, cleanRecipient, cleanContact, cleanDropLoc, cleanNotes, cleanPhoto, cleanPrice, errMsg string) {
+	cleanSize = sanitizePlainText(parcelSize, 50)
+	if cleanSize == "" {
+		return "", "", "", "", "", "", "", "Parcel size is required for parcel bookings"
+	}
+
+	cleanRecipient = sanitizePlainText(recipientName, 100)
+	if len(cleanRecipient) < 2 {
+		return "", "", "", "", "", "", "", "Recipient name must be at least 2 characters"
+	}
+
+	rawContact := strings.TrimSpace(contactNumber)
+	if len(rawContact) > 25 {
+		return "", "", "", "", "", "", "", "Contact number is too long"
+	}
+	digits := nonDigitRegex.ReplaceAllString(rawContact, "")
+	if len(digits) < 7 || len(digits) > 15 {
+		return "", "", "", "", "", "", "", "Valid recipient contact number is required"
+	}
+	cleanContact = sanitizePlainText(rawContact, 25)
+
+	cleanDropLoc = sanitizePlainText(dropLocation, 200)
+	cleanNotes = sanitizePlainText(notes, 500)
+
+	cleanPhoto = strings.TrimSpace(photoUrl)
+	if cleanPhoto != "" {
+		lowerPhoto := strings.ToLower(cleanPhoto)
+		if !strings.HasPrefix(lowerPhoto, "https://") &&
+			!strings.HasPrefix(lowerPhoto, "http://") &&
+			!strings.HasPrefix(lowerPhoto, "/uploads/") {
+			return "", "", "", "", "", "", "", "Invalid parcel photo URL"
+		}
+	}
+
+	priceStr := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(price, "₹", ""), ",", ""))
+	parsedPrice, parseErr := strconv.ParseFloat(priceStr, 64)
+	if parseErr != nil || math.IsNaN(parsedPrice) || math.IsInf(parsedPrice, 0) || parsedPrice <= 0 || parsedPrice > 100000 {
+		return "", "", "", "", "", "", "", "Valid positive parcel price is required"
+	}
+	cleanPrice = fmt.Sprintf("%.0f", parsedPrice)
+
+	return cleanSize, cleanRecipient, cleanContact, cleanDropLoc, cleanNotes, cleanPhoto, cleanPrice, ""
+}
+
 func BookRide(c *gin.Context) {
 	passengerId := c.MustGet("userId").(primitive.ObjectID)
 	rideIdHex := c.Param("rideId")
@@ -1013,12 +1132,28 @@ func BookRide(c *gin.Context) {
 		return
 	}
 
+	var cleanSize, cleanRecipient, cleanContact, cleanDropLoc, cleanNotes, cleanPhoto, cleanParcelPrice string
+	if bookingType == "parcel" {
+		var pErr string
+		cleanSize, cleanRecipient, cleanContact, cleanDropLoc, cleanNotes, cleanPhoto, cleanParcelPrice, pErr = validateAndSanitizeParcelBooking(
+			body.ParcelSize, body.RecipientName, body.ContactNumber, body.DropLocation, body.Notes, body.PhotoUrl, body.Price,
+		)
+		if pErr != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": pErr})
+			return
+		}
+	}
+
 	// SECURITY: Prevent driver from booking their own ride
 	checkCtx, checkCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer checkCancel()
 	var rideForCheck models.Ride
 	if err := rideCollection.FindOne(checkCtx, bson.M{"_id": rideId}).Decode(&rideForCheck); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch ride"})
 		return
 	}
 	if passengerId == rideForCheck.DriverID {
@@ -1042,39 +1177,22 @@ func BookRide(c *gin.Context) {
 		return
 	}
 
-	bookingPrice := strings.TrimSpace(body.Price)
-	if bookingType == "seat" && computedTotalPrice > 0 {
-		bookingPrice = fmt.Sprintf("%.0f", computedTotalPrice)
-	}
-
+	bookingPrice := cleanParcelPrice
 	if bookingType == "seat" {
-		// SECURITY: Prevent same passenger from booking the same ride twice (seat rides only)
-		existingCount, _ := bookingCollection.CountDocuments(checkCtx, bson.M{
-			"rideId":      rideId,
-			"passengerId": passengerId,
-			"type":        "seat",
-			"status":      bson.M{"$in": []string{"pending", "accepted"}},
-		})
-		if existingCount > 0 {
-			c.JSON(http.StatusConflict, gin.H{"error": "You already have an active booking for this ride. Check your notifications for the status."})
-			return
-		}
-
-		// Verify that requested seats are not already taken or pending approval
-		takenSeats := getTakenSeats(checkCtx, rideForCheck, effectivePickup, effectiveDropoff)
-		takenMap := make(map[int]bool, len(takenSeats))
-		for _, seat := range takenSeats {
-			takenMap[seat] = true
-		}
-		for _, requestedSeat := range seatLayout {
-			if takenMap[requestedSeat] {
-				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Seat %d is already taken or pending approval", requestedSeat)})
-				return
-			}
+		if computedTotalPrice > 0 {
+			bookingPrice = fmt.Sprintf("%.0f", computedTotalPrice)
+		} else {
+			bookingPrice = strings.TrimSpace(body.Price)
 		}
 	}
 
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	newBookingID := primitive.NewObjectID()
+	now := time.Now()
 	booking := models.Booking{
+		ID:             newBookingID,
 		RideID:         rideId,
 		PassengerID:    passengerId,
 		Type:           bookingType,
@@ -1085,41 +1203,116 @@ func BookRide(c *gin.Context) {
 		RoofCarrier:    body.RoofCarrier,
 		MotionSickness: body.MotionSickness,
 		// Parcel fields
-		ParcelSize:    body.ParcelSize,
-		RecipientName: body.RecipientName,
-		ContactNumber: body.ContactNumber,
-		DropLocation:  body.DropLocation,
-		Notes:         body.Notes,
-		PhotoUrl:      body.PhotoUrl,
+		ParcelSize:    cleanSize,
+		RecipientName: cleanRecipient,
+		ContactNumber: cleanContact,
+		DropLocation:  cleanDropLoc,
+		Notes:         cleanNotes,
+		PhotoUrl:      cleanPhoto,
 		Price:         bookingPrice,
 		Status:        "pending",
-		CreatedAt:     time.Now(),
+		CreatedAt:     now,
 	}
 
-	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	result, err := bookingCollection.InsertOne(dbCtx, booking)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store booking"})
-		return
-	}
-
-	// CONCURRENCY: The availability checks above ran BEFORE the insert, so two
-	// simultaneous requests for the same seat could both pass them. Re-verify now
-	// that our booking is persisted; if it conflicts, roll it back.
-	newBookingID, _ := result.InsertedID.(primitive.ObjectID)
-	conflictMsg, verifyErr := verifyNewBooking(dbCtx, rideId, newBookingID, passengerId, bookingType, effectivePickup, effectiveDropoff, seatsCount, seatLayout)
-	if verifyErr != nil || conflictMsg != "" {
-		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, _ = bookingCollection.DeleteOne(rbCtx, bson.M{"_id": newBookingID})
-		rbCancel()
-		if verifyErr != nil {
-			log.Printf("[BookRide] Verification failed for booking %s: %v", newBookingID.Hex(), verifyErr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to confirm booking. Please try again."})
-			return
+	if err := config.RunInTransaction(dbCtx, func(txCtx context.Context) error {
+		// Serialize concurrent bookings against the ride document so snapshot isolation
+		// cannot allow two concurrent transactions to reserve the same seat.
+		var lockedRide models.Ride
+		lockErr := rideCollection.FindOneAndUpdate(
+			txCtx,
+			bson.M{"_id": rideId, "status": string(models.RideStatusAvailable)},
+			bson.M{"$set": bson.M{"updatedAt": now}},
+			options.FindOneAndUpdate().SetReturnDocument(options.After),
+		).Decode(&lockedRide)
+		if lockErr != nil {
+			if errors.Is(lockErr, mongo.ErrNoDocuments) {
+				var latest models.Ride
+				if findErr := rideCollection.FindOne(txCtx, bson.M{"_id": rideId}).Decode(&latest); findErr != nil {
+					if errors.Is(findErr, mongo.ErrNoDocuments) {
+						return newTxErr(http.StatusNotFound, "Ride not found")
+					}
+					return findErr
+				}
+				return newTxErr(http.StatusConflict, "This ride is no longer accepting bookings")
+			}
+			return lockErr
 		}
-		c.JSON(http.StatusConflict, gin.H{"error": conflictMsg})
+
+		if bookingType == "seat" {
+			// SECURITY: Prevent same passenger from booking the same ride twice (seat rides only)
+			existingCount, countErr := bookingCollection.CountDocuments(txCtx, bson.M{
+				"rideId":      rideId,
+				"passengerId": passengerId,
+				"type":        "seat",
+				"status":      bson.M{"$in": []string{"pending", "accepted"}},
+			})
+			if countErr != nil {
+				return countErr
+			}
+			if existingCount > 0 {
+				return newTxErr(http.StatusConflict, "You already have an active booking for this ride. Check your notifications for the status.")
+			}
+
+			// Verify that requested seats are not already taken or pending approval
+			takenSeats, takenErr := getTakenSeats(txCtx, lockedRide, effectivePickup, effectiveDropoff)
+			if takenErr != nil {
+				return takenErr
+			}
+			takenMap := make(map[int]bool, len(takenSeats))
+			for _, seat := range takenSeats {
+				takenMap[seat] = true
+			}
+			for _, requestedSeat := range seatLayout {
+				if takenMap[requestedSeat] {
+					return newTxErr(http.StatusBadRequest, fmt.Sprintf("Seat %d is already taken or pending approval", requestedSeat))
+				}
+			}
+		} else {
+			// Double-submit guard for identical active parcel request
+			dupParcelCount, dupErr := bookingCollection.CountDocuments(txCtx, bson.M{
+				"rideId":        rideId,
+				"passengerId":   passengerId,
+				"type":          "parcel",
+				"status":        bson.M{"$in": []string{"pending", "accepted"}},
+				"recipientName": cleanRecipient,
+				"contactNumber": cleanContact,
+				"parcelSize":    cleanSize,
+			})
+			if dupErr != nil {
+				return dupErr
+			}
+			if dupParcelCount > 0 {
+				return newTxErr(http.StatusConflict, "An identical active parcel booking already exists for this ride")
+			}
+		}
+
+		if _, err := bookingCollection.InsertOne(txCtx, booking); err != nil {
+			if mongo.IsDuplicateKeyError(err) {
+				return newTxErr(http.StatusConflict, "You already have an active booking for this ride. Check your notifications for the status.")
+			}
+			return err
+		}
+
+		// In non-transactional standalone dev mode, verify post-insert and compensate on conflict.
+		if !config.InTransaction(txCtx) {
+			conflictMsg, verifyErr := verifyNewBooking(txCtx, rideId, newBookingID, passengerId, bookingType, effectivePickup, effectiveDropoff, seatsCount, seatLayout)
+			if verifyErr != nil || conflictMsg != "" {
+				rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, rbErr := bookingCollection.DeleteOne(rbCtx, bson.M{"_id": newBookingID})
+				rbCancel()
+				if rbErr != nil {
+					log.Printf("[CRITICAL ROLLBACK FAILURE] BookRide failed to delete conflicting booking %s: %v", newBookingID.Hex(), rbErr)
+					return fmt.Errorf("booking verification rollback failed: %w", rbErr)
+				}
+				if verifyErr != nil {
+					return verifyErr
+				}
+				return newTxErr(http.StatusConflict, conflictMsg)
+			}
+		}
+		return nil
+	}); err != nil {
+		respondTxError(c, err, "Failed to confirm booking. Please try again.")
 		return
 	}
 
@@ -1167,9 +1360,8 @@ func BookRide(c *gin.Context) {
 				log.Printf("[FCM] Sending booking request push to driver %s...", ride.DriverID.Hex())
 				// Pass rich data so the SW notification shows full ride details and
 				// tapping it deep-links straight into the requests overlay.
-				bookingObjectId := result.InsertedID.(primitive.ObjectID)
-				CreateNotification(ride.DriverID, title, body, "booking_request", bookingObjectId.Hex(), map[string]string{
-					"bookingId": bookingObjectId.Hex(),
+				CreateNotification(ride.DriverID, title, body, "booking_request", newBookingID.Hex(), map[string]string{
+					"bookingId": newBookingID.Hex(),
 					"rideId":    rideId.Hex(),
 					"pickup":    booking.Pickup,
 					"dropoff":   booking.Dropoff,
@@ -1181,7 +1373,7 @@ func BookRide(c *gin.Context) {
 		}
 	}()
 
-	c.JSON(http.StatusCreated, gin.H{"message": msg, "bookingId": result.InsertedID})
+	c.JSON(http.StatusCreated, gin.H{"message": msg, "bookingId": newBookingID})
 }
 
 func GetDriverRequests(c *gin.Context) {
@@ -1192,13 +1384,13 @@ func GetDriverRequests(c *gin.Context) {
 	// Sub-query to get all rides created by this driver
 	cursor, err := rideCollection.Find(dbCtx, bson.M{"driverId": driverId})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch driver rides"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch driver rides"})
 		return
 	}
 
 	var rides []models.Ride
-	if err := cursor.All(dbCtx, &rides); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse rides"})
+	if err := decodeCursorAll(dbCtx, cursor, &rides); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse rides"})
 		return
 	}
 
@@ -1217,15 +1409,15 @@ func GetDriverRequests(c *gin.Context) {
 
 	// Filter bookings for those rideIds (newest first)
 	opts := options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}})
-	cursor, err = bookingCollection.Find(dbCtx, bson.M{"rideId": bson.M{"$in": rideIds}}, opts)
+	bCursor, err := bookingCollection.Find(dbCtx, bson.M{"rideId": bson.M{"$in": rideIds}}, opts)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch requests"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch requests"})
 		return
 	}
 
 	var bookings []models.Booking
-	if err := cursor.All(dbCtx, &bookings); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings"})
+	if err := decodeCursorAll(dbCtx, bCursor, &bookings); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse bookings"})
 		return
 	}
 
@@ -1252,13 +1444,17 @@ func GetDriverRequests(c *gin.Context) {
 			bson.M{"_id": bson.M{"$in": passengerIDs}},
 			options.Find().SetProjection(bson.M{"name": 1, "phone_number": 1}),
 		)
-		if pErr == nil {
-			var passengers []models.User
-			if err := pCursor.All(dbCtx, &passengers); err == nil {
-				for _, p := range passengers {
-					passengerMap[p.ID] = p
-				}
-			}
+		if pErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(pErr), gin.H{"error": "Failed to fetch passenger details"})
+			return
+		}
+		var passengers []models.User
+		if err := decodeCursorAll(dbCtx, pCursor, &passengers); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse passenger details"})
+			return
+		}
+		for _, p := range passengers {
+			passengerMap[p.ID] = p
 		}
 	}
 
@@ -1298,7 +1494,7 @@ func GetPassengerBookings(c *gin.Context) {
 
 	cursor, err := bookingCollection.Aggregate(dbCtx, pipeline)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch bookings"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch bookings"})
 		return
 	}
 
@@ -1308,8 +1504,8 @@ func GetPassengerBookings(c *gin.Context) {
 	}
 
 	var results []aggregatedResult
-	if err := cursor.All(dbCtx, &results); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse bookings"})
+	if err := decodeCursorAll(dbCtx, cursor, &results); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse bookings"})
 		return
 	}
 
@@ -1336,8 +1532,8 @@ func GetPassengerBookings(c *gin.Context) {
 
 	bookingsByRide, bErr := batchBookingsForRides(dbCtx, rideIDs)
 	if bErr != nil {
-		log.Printf("[GetPassengerBookings] batchBookingsForRides warning: %v", bErr)
-		bookingsByRide = make(map[primitive.ObjectID][]models.Booking)
+		c.JSON(config.DBErrorHTTPStatus(bErr), gin.H{"error": "Failed to fetch ride seat availability"})
+		return
 	}
 
 	driverPhones := make(map[primitive.ObjectID]string, len(driverIDs))
@@ -1346,17 +1542,20 @@ func GetPassengerBookings(c *gin.Context) {
 			bson.M{"_id": bson.M{"$in": driverIDs}},
 			options.Find().SetProjection(bson.M{"phone_number": 1}),
 		)
-		if dErr == nil && dCursor != nil {
-			var drivers []struct {
-				ID          primitive.ObjectID `bson:"_id"`
-				PhoneNumber string             `bson:"phone_number"`
-			}
-			if dCursor.All(dbCtx, &drivers) == nil {
-				for _, d := range drivers {
-					driverPhones[d.ID] = d.PhoneNumber
-				}
-			}
-			dCursor.Close(dbCtx)
+		if dErr != nil {
+			c.JSON(config.DBErrorHTTPStatus(dErr), gin.H{"error": "Failed to fetch driver contact details"})
+			return
+		}
+		var drivers []struct {
+			ID          primitive.ObjectID `bson:"_id"`
+			PhoneNumber string             `bson:"phone_number"`
+		}
+		if err := decodeCursorAll(dbCtx, dCursor, &drivers); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode driver contact details"})
+			return
+		}
+		for _, d := range drivers {
+			driverPhones[d.ID] = d.PhoneNumber
 		}
 	}
 
@@ -1411,7 +1610,7 @@ func SaveRecentRide(c *gin.Context) {
 
 	_, err := recentRoutesCollection.InsertOne(dbCtx, recentEntry)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save recent ride"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to save recent ride"})
 		return
 	}
 
@@ -1494,170 +1693,229 @@ func UpdateBookingStatus(c *gin.Context) {
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	// Get the booking to find the rideId and seatsRequested
 	var booking models.Booking
-	err = bookingCollection.FindOne(dbCtx, bson.M{"_id": bookingId}).Decode(&booking)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Booking not found"})
-		return
-	}
+	var generatedBID string
 
-	// Explicit booking FSM transition guard
-	if !models.CanTransitionBookingStatus(models.BookingStatus(booking.Status), models.BookingStatus(body.Status)) {
-		c.JSON(http.StatusConflict, gin.H{"error": "Booking status already updated"})
-		return
-	}
-
-	// Authorization check IDOR & ride status check
-	var ride models.Ride
-	err = rideCollection.FindOne(dbCtx, bson.M{"_id": booking.RideID}).Decode(&ride)
-	if err != nil || ride.DriverID != driverId {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized"})
-		return
-	}
-	if ride.Status != string(models.RideStatusAvailable) {
-		c.JSON(http.StatusConflict, gin.H{"error": "Cannot update a booking for a ride that is " + ride.Status})
-		return
-	}
-
-	if body.Status == string(models.BookingStatusAccepted) {
-		// Fail closed on driver lookup error or unverified status
-		var driver struct {
-			VerificationStatus string `bson:"verification_status"`
-		}
-		if err := config.Database.Collection("users").FindOne(dbCtx, bson.M{"_id": driverId}).Decode(&driver); err != nil || driver.VerificationStatus != string(models.VerificationStatusVerified) {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Only verified drivers can accept rides"})
-			return
+	if err := config.RunInTransaction(dbCtx, func(txCtx context.Context) error {
+		// Get the booking to find the rideId and seatsRequested
+		if err := bookingCollection.FindOne(txCtx, bson.M{"_id": bookingId}).Decode(&booking); err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
+				return newTxErr(http.StatusNotFound, "Booking not found")
+			}
+			return err
 		}
 
-		// Pre-CAS segment-aware seat & manual-block conflict check
-		if booking.Type == "seat" {
-			acceptedCursor, accErr := bookingCollection.Find(dbCtx, bson.M{
-				"rideId": booking.RideID,
-				"type":   "seat",
-				"status": string(models.BookingStatusAccepted),
-			})
-			if accErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify seat availability"})
-				return
-			}
-			var acceptedBookings []models.Booking
-			if decErr := acceptedCursor.All(dbCtx, &acceptedBookings); decErr != nil {
-				acceptedCursor.Close(dbCtx)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify seat availability"})
-				return
-			}
-			acceptedCursor.Close(dbCtx)
-
-			if conflict := checkAcceptBookingSeatConflict(ride, booking, acceptedBookings); conflict != "" {
-				c.JSON(http.StatusConflict, gin.H{"error": conflict})
-				return
-			}
+		// Explicit booking FSM transition guard
+		if !models.CanTransitionBookingStatus(models.BookingStatus(booking.Status), models.BookingStatus(body.Status)) {
+			return newTxErr(http.StatusConflict, "Booking status already updated")
 		}
-	}
 
-	// Atomic check that ride is still "available" before transitioning booking
-	rideCheckRes, rideCheckErr := rideCollection.UpdateOne(
-		dbCtx,
-		bson.M{"_id": booking.RideID, "status": string(models.RideStatusAvailable)},
-		bson.M{"$set": bson.M{"status": string(models.RideStatusAvailable)}},
-	)
-	if rideCheckErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify ride status"})
-		return
-	}
-	if rideCheckRes.MatchedCount == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "Ride is no longer available"})
-		return
-	}
+		// Authorization check IDOR & ride status check
+		var ride models.Ride
+		if err := rideCollection.FindOne(txCtx, bson.M{"_id": booking.RideID}).Decode(&ride); err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
+				return newTxErr(http.StatusForbidden, "Not authorized")
+			}
+			return err
+		}
+		if ride.DriverID != driverId {
+			return newTxErr(http.StatusForbidden, "Not authorized")
+		}
+		if ride.Status != string(models.RideStatusAvailable) {
+			return newTxErr(http.StatusConflict, "Cannot update a booking for a ride that is "+ride.Status)
+		}
 
-	// CONCURRENCY: Only transition the booking if it is STILL pending.
-	updateRes, err := bookingCollection.UpdateOne(
-		dbCtx,
-		bson.M{"_id": bookingId, "status": string(models.BookingStatusPending)},
-		bson.M{"$set": bson.M{"status": body.Status}},
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update booking"})
-		return
-	}
-	if updateRes.MatchedCount == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "Booking status already updated"})
-		return
-	}
-
-	rollbackAcceptedBooking := func() {
-		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer rbCancel()
-		_, _ = bookingCollection.UpdateOne(
-			rbCtx,
-			bson.M{"_id": bookingId, "status": string(models.BookingStatusAccepted)},
-			bson.M{"$set": bson.M{"status": string(models.BookingStatusPending)}},
+		// Serialize concurrent mutations on this ride inside multi-document transactions.
+		now := time.Now()
+		rideCheckRes, rideCheckErr := rideCollection.UpdateOne(
+			txCtx,
+			bson.M{"_id": booking.RideID, "driverId": driverId, "status": string(models.RideStatusAvailable)},
+			bson.M{"$set": bson.M{"updatedAt": now}},
 		)
-	}
-
-	if body.Status == string(models.BookingStatusAccepted) {
-		// Post-CAS verification: re-read ride & accepted bookings to eliminate TOCTOU races
-		var latestRide models.Ride
-		if err := rideCollection.FindOne(dbCtx, bson.M{"_id": booking.RideID}).Decode(&latestRide); err != nil || latestRide.Status != string(models.RideStatusAvailable) {
-			rollbackAcceptedBooking()
-			c.JSON(http.StatusConflict, gin.H{"error": "Ride is no longer available"})
-			return
+		if rideCheckErr != nil {
+			return rideCheckErr
+		}
+		if rideCheckRes.MatchedCount == 0 {
+			return newTxErr(http.StatusConflict, "Ride is no longer available")
 		}
 
-		if booking.Type == "seat" {
-			acceptedCursor, accErr := bookingCollection.Find(dbCtx, bson.M{
-				"rideId": booking.RideID,
-				"type":   "seat",
-				"status": string(models.BookingStatusAccepted),
-			})
-			if accErr != nil {
-				rollbackAcceptedBooking()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify seat availability"})
-				return
+		if body.Status == string(models.BookingStatusAccepted) {
+			// Fail closed on driver lookup error or unverified status
+			var driver struct {
+				VerificationStatus string `bson:"verification_status"`
 			}
-			var acceptedBookings []models.Booking
-			if decErr := acceptedCursor.All(dbCtx, &acceptedBookings); decErr != nil {
-				acceptedCursor.Close(dbCtx)
-				rollbackAcceptedBooking()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify seat availability"})
-				return
+			if err := config.Database.Collection("users").FindOne(txCtx, bson.M{"_id": driverId}).Decode(&driver); err != nil {
+				if errors.Is(err, mongo.ErrNoDocuments) {
+					return newTxErr(http.StatusForbidden, "Only verified drivers can accept rides")
+				}
+				return err
 			}
-			acceptedCursor.Close(dbCtx)
-
-			if conflict := checkAcceptBookingSeatConflict(latestRide, booking, acceptedBookings); conflict != "" {
-				rollbackAcceptedBooking()
-				c.JSON(http.StatusConflict, gin.H{"error": conflict})
-				return
+			if driver.VerificationStatus != string(models.VerificationStatusVerified) {
+				return newTxErr(http.StatusForbidden, "Only verified drivers can accept rides")
 			}
 
-			distinctSeats := countDistinctAcceptedSeats(acceptedBookings)
-			_, _ = rideCollection.UpdateOne(
-				dbCtx,
-				bson.M{"_id": booking.RideID, "status": string(models.RideStatusAvailable)},
-				bson.M{"$set": bson.M{"seatsBooked": distinctSeats}},
-			)
+			// Segment-aware seat & manual-block conflict check
+			if booking.Type == "seat" {
+				acceptedCursor, accErr := bookingCollection.Find(txCtx, bson.M{
+					"rideId": booking.RideID,
+					"type":   "seat",
+					"status": string(models.BookingStatusAccepted),
+				})
+				if accErr != nil {
+					return accErr
+				}
+				var acceptedBookings []models.Booking
+				decErr := acceptedCursor.All(txCtx, &acceptedBookings)
+				curErr := acceptedCursor.Err()
+				acceptedCursor.Close(txCtx)
+				if decErr != nil {
+					return decErr
+				}
+				if curErr != nil {
+					return curErr
+				}
+
+				if conflict := checkAcceptBookingSeatConflict(ride, booking, acceptedBookings); conflict != "" {
+					return newTxErr(http.StatusConflict, conflict)
+				}
+			}
+
+			// Generate unique Booking ID (BID) outside tx lock (reused across tx retries)
+			// so status and bookingId persist atomically together.
+			if booking.BookingID == "" && generatedBID == "" {
+				bidCtx, bidCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+				newBID, errBID := utils.GenerateNextBookingID(bidCtx)
+				bidCancel()
+				if errBID != nil || newBID == "" {
+					return fmt.Errorf("generate bookingId: %w", errBID)
+				}
+				generatedBID = newBID
+			}
 		}
 
-		// Assign unique Booking ID (BID) only after acceptance is verified
-		if booking.BookingID == "" {
-			newBID, errBID := utils.GenerateNextBookingID(c.Request.Context())
-			if errBID == nil && newBID != "" {
-				_, _ = bookingCollection.UpdateOne(
-					dbCtx,
+		bookingUpdateFields := bson.M{"status": body.Status}
+		if body.Status == string(models.BookingStatusAccepted) && booking.BookingID == "" && generatedBID != "" {
+			bookingUpdateFields["bookingId"] = generatedBID
+		}
+
+		// CONCURRENCY: Only transition the booking if it is STILL pending.
+		updateRes, err := bookingCollection.UpdateOne(
+			txCtx,
+			bson.M{"_id": bookingId, "status": string(models.BookingStatusPending)},
+			bson.M{"$set": bookingUpdateFields},
+		)
+		if err != nil {
+			return err
+		}
+		if updateRes.MatchedCount == 0 {
+			return newTxErr(http.StatusConflict, "Booking status already updated")
+		}
+
+		if body.Status == string(models.BookingStatusAccepted) && booking.BookingID == "" {
+			booking.BookingID = generatedBID
+		}
+
+		if body.Status == string(models.BookingStatusAccepted) {
+			compensateStandalone := func() error {
+				if config.InTransaction(txCtx) {
+					return nil
+				}
+				rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer rbCancel()
+				rbUpdate := bson.M{"$set": bson.M{"status": string(models.BookingStatusPending)}}
+				if generatedBID != "" {
+					rbUpdate["$unset"] = bson.M{"bookingId": ""}
+				}
+				if _, rbErr := bookingCollection.UpdateOne(
+					rbCtx,
 					bson.M{"_id": bookingId, "status": string(models.BookingStatusAccepted)},
-					bson.M{"$set": bson.M{"bookingId": newBID}},
+					rbUpdate,
+				); rbErr != nil {
+					log.Printf("[CRITICAL ROLLBACK FAILURE] UpdateBookingStatus failed to revert booking %s: %v", bookingId.Hex(), rbErr)
+					return fmt.Errorf("booking rollback failed: %w", rbErr)
+				}
+				return nil
+			}
+
+			// Re-verify ride status inside tx/standalone fallback
+			var latestRide models.Ride
+			if err := rideCollection.FindOne(txCtx, bson.M{"_id": booking.RideID}).Decode(&latestRide); err != nil || latestRide.Status != string(models.RideStatusAvailable) {
+				if rbErr := compensateStandalone(); rbErr != nil {
+					return rbErr
+				}
+				if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+					return err
+				}
+				return newTxErr(http.StatusConflict, "Ride is no longer available")
+			}
+
+			if booking.Type == "seat" {
+				acceptedCursor, accErr := bookingCollection.Find(txCtx, bson.M{
+					"rideId": booking.RideID,
+					"type":   "seat",
+					"status": string(models.BookingStatusAccepted),
+				})
+				if accErr != nil {
+					if rbErr := compensateStandalone(); rbErr != nil {
+						return rbErr
+					}
+					return accErr
+				}
+				var acceptedBookings []models.Booking
+				decErr := acceptedCursor.All(txCtx, &acceptedBookings)
+				curErr := acceptedCursor.Err()
+				acceptedCursor.Close(txCtx)
+				if decErr != nil {
+					if rbErr := compensateStandalone(); rbErr != nil {
+						return rbErr
+					}
+					return decErr
+				}
+				if curErr != nil {
+					if rbErr := compensateStandalone(); rbErr != nil {
+						return rbErr
+					}
+					return curErr
+				}
+
+				if conflict := checkAcceptBookingSeatConflict(latestRide, booking, acceptedBookings); conflict != "" {
+					if rbErr := compensateStandalone(); rbErr != nil {
+						return rbErr
+					}
+					return newTxErr(http.StatusConflict, conflict)
+				}
+
+				distinctSeats := countDistinctAcceptedSeats(acceptedBookings)
+				seatUpdRes, seatUpdErr := rideCollection.UpdateOne(
+					txCtx,
+					bson.M{"_id": booking.RideID, "status": string(models.RideStatusAvailable)},
+					bson.M{"$set": bson.M{"seatsBooked": distinctSeats}},
 				)
-				booking.BookingID = newBID
+				if seatUpdErr != nil {
+					if rbErr := compensateStandalone(); rbErr != nil {
+						return rbErr
+					}
+					return seatUpdErr
+				}
+				if seatUpdRes.MatchedCount == 0 {
+					if rbErr := compensateStandalone(); rbErr != nil {
+						return rbErr
+					}
+					return newTxErr(http.StatusConflict, "Ride is no longer available")
+				}
 			}
 		}
-	}
 
+		return nil
+	}); err != nil {
+		respondTxError(c, err, "Failed to update booking")
+		return
+	}
 
 	// Capture status before goroutine so the closure doesn't race on body
 	capturedStatus := body.Status
 
-	// Notify passenger of decision via DB notification + FCM Push
+	// Notify passenger of decision via DB notification + FCM Push (after commit)
 	go func() {
 		var pushTitle, pushBody string
 		if capturedStatus == "accepted" {
@@ -1682,7 +1940,7 @@ func UpdateBookingStatus(c *gin.Context) {
 		})
 	}()
 
-	c.JSON(http.StatusOK, gin.H{"message": "Booking status updated"})
+	c.JSON(http.StatusOK, gin.H{"message": "Booking status updated", "bookingId": booking.BookingID})
 }
 
 func GetRecentRides(c *gin.Context) {
@@ -1714,7 +1972,7 @@ func GetRecentRides(c *gin.Context) {
 			opts,
 		)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch rides"})
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch rides"})
 			return
 		}
 		defer cursor.Close(dbCtx)
@@ -1727,6 +1985,10 @@ func GetRecentRides(c *gin.Context) {
 			} else {
 				log.Printf("[GetRecentRides] Skipping unparseable ride doc: %v", err)
 			}
+		}
+		if err := cursor.Err(); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to read rides"})
+			return
 		}
 
 		if rides == nil {
@@ -1746,26 +2008,33 @@ func GetRecentRides(c *gin.Context) {
 		}
 		allBookingsByRide := make(map[primitive.ObjectID][]models.Booking, len(rideIDs))
 		activeBookingsByRide := make(map[primitive.ObjectID][]models.Booking, len(rideIDs))
+		acceptedBookingsByRide := make(map[primitive.ObjectID][]models.Booking, len(rideIDs))
 		if len(rideIDs) > 0 {
 			bCursor, bErr := bookingCollection.Find(dbCtx, bson.M{"rideId": bson.M{"$in": rideIDs}})
-			if bErr == nil && bCursor != nil {
-				var allBookings []models.Booking
-				if bCursor.All(dbCtx, &allBookings) == nil {
-					for _, b := range allBookings {
-						allBookingsByRide[b.RideID] = append(allBookingsByRide[b.RideID], b)
-						if b.Status == "pending" || b.Status == "accepted" {
-							activeBookingsByRide[b.RideID] = append(activeBookingsByRide[b.RideID], b)
-						}
-					}
+			if bErr != nil {
+				c.JSON(config.DBErrorHTTPStatus(bErr), gin.H{"error": "Failed to fetch bookings for rides"})
+				return
+			}
+			var allBookings []models.Booking
+			if err := decodeCursorAll(dbCtx, bCursor, &allBookings); err != nil {
+				c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to decode bookings for rides"})
+				return
+			}
+			for _, b := range allBookings {
+				allBookingsByRide[b.RideID] = append(allBookingsByRide[b.RideID], b)
+				if b.Status == string(models.BookingStatusPending) || b.Status == string(models.BookingStatusAccepted) {
+					activeBookingsByRide[b.RideID] = append(activeBookingsByRide[b.RideID], b)
 				}
-				bCursor.Close(dbCtx)
+				if b.Status == string(models.BookingStatusAccepted) || b.Status == string(models.BookingStatusCompleted) {
+					acceptedBookingsByRide[b.RideID] = append(acceptedBookingsByRide[b.RideID], b)
+				}
 			}
 		}
 
 		var enrichedRides []EnrichedDriverRide
 		for _, r := range rides {
 			r.TakenSeats = computeTakenSeatsFromBookings(r, activeBookingsByRide[r.ID], "", "")
-			r.SeatsBooked = len(r.TakenSeats)
+			r.SeatsBooked = countDistinctAcceptedSeats(acceptedBookingsByRide[r.ID])
 
 			rideBookings := allBookingsByRide[r.ID]
 			if rideBookings == nil {
@@ -1800,13 +2069,20 @@ func GetRecentRides(c *gin.Context) {
 	}
 
 	bCursor, bErr := bookingCollection.Aggregate(dbCtx, pipeline)
-	if bErr == nil {
+	if bErr != nil {
+		c.JSON(config.DBErrorHTTPStatus(bErr), gin.H{"error": "Failed to fetch recent rides"})
+		return
+	}
+	if bCursor != nil {
 		var results []struct {
 			models.Booking `bson:",inline"`
 			RideDetails    []models.Ride `bson:"rideDetails"`
 		}
-		if err := bCursor.All(dbCtx, &results); err == nil && len(results) > 0 {
-			bCursor.Close(dbCtx)
+		if err := decodeCursorAll(dbCtx, bCursor, &results); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse recent rides"})
+			return
+		}
+		if len(results) > 0 {
 			var passengerRecent []bson.M
 			for _, res := range results {
 				pickup := res.Booking.Pickup
@@ -1834,9 +2110,6 @@ func GetRecentRides(c *gin.Context) {
 			c.JSON(http.StatusOK, passengerRecent)
 			return
 		}
-		if bCursor != nil {
-			bCursor.Close(dbCtx)
-		}
 	}
 
 	// Fallback for passengers with no bookings: return search history from `recent_routes`
@@ -1846,7 +2119,7 @@ func GetRecentRides(c *gin.Context) {
 		opts,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recent rides"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch recent rides"})
 		return
 	}
 	defer cursor.Close(dbCtx)
@@ -1857,6 +2130,10 @@ func GetRecentRides(c *gin.Context) {
 		if err := cursor.Decode(&doc); err == nil {
 			recent = append(recent, doc)
 		}
+	}
+	if err := cursor.Err(); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to read recent rides"})
+		return
 	}
 
 	if recent == nil {
@@ -1876,89 +2153,116 @@ func CompleteRide(c *gin.Context) {
 
 	userId := c.MustGet("userId").(primitive.ObjectID)
 
-	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	now := time.Now()
 	var ride models.Ride
-	err = rideCollection.FindOneAndUpdate(
-		dbCtx,
-		bson.M{
-			"_id":      rideId,
-			"driverId": userId,
-			"status":   bson.M{"$in": []string{string(models.RideStatusAvailable), string(models.RideStatusOngoing)}},
-		},
-		bson.M{"$set": bson.M{"status": string(models.RideStatusCompleted), "completedAt": now}},
-		options.FindOneAndUpdate().SetReturnDocument(options.After),
-	).Decode(&ride)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			var existing models.Ride
-			if findErr := rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&existing); findErr != nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
-				return
-			}
-			if existing.DriverID != userId {
-				c.JSON(http.StatusForbidden, gin.H{"error": "Only the driver can complete this ride"})
-				return
-			}
-			if existing.Status == string(models.RideStatusCancelled) {
-				c.JSON(http.StatusConflict, gin.H{"error": "Cannot complete a cancelled ride"})
-				return
-			}
-			if existing.Status == string(models.RideStatusCompleted) {
-				c.JSON(http.StatusConflict, gin.H{"error": "Ride is already completed"})
-				return
-			}
-			c.JSON(http.StatusConflict, gin.H{"error": "Cannot complete a ride in status " + existing.Status})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete ride"})
-		return
-	}
-
-	// Collect accepted passenger IDs BEFORE updating booking statuses
 	var completedPassengerIDs []primitive.ObjectID
-	{
-		collectCtx, collectCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer collectCancel()
-		pcursor, pcursorErr := bookingCollection.Find(collectCtx, bson.M{"rideId": rideId, "status": string(models.BookingStatusAccepted)})
-		if pcursorErr == nil {
-			seen := make(map[primitive.ObjectID]bool)
-			for pcursor.Next(collectCtx) {
-				var b models.Booking
-				if pcursor.Decode(&b) == nil {
-					if !seen[b.PassengerID] {
-						seen[b.PassengerID] = true
-						completedPassengerIDs = append(completedPassengerIDs, b.PassengerID)
+
+	if err := config.RunInTransaction(dbCtx, func(txCtx context.Context) error {
+		now := time.Now()
+		completedPassengerIDs = nil
+
+		err := rideCollection.FindOneAndUpdate(
+			txCtx,
+			bson.M{
+				"_id":      rideId,
+				"driverId": userId,
+				"status":   bson.M{"$in": []string{string(models.RideStatusAvailable), string(models.RideStatusOngoing)}},
+			},
+			bson.M{"$set": bson.M{"status": string(models.RideStatusCompleted), "completedAt": now}},
+			options.FindOneAndUpdate().SetReturnDocument(options.After),
+		).Decode(&ride)
+		if err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
+				var existing models.Ride
+				if findErr := rideCollection.FindOne(txCtx, bson.M{"_id": rideId}).Decode(&existing); findErr != nil {
+					if errors.Is(findErr, mongo.ErrNoDocuments) {
+						return newTxErr(http.StatusNotFound, "Ride not found")
 					}
+					return findErr
 				}
+				if existing.DriverID != userId {
+					return newTxErr(http.StatusForbidden, "Only the driver can complete this ride")
+				}
+				if existing.Status == string(models.RideStatusCancelled) {
+					return newTxErr(http.StatusConflict, "Cannot complete a cancelled ride")
+				}
+				if existing.Status == string(models.RideStatusCompleted) {
+					// Idempotent retry reconciliation: if a previous attempt crashed/aborted
+					// after marking the ride completed in non-tx mode, reconcile lingering open bookings.
+					lingeringCount, cntErr := bookingCollection.CountDocuments(txCtx, bson.M{
+						"rideId": rideId,
+						"status": bson.M{"$in": []string{string(models.BookingStatusAccepted), string(models.BookingStatusPending)}},
+					})
+					if cntErr != nil {
+						return cntErr
+					}
+					if lingeringCount == 0 {
+						return newTxErr(http.StatusConflict, "Ride is already completed")
+					}
+					ride = existing
+				} else {
+					return newTxErr(http.StatusConflict, "Cannot complete a ride in status "+existing.Status)
+				}
+			} else {
+				return err
 			}
-			pcursor.Close(collectCtx)
 		}
-	}
 
-	if _, err := bookingCollection.UpdateMany(
-		dbCtx,
-		bson.M{"rideId": rideId, "status": string(models.BookingStatusAccepted)},
-		bson.M{"$set": bson.M{"status": string(models.BookingStatusCompleted), "completedAt": now}},
-	); err != nil {
-		log.Printf("[CompleteRide] Failed to mark accepted bookings completed for ride %s: %v", rideId.Hex(), err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ride completed, but failed to update accepted bookings"})
+		// Collect accepted passenger IDs BEFORE updating booking statuses
+		pcursor, pcursorErr := bookingCollection.Find(
+			txCtx,
+			bson.M{"rideId": rideId, "status": string(models.BookingStatusAccepted)},
+			options.Find().SetProjection(bson.M{"passengerId": 1}),
+		)
+		if pcursorErr != nil {
+			return fmt.Errorf("fetch accepted bookings for completion: %w", pcursorErr)
+		}
+		var acceptedRows []struct {
+			PassengerID primitive.ObjectID `bson:"passengerId"`
+		}
+		decErr := pcursor.All(txCtx, &acceptedRows)
+		curErr := pcursor.Err()
+		pcursor.Close(txCtx)
+		if decErr != nil {
+			return fmt.Errorf("decode accepted bookings for completion: %w", decErr)
+		}
+		if curErr != nil {
+			return fmt.Errorf("iterate accepted bookings for completion: %w", curErr)
+		}
+
+		seen := make(map[primitive.ObjectID]bool, len(acceptedRows))
+		for _, row := range acceptedRows {
+			if !row.PassengerID.IsZero() && !seen[row.PassengerID] {
+				seen[row.PassengerID] = true
+				completedPassengerIDs = append(completedPassengerIDs, row.PassengerID)
+			}
+		}
+
+		if _, err := bookingCollection.UpdateMany(
+			txCtx,
+			bson.M{"rideId": rideId, "status": string(models.BookingStatusAccepted)},
+			bson.M{"$set": bson.M{"status": string(models.BookingStatusCompleted), "completedAt": now}},
+		); err != nil {
+			return fmt.Errorf("mark accepted bookings completed: %w", err)
+		}
+
+		if _, err := bookingCollection.UpdateMany(
+			txCtx,
+			bson.M{"rideId": rideId, "status": string(models.BookingStatusPending)},
+			bson.M{"$set": bson.M{"status": string(models.BookingStatusCancelled), "cancelledAt": now}},
+		); err != nil {
+			return fmt.Errorf("cancel pending bookings: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		respondTxError(c, err, "Failed to complete ride")
 		return
 	}
 
-	if _, err := bookingCollection.UpdateMany(
-		dbCtx,
-		bson.M{"rideId": rideId, "status": string(models.BookingStatusPending)},
-		bson.M{"$set": bson.M{"status": string(models.BookingStatusCancelled), "cancelledAt": now}},
-	); err != nil {
-		log.Printf("[CompleteRide] Failed to cancel pending bookings for ride %s: %v", rideId.Hex(), err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ride completed, but failed to cancel pending bookings"})
-		return
-	}
-
-	// Notify all accepted passengers that the ride is complete (DB notif + FCM push)
+	// Notify all accepted passengers AFTER transaction commits (DB notif + FCM push)
 	for _, passengerID := range completedPassengerIDs {
 		pid := passengerID // capture loop var
 		go CreateNotification(pid, "🏁 Ride Completed!",
@@ -1994,10 +2298,14 @@ func StartRide(c *gin.Context) {
 		options.FindOneAndUpdate().SetReturnDocument(options.After),
 	).Decode(&ride)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, mongo.ErrNoDocuments) {
 			var existing models.Ride
 			if findErr := rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&existing); findErr != nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+				if errors.Is(findErr, mongo.ErrNoDocuments) {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
+					return
+				}
+				c.JSON(config.DBErrorHTTPStatus(findErr), gin.H{"error": "Failed to verify ride"})
 				return
 			}
 			if existing.DriverID != userId {
@@ -2012,7 +2320,7 @@ func StartRide(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "Cannot start a ride that is already " + existing.Status})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start ride"})
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to start ride"})
 		return
 	}
 
@@ -2022,6 +2330,7 @@ func StartRide(c *gin.Context) {
 		defer notifCancel()
 		cursor, err := bookingCollection.Find(notifCtx, bson.M{"rideId": startedRideId, "status": string(models.BookingStatusAccepted)})
 		if err != nil {
+			log.Printf("[StartRide] Failed to query passengers for ride %s: %v", startedRideId.Hex(), err)
 			return
 		}
 		defer cursor.Close(notifCtx)
@@ -2037,11 +2346,13 @@ func StartRide(c *gin.Context) {
 				}
 			}
 		}
+		if err := cursor.Err(); err != nil {
+			log.Printf("[StartRide] Cursor error notifying passengers for ride %s: %v", startedRideId.Hex(), err)
+		}
 	}(rideId, ride.Pickup, ride.Dropoff)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Ride started successfully"})
 }
-
 
 func MarkNotificationsViewed(c *gin.Context) {
 	userId := c.MustGet("userId").(primitive.ObjectID)
@@ -2055,7 +2366,11 @@ func MarkNotificationsViewed(c *gin.Context) {
 	}
 	err := usersCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&userInfo)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+			return
+		}
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to load user profile"})
 		return
 	}
 	role := userInfo.Role
@@ -2065,11 +2380,12 @@ func MarkNotificationsViewed(c *gin.Context) {
 
 	if role == "driver" {
 		// Driver sees requests for THEIR rides
-		cursor, err := rideCollection.Find(dbCtx, bson.M{"driverId": userId})
-		if err != nil || cursor == nil {
-			c.JSON(http.StatusOK, gin.H{"message": "Notifications marked as viewed"})
+		cursor, err := rideCollection.Find(dbCtx, bson.M{"driverId": userId}, options.Find().SetProjection(bson.M{"_id": 1}))
+		if err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to fetch driver rides"})
 			return
 		}
+		defer cursor.Close(dbCtx)
 		var rideIds []primitive.ObjectID
 		for cursor.Next(dbCtx) {
 			var r models.Ride
@@ -2077,7 +2393,10 @@ func MarkNotificationsViewed(c *gin.Context) {
 				rideIds = append(rideIds, r.ID)
 			}
 		}
-		cursor.Close(dbCtx)
+		if err := cursor.Err(); err != nil {
+			c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to read driver rides"})
+			return
+		}
 		if len(rideIds) == 0 {
 			c.JSON(http.StatusOK, gin.H{"message": "Notifications marked as viewed"})
 			return
@@ -2090,7 +2409,10 @@ func MarkNotificationsViewed(c *gin.Context) {
 		update = bson.M{"$set": bson.M{"viewedByPassenger": true}}
 	}
 
-	bookingCollection.UpdateMany(dbCtx, filter, update)
+	if _, err := bookingCollection.UpdateMany(dbCtx, filter, update); err != nil {
+		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to mark notifications as viewed"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "Notifications marked as viewed"})
 }
 
@@ -2111,89 +2433,93 @@ func ToggleBlockSeat(c *gin.Context) {
 		return
 	}
 
-	// 1. Fetch the ride and verify ownership and status
-	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	var ride models.Ride
-	err = rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&ride)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Ride not found"})
-		return
-	}
-
-	if ride.DriverID != userId {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Only the driver can block seats"})
-		return
-	}
-	if ride.Status != string(models.RideStatusAvailable) {
-		c.JSON(http.StatusConflict, gin.H{"error": "Seats can only be blocked or unblocked on available rides"})
-		return
-	}
-
-	if body.SeatIndex < 1 || body.SeatIndex > ride.SeatsTotal {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid seat index"})
-		return
-	}
-
-	isBlocked := false
-	for _, s := range ride.ManualBlockedSeats {
-		if s == body.SeatIndex {
-			isBlocked = true
-			break
-		}
-	}
-
 	var updatedRide models.Ride
-	if isBlocked {
-		err = rideCollection.FindOneAndUpdate(
-			dbCtx,
-			bson.M{
-				"_id":                rideId,
-				"driverId":           userId,
-				"status":             string(models.RideStatusAvailable),
-				"manualBlockedSeats": body.SeatIndex,
-			},
-			bson.M{"$pull": bson.M{"manualBlockedSeats": body.SeatIndex}},
-			options.FindOneAndUpdate().SetReturnDocument(options.After),
-		).Decode(&updatedRide)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				var latest models.Ride
-				if findErr := rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&latest); findErr == nil {
-					if latest.Status != string(models.RideStatusAvailable) {
-						c.JSON(http.StatusConflict, gin.H{"error": "Seats can only be blocked or unblocked on available rides"})
-						return
-					}
-					c.JSON(http.StatusOK, gin.H{
-						"message":            "Seat status updated",
-						"manualBlockedSeats": latest.ManualBlockedSeats,
-					})
-					return
+
+	if err := config.RunInTransaction(dbCtx, func(txCtx context.Context) error {
+		var ride models.Ride
+		if err := rideCollection.FindOne(txCtx, bson.M{"_id": rideId}).Decode(&ride); err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
+				return newTxErr(http.StatusNotFound, "Ride not found")
+			}
+			return err
+		}
+
+		if ride.DriverID != userId {
+			return newTxErr(http.StatusForbidden, "Only the driver can block seats")
+		}
+		if ride.Status != string(models.RideStatusAvailable) {
+			return newTxErr(http.StatusConflict, "Seats can only be blocked or unblocked on available rides")
+		}
+		if body.SeatIndex < 1 || body.SeatIndex > ride.SeatsTotal {
+			return newTxErr(http.StatusBadRequest, "Invalid seat index")
+		}
+
+		hasSeat := func(list []int, target int) bool {
+			for _, s := range list {
+				if s == target {
+					return true
 				}
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update seat block"})
-			return
+			return false
 		}
-	} else {
+
+		isBlocked := hasSeat(ride.ManualBlockedSeats, body.SeatIndex)
+
+		if isBlocked {
+			err := rideCollection.FindOneAndUpdate(
+				txCtx,
+				bson.M{
+					"_id":                rideId,
+					"driverId":           userId,
+					"status":             string(models.RideStatusAvailable),
+					"manualBlockedSeats": body.SeatIndex,
+				},
+				bson.M{"$pull": bson.M{"manualBlockedSeats": body.SeatIndex}},
+				options.FindOneAndUpdate().SetReturnDocument(options.After),
+			).Decode(&updatedRide)
+			if err != nil {
+				if errors.Is(err, mongo.ErrNoDocuments) {
+					var latest models.Ride
+					if findErr := rideCollection.FindOne(txCtx, bson.M{"_id": rideId}).Decode(&latest); findErr != nil {
+						if errors.Is(findErr, mongo.ErrNoDocuments) {
+							return newTxErr(http.StatusNotFound, "Ride not found")
+						}
+						return findErr
+					}
+					if latest.Status != string(models.RideStatusAvailable) {
+						return newTxErr(http.StatusConflict, "Seats can only be blocked or unblocked on available rides")
+					}
+					if !hasSeat(latest.ManualBlockedSeats, body.SeatIndex) {
+						// Already unblocked concurrently; safe idempotent return.
+						updatedRide = latest
+						return nil
+					}
+					return newTxErr(http.StatusConflict, "Seat block state changed concurrently. Please retry.")
+				}
+				return err
+			}
+			return nil
+		}
+
 		activeBookingFilter := bson.M{
 			"rideId":     rideId,
 			"type":       "seat",
 			"status":     bson.M{"$in": []string{string(models.BookingStatusPending), string(models.BookingStatusAccepted)}},
 			"seatLayout": body.SeatIndex,
 		}
-		bookedCount, countErr := bookingCollection.CountDocuments(dbCtx, activeBookingFilter)
+		bookedCount, countErr := bookingCollection.CountDocuments(txCtx, activeBookingFilter)
 		if countErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check seat bookings"})
-			return
+			return countErr
 		}
 		if bookedCount > 0 {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Cannot block seat %d: seat is already booked or pending approval", body.SeatIndex)})
-			return
+			return newTxErr(http.StatusConflict, fmt.Sprintf("Cannot block seat %d: seat is already booked or pending approval", body.SeatIndex))
 		}
 
-		err = rideCollection.FindOneAndUpdate(
-			dbCtx,
+		err := rideCollection.FindOneAndUpdate(
+			txCtx,
 			bson.M{
 				"_id":                rideId,
 				"driverId":           userId,
@@ -2204,37 +2530,47 @@ func ToggleBlockSeat(c *gin.Context) {
 			options.FindOneAndUpdate().SetReturnDocument(options.After),
 		).Decode(&updatedRide)
 		if err != nil {
-			if err == mongo.ErrNoDocuments {
+			if errors.Is(err, mongo.ErrNoDocuments) {
 				var latest models.Ride
-				if findErr := rideCollection.FindOne(dbCtx, bson.M{"_id": rideId}).Decode(&latest); findErr == nil {
-					if latest.Status != string(models.RideStatusAvailable) {
-						c.JSON(http.StatusConflict, gin.H{"error": "Seats can only be blocked or unblocked on available rides"})
-						return
+				if findErr := rideCollection.FindOne(txCtx, bson.M{"_id": rideId}).Decode(&latest); findErr != nil {
+					if errors.Is(findErr, mongo.ErrNoDocuments) {
+						return newTxErr(http.StatusNotFound, "Ride not found")
 					}
-					c.JSON(http.StatusOK, gin.H{
-						"message":            "Seat status updated",
-						"manualBlockedSeats": latest.ManualBlockedSeats,
-					})
-					return
+					return findErr
 				}
+				if latest.Status != string(models.RideStatusAvailable) {
+					return newTxErr(http.StatusConflict, "Seats can only be blocked or unblocked on available rides")
+				}
+				if hasSeat(latest.ManualBlockedSeats, body.SeatIndex) {
+					updatedRide = latest
+					return nil
+				}
+				return newTxErr(http.StatusConflict, "Seat block state changed concurrently. Please retry.")
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update seat block"})
-			return
+			return err
 		}
 
 		// Re-verify no booking raced in for this seat during $addToSet
-		postCount, postErr := bookingCollection.CountDocuments(dbCtx, activeBookingFilter)
+		postCount, postErr := bookingCollection.CountDocuments(txCtx, activeBookingFilter)
 		if postErr != nil || postCount > 0 {
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, _ = rideCollection.UpdateOne(rbCtx, bson.M{"_id": rideId}, bson.M{"$pull": bson.M{"manualBlockedSeats": body.SeatIndex}})
-			rbCancel()
-			if postErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to confirm seat block"})
-				return
+			if !config.InTransaction(txCtx) {
+				rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, rbErr := rideCollection.UpdateOne(rbCtx, bson.M{"_id": rideId}, bson.M{"$pull": bson.M{"manualBlockedSeats": body.SeatIndex}})
+				rbCancel()
+				if rbErr != nil {
+					log.Printf("[CRITICAL ROLLBACK FAILURE] ToggleBlockSeat failed to revert block on ride %s seat %d: %v", rideId.Hex(), body.SeatIndex, rbErr)
+					return fmt.Errorf("seat block rollback failed: %w", rbErr)
+				}
 			}
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Cannot block seat %d: seat was just booked by a passenger", body.SeatIndex)})
-			return
+			if postErr != nil {
+				return postErr
+			}
+			return newTxErr(http.StatusConflict, fmt.Sprintf("Cannot block seat %d: seat was just booked by a passenger", body.SeatIndex))
 		}
+		return nil
+	}); err != nil {
+		respondTxError(c, err, "Failed to update seat block")
+		return
 	}
 
 	if updatedRide.ManualBlockedSeats == nil {
@@ -2246,22 +2582,45 @@ func ToggleBlockSeat(c *gin.Context) {
 	})
 }
 
-// retireOpenRides replaces a driver's previously posted "available" rides when they
-// post a new one, WITHOUT orphaning passenger bookings:
-//   - rides nobody has booked are deleted (same clean-up behaviour as before);
-//   - rides with pending/accepted bookings are marked "cancelled" (kept for history),
-//     their active bookings are cancelled and the affected passengers are notified.
-func retireOpenRides(ctx context.Context, driverID primitive.ObjectID) error {
+type retiredBookingNotice struct {
+	Booking models.Booking
+	Ride    models.Ride
+}
+
+func sendRetiredRideNotices(notices []retiredBookingNotice) {
+	for _, item := range notices {
+		b := item.Booking
+		r := item.Ride
+		bookingHex := b.ID.Hex()
+		go CreateNotification(b.PassengerID, "❌ Ride Cancelled",
+			"Your booking from "+b.Pickup+" to "+b.Dropoff+" was cancelled because the driver replaced the ride ("+r.Pickup+" → "+r.Dropoff+"). Please book another ride.",
+			"booking_status", bookingHex, map[string]string{
+				"bookingId": bookingHex,
+				"url":       "/?openTrips=true",
+			})
+	}
+}
+
+// retireOpenRidesInTx soft-cancels all "available" rides belonging to driverID
+// (never hard-deletes rides) and cancels any open ("pending"/"accepted") bookings
+// on those rides, returning passenger notification records to dispatch after commit.
+func retireOpenRidesInTx(ctx context.Context, driverID primitive.ObjectID) ([]retiredBookingNotice, error) {
 	cursor, err := rideCollection.Find(ctx, bson.M{"driverId": driverID, "status": string(models.RideStatusAvailable)})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var oldRides []models.Ride
-	if err := cursor.All(ctx, &oldRides); err != nil {
-		return err
+	decErr := cursor.All(ctx, &oldRides)
+	curErr := cursor.Err()
+	cursor.Close(ctx)
+	if decErr != nil {
+		return nil, decErr
+	}
+	if curErr != nil {
+		return nil, curErr
 	}
 	if len(oldRides) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	allIDs := make([]primitive.ObjectID, 0, len(oldRides))
@@ -2271,85 +2630,65 @@ func retireOpenRides(ctx context.Context, driverID primitive.ObjectID) error {
 		rideByID[r.ID] = r
 	}
 
-	activeStatuses := bson.M{"$in": []string{string(models.BookingStatusPending), string(models.BookingStatusAccepted)}}
-	bookedRideIDs, err := bookingCollection.Distinct(ctx, "rideId", bson.M{
-		"rideId": bson.M{"$in": allIDs},
-		"status": activeStatuses,
-	})
-	if err != nil {
-		return err
-	}
-	booked := make(map[primitive.ObjectID]bool, len(bookedRideIDs))
-	for _, v := range bookedRideIDs {
-		if id, ok := v.(primitive.ObjectID); ok {
-			booked[id] = true
-		}
-	}
-
-	var toCancel, toDelete []primitive.ObjectID
-	for _, id := range allIDs {
-		if booked[id] {
-			toCancel = append(toCancel, id)
-		} else {
-			toDelete = append(toDelete, id)
-		}
-	}
-
 	now := time.Now()
-	if len(toCancel) > 0 {
-		if _, err := rideCollection.UpdateMany(ctx,
-			bson.M{"_id": bson.M{"$in": toCancel}, "status": string(models.RideStatusAvailable)},
-			bson.M{"$set": bson.M{"status": string(models.RideStatusCancelled), "cancelledAt": now, "seatsBooked": 0}},
-		); err != nil {
-			return err
-		}
-	}
-	if len(toDelete) > 0 {
-		if _, err := rideCollection.DeleteMany(ctx,
-			bson.M{"_id": bson.M{"$in": toDelete}, "status": string(models.RideStatusAvailable)},
-		); err != nil {
-			return err
-		}
+	// Always soft-cancel available rides instead of hard-deleting them so audit history,
+	// foreign-key references, and analytics remain intact.
+	if _, err := rideCollection.UpdateMany(ctx,
+		bson.M{"_id": bson.M{"$in": allIDs}, "status": string(models.RideStatusAvailable)},
+		bson.M{"$set": bson.M{"status": string(models.RideStatusCancelled), "cancelledAt": now, "seatsBooked": 0}},
+	); err != nil {
+		return nil, err
 	}
 
-	// Cancel every booking still active on the retired rides. This runs AFTER the
-	// rides were retired, so it also catches any booking that raced in during the
-	// steps above (BookRide re-checks the ride's status after inserting).
+	activeStatuses := bson.M{"$in": []string{string(models.BookingStatusPending), string(models.BookingStatusAccepted)}}
 	bCursor, err := bookingCollection.Find(ctx, bson.M{"rideId": bson.M{"$in": allIDs}, "status": activeStatuses})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var affected []models.Booking
-	if err := bCursor.All(ctx, &affected); err != nil {
-		return err
+	bDecErr := bCursor.All(ctx, &affected)
+	bCurErr := bCursor.Err()
+	bCursor.Close(ctx)
+	if bDecErr != nil {
+		return nil, bDecErr
+	}
+	if bCurErr != nil {
+		return nil, bCurErr
 	}
 	if len(affected) == 0 {
-		return nil
+		log.Printf("[CreateRide] Driver %s: soft-cancelled %d open ride(s) with 0 open bookings",
+			driverID.Hex(), len(allIDs))
+		return nil, nil
 	}
 
 	affectedIDs := make([]primitive.ObjectID, 0, len(affected))
+	notices := make([]retiredBookingNotice, 0, len(affected))
 	for _, b := range affected {
 		affectedIDs = append(affectedIDs, b.ID)
+		notices = append(notices, retiredBookingNotice{
+			Booking: b,
+			Ride:    rideByID[b.RideID],
+		})
 	}
 	if _, err := bookingCollection.UpdateMany(ctx,
 		bson.M{"_id": bson.M{"$in": affectedIDs}, "status": activeStatuses},
 		bson.M{"$set": bson.M{"status": string(models.BookingStatusCancelled), "cancelledAt": now}},
 	); err != nil {
-		return err
+		return nil, err
 	}
 
-	for _, b := range affected {
-		r := rideByID[b.RideID]
-		bookingHex := b.ID.Hex()
-		go CreateNotification(b.PassengerID, "❌ Ride Cancelled",
-			"Your booking from "+b.Pickup+" to "+b.Dropoff+" was cancelled because the driver replaced the ride ("+r.Pickup+" → "+r.Dropoff+"). Please book another ride.",
-			"booking_status", bookingHex, map[string]string{
-				"bookingId": bookingHex,
-				"url":       "/?openTrips=true",
-			})
+	log.Printf("[CreateRide] Driver %s: soft-cancelled %d open ride(s) and %d booking(s)",
+		driverID.Hex(), len(allIDs), len(affected))
+	return notices, nil
+}
+
+// retireOpenRides soft-cancels open rides and immediately dispatches passenger notifications.
+func retireOpenRides(ctx context.Context, driverID primitive.ObjectID) error {
+	notices, err := retireOpenRidesInTx(ctx, driverID)
+	if err != nil {
+		return err
 	}
-	log.Printf("[CreateRide] Driver %s: deleted %d unbooked ride(s), cancelled %d booked ride(s) and %d booking(s)",
-		driverID.Hex(), len(toDelete), len(toCancel), len(affected))
+	sendRetiredRideNotices(notices)
 	return nil
 }
 
@@ -2377,6 +2716,26 @@ func verifyNewBooking(ctx context.Context, rideID, bookingID, passengerID primit
 	}
 
 	if bookingType == "parcel" {
+		var inserted models.Booking
+		if err := bookingCollection.FindOne(ctx, bson.M{"_id": bookingID}).Decode(&inserted); err != nil {
+			return "", err
+		}
+		dupParcel, err := bookingCollection.CountDocuments(ctx, bson.M{
+			"_id":           bson.M{"$ne": bookingID},
+			"rideId":        rideID,
+			"passengerId":   passengerID,
+			"type":          "parcel",
+			"status":        bson.M{"$in": []string{"pending", "accepted"}},
+			"recipientName": inserted.RecipientName,
+			"contactNumber": inserted.ContactNumber,
+			"parcelSize":    inserted.ParcelSize,
+		})
+		if err != nil {
+			return "", err
+		}
+		if dupParcel > 0 {
+			return "An identical active parcel booking already exists for this ride", nil
+		}
 		return "", nil
 	}
 

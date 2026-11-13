@@ -8,12 +8,13 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"raahi-backend/config"
 )
 
 func getJwtSecret() []byte {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
-		if os.Getenv("APP_ENV") == "production" {
+		if config.IsProductionEnv(os.Getenv("APP_ENV")) {
 			// CRITICAL SECURITY FIX: Never use a fallback secret in production.
 			// The application must crash if the secret is missing to prevent token forging.
 			panic("CRITICAL ERROR: JWT_SECRET environment variable is not set in production!")

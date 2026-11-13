@@ -2,12 +2,15 @@ package config
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -25,6 +28,12 @@ const (
 
 var DB *mongo.Client
 var Database *mongo.Database
+
+var (
+	topologyMu           sync.RWMutex
+	detectedTopologyMode string
+	standaloneTxWarnOnce sync.Once
+)
 
 // TopologyInfo holds the subset of MongoDB `hello` / `isMaster` fields used to
 // classify whether the connected server is a replica set, sharded router, or standalone node.
@@ -180,7 +189,7 @@ func BuildMongoClientOptions(rawURI, appEnv string) (*options.ClientOptions, err
 	// defaults cannot downgrade write durability or read consistency.
 	clientOptions.
 		SetAppName("raahi-backend").
-		SetWriteConcern(writeconcern.Majority().WithOptions(writeconcern.J(true))).
+		SetWriteConcern(writeconcern.Majority().WithOptions(writeconcern.J(true), writeconcern.WTimeout(5*time.Second))).
 		SetReadPreference(readpref.Primary()).
 		SetRetryWrites(true).
 		SetRetryReads(true).
@@ -294,6 +303,157 @@ func inspectTopology(
 	return ClassifyTopology(info, isProd)
 }
 
+func setDetectedTopologyMode(mode string) {
+	topologyMu.Lock()
+	detectedTopologyMode = mode
+	topologyMu.Unlock()
+}
+
+func getDetectedTopologyMode() string {
+	topologyMu.RLock()
+	mode := detectedTopologyMode
+	topologyMu.RUnlock()
+	return mode
+}
+
+// IsDBUnavailableError reports whether err represents a MongoDB timeout,
+// network failure, client disconnect, or primary failover condition where
+// HTTP 503 Service Unavailable is appropriate.
+func IsDBUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, mongo.ErrClientDisconnected) {
+		return true
+	}
+	if mongo.IsTimeout(err) || mongo.IsNetworkError(err) {
+		return true
+	}
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) {
+		if cmdErr.HasErrorLabel("RetryableWriteError") ||
+			cmdErr.HasErrorLabel("NetworkError") ||
+			cmdErr.HasErrorLabel("TransientTransactionError") ||
+			cmdErr.HasErrorLabel("UnknownTransactionCommitResult") {
+			return true
+		}
+		switch cmdErr.Code {
+		case 50, 91, 189, 10107, 11600, 11602, 13435, 13436:
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "server selection error") ||
+		strings.Contains(msg, "topology is closed") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "context deadline exceeded")
+}
+
+// DBErrorHTTPStatus returns HTTP 503 for transient/timeout/failover DB errors
+// and HTTP 500 for other unexpected database errors.
+func DBErrorHTTPStatus(err error) int {
+	if IsDBUnavailableError(err) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusInternalServerError
+}
+
+// IsTransactionUnsupportedError reports whether MongoDB rejected multi-document
+// transactions because the connected server is a standalone node rather than a
+// replica set or mongos.
+func IsTransactionUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) && cmdErr.Code == 20 {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "transaction numbers are only allowed on a replica set member or mongos") ||
+		strings.Contains(msg, "transactions are not supported")
+}
+
+// InTransaction reports whether ctx is an active MongoDB multi-document session context.
+func InTransaction(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	_, ok := ctx.(mongo.SessionContext)
+	return ok
+}
+
+type txSessionRunner func(ctx context.Context, fn func(txCtx context.Context) error) error
+
+// RunInTransaction executes fn inside a MongoDB ACID transaction when supported.
+// In non-production environments connected to a standalone mongod (or unit tests
+// without an active DB client), it safely falls back to executing fn without
+// a multi-document transaction. In production, transactions are strictly enforced.
+func RunInTransaction(ctx context.Context, fn func(txCtx context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	isProd := IsProductionEnv(os.Getenv("APP_ENV"))
+	return runInTransactionWith(
+		ctx,
+		isProd,
+		getDetectedTopologyMode(),
+		DB != nil,
+		func(c context.Context, callback func(txCtx context.Context) error) error {
+			session, err := DB.StartSession()
+			if err != nil {
+				return err
+			}
+			defer session.EndSession(context.Background())
+
+			_, err = session.WithTransaction(c, func(sessCtx mongo.SessionContext) (interface{}, error) {
+				return nil, callback(sessCtx)
+			})
+			return err
+		},
+		fn,
+	)
+}
+
+func runInTransactionWith(
+	ctx context.Context,
+	isProd bool,
+	topologyMode string,
+	clientInitialized bool,
+	sessionRunner txSessionRunner,
+	fn func(txCtx context.Context) error,
+) error {
+	if !clientInitialized {
+		if isProd {
+			return errors.New("mongodb client is not initialized; refusing non-transactional write in production")
+		}
+		return fn(ctx)
+	}
+
+	if topologyMode == "standalone" {
+		if isProd {
+			return errors.New("multi-document transactions require a replica set or mongos topology in production")
+		}
+		standaloneTxWarnOnce.Do(func() {
+			log.Println("⚠️ MongoDB standalone topology detected — executing multi-step write without transaction in non-production")
+		})
+		return fn(ctx)
+	}
+
+	err := sessionRunner(ctx, fn)
+	if err != nil && IsTransactionUnsupportedError(err) {
+		if isProd {
+			return fmt.Errorf("multi-document transactions are required in production but unsupported by MongoDB topology: %w", err)
+		}
+		setDetectedTopologyMode("standalone")
+		standaloneTxWarnOnce.Do(func() {
+			log.Println("⚠️ MongoDB server rejected transaction (standalone mode) — falling back to non-transactional execution in non-production")
+		})
+		return fn(ctx)
+	}
+	return err
+}
+
 func checkClusterTopology(client *mongo.Client, isProd bool) TopologyReport {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -302,6 +462,7 @@ func checkClusterTopology(client *mongo.Client, isProd bool) TopologyReport {
 	report := inspectTopology(ctx, func(c context.Context, cmd bson.D, out interface{}) error {
 		return adminDB.RunCommand(c, cmd).Decode(out)
 	}, isProd)
+	setDetectedTopologyMode(report.Mode)
 	log.Println(report.LogMessage)
 	return report
 }
@@ -347,14 +508,20 @@ func ConnectDB() {
 
 	if pingErr == nil {
 		checkClusterTopology(client, isProd)
-		InitializeIndexes()
+		if idxErr := InitializeIndexes(); idxErr != nil {
+			if isProd {
+				log.Fatalf("❌ FATAL MongoDB index initialization failed in production: %v", idxErr)
+			}
+			log.Printf("⚠️ MongoDB index initialization warning (non-prod): %v", idxErr)
+		}
 	}
 }
 
-func ensureCollectionIndexes(ctx context.Context, collectionName string, models []mongo.IndexModel) {
+func ensureCollectionIndexes(ctx context.Context, collectionName string, models []mongo.IndexModel) error {
 	if _, err := Database.Collection(collectionName).Indexes().CreateMany(ctx, models); err != nil {
-		log.Printf("⚠️ Failed to create %s indexes: %v", collectionName, err)
+		return fmt.Errorf("create %s indexes: %w", collectionName, err)
 	}
+	return nil
 }
 
 // CollectionIndexSpecs returns the declarative index specifications for all collections.
@@ -377,6 +544,7 @@ func CollectionIndexSpecs() []CollectionIndexSpec {
 		},
 		{
 			// Rides: Searchable by route, status/date, driver, and time (NO TTL)
+			// Enforces at most one active (available or ongoing) ride per driver.
 			Collection: "rides",
 			Models: []mongo.IndexModel{
 				{Keys: bson.D{{Key: "driverId", Value: 1}}},
@@ -386,10 +554,19 @@ func CollectionIndexSpecs() []CollectionIndexSpec {
 				{Keys: bson.D{{Key: "status", Value: 1}, {Key: "date", Value: 1}}},
 				{Keys: bson.D{{Key: "driverId", Value: 1}, {Key: "createdAt", Value: -1}}},
 				{Keys: bson.D{{Key: "driverId", Value: 1}, {Key: "status", Value: 1}}},
+				{
+					Keys: bson.D{{Key: "driverId", Value: 1}},
+					Options: options.Index().
+						SetName("uniq_active_ride_per_driver").
+						SetUnique(true).
+						SetPartialFilterExpression(bson.D{
+							{Key: "status", Value: bson.D{{Key: "$in", Value: bson.A{"available", "ongoing"}}}},
+						}),
+				},
 			},
 		},
 		{
-			// Bookings: Relational links, status filters, and passenger history (NO TTL)
+			// Bookings: Relational links, status filters, bookingId uniqueness, and active seat dedup (NO TTL)
 			Collection: "bookings",
 			Models: []mongo.IndexModel{
 				{Keys: bson.D{{Key: "rideId", Value: 1}}},
@@ -398,6 +575,20 @@ func CollectionIndexSpecs() []CollectionIndexSpec {
 				{Keys: bson.D{{Key: "createdAt", Value: -1}}},
 				{Keys: bson.D{{Key: "rideId", Value: 1}, {Key: "status", Value: 1}}},
 				{Keys: bson.D{{Key: "passengerId", Value: 1}, {Key: "createdAt", Value: -1}}},
+				{
+					Keys:    bson.D{{Key: "bookingId", Value: 1}},
+					Options: options.Index().SetUnique(true).SetSparse(true),
+				},
+				{
+					Keys: bson.D{{Key: "rideId", Value: 1}, {Key: "passengerId", Value: 1}},
+					Options: options.Index().
+						SetName("uniq_active_seat_booking_per_passenger").
+						SetUnique(true).
+						SetPartialFilterExpression(bson.D{
+							{Key: "type", Value: "seat"},
+							{Key: "status", Value: bson.D{{Key: "$in", Value: bson.A{"pending", "accepted"}}}},
+						}),
+				},
 			},
 		},
 		{
@@ -439,13 +630,22 @@ func CollectionIndexSpecs() []CollectionIndexSpec {
 	}
 }
 
-func InitializeIndexes() {
+func InitializeIndexes() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	var errs []error
 	for _, spec := range CollectionIndexSpecs() {
-		ensureCollectionIndexes(ctx, spec.Collection, spec.Models)
+		if err := ensureCollectionIndexes(ctx, spec.Collection, spec.Models); err != nil {
+			log.Printf("⚠️ Failed to create %s indexes: %v", spec.Collection, err)
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 
 	log.Println("⚡ Database indexes initialized")
+	return nil
 }
