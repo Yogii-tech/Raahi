@@ -38,6 +38,11 @@ RUN chown -R appuser:appgroup /app
 
 USER appuser
 
+# Default to production so containers fail closed (e.g. requiring GCS_BUCKET_NAME and
+# MONGO_URI instead of falling back to ephemeral ./uploads/ or localhost). Override with
+# `-e APP_ENV=development` for local container testing only.
+ENV APP_ENV=production
+
 # Expose the port the app runs on
 EXPOSE 8080
 

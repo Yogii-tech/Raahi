@@ -64,6 +64,12 @@ func main() {
 	controllers.InitializeChatCollection()
 	controllers.InitializeNotificationCollection()
 	controllers.InitializeReviewCollection()
+	if err := controllers.InitializeStorage(); err != nil {
+		if !isDev {
+			log.Fatalf("FATAL: Storage initialization failed in non-development environment (APP_ENV=%q): %v", appEnv, err)
+		}
+		log.Printf("⚠️ Storage initialization warning (dev mode): %v", err)
+	}
 
 	// Always run in release mode unless explicitly in development
 	if isDev {
@@ -134,10 +140,16 @@ func main() {
 	r.Use(cors.New(corsConfig))
 
 	// SECURITY: Serve uploads with security headers and no directory listing.
+	// In non-development environments (e.g. production Cloud Run), local ./uploads
+	// disk serving is disabled because all uploads live in Cloud Storage.
 	// Images are served inline so they can be rendered by browser <img> tags and
 	// the React Native Web <Image> component. Non-image files (PDFs etc.) are
 	// served as attachments to prevent inline script execution.
 	r.GET("/uploads/:filename", func(c *gin.Context) {
+		if !isDev {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Local disk file serving is disabled in production"})
+			return
+		}
 		filename := c.Param("filename")
 		// Prevent path traversal (including Windows backslashes)
 		if filename == "" || filename[0] == '.' || len(filename) > 255 || filename != filepath.Base(filename) || strings.ContainsAny(filename, "/\\") {
@@ -195,6 +207,10 @@ func main() {
 		if err := config.DB.Disconnect(shutdownCtx); err != nil {
 			log.Printf("MongoDB disconnect error: %v", err)
 		}
+	}
+
+	if err := controllers.CloseStorage(); err != nil {
+		log.Printf("GCS storage close error: %v", err)
 	}
 
 	sentry.Flush(5 * time.Second)

@@ -25,6 +25,35 @@ jobs:
     - name: Test
       run: go test -p 1 -vet=off -v ./...
 
+    - name: Validate Production Storage Secrets
+      env:
+        GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+        GCS_REPLICA_BUCKET_NAME: ${{ secrets.GCS_REPLICA_BUCKET_NAME }}
+        GCS_REQUIRE_REPLICA: ${{ secrets.GCS_REQUIRE_REPLICA }}
+      run: |-
+        python3 -c '
+        import os, sys
+
+        bucket = os.environ.get("GCS_BUCKET_NAME", "").strip()
+        replica_bucket = os.environ.get("GCS_REPLICA_BUCKET_NAME", "").strip()
+        require_replica = os.environ.get("GCS_REQUIRE_REPLICA", "").strip().lower()
+
+        if not bucket:
+            print("::error::GCS_BUCKET_NAME GitHub Secret is empty or unset. Refusing to deploy without persistent Cloud Storage.", file=sys.stderr)
+            sys.exit(1)
+
+        if require_replica in ("1", "true", "yes", "on") and not replica_bucket:
+            print("::error::GCS_REQUIRE_REPLICA is enabled but GCS_REPLICA_BUCKET_NAME is empty or unset.", file=sys.stderr)
+            sys.exit(1)
+
+        if replica_bucket and replica_bucket == bucket:
+            print(f"::error::GCS_REPLICA_BUCKET_NAME ({replica_bucket}) must differ from GCS_BUCKET_NAME.", file=sys.stderr)
+            sys.exit(1)
+
+        if not replica_bucket:
+            print("::warning::GCS_REPLICA_BUCKET_NAME is not set. Configure a secondary region backup bucket in GCP + GitHub Secrets for cross-region document replication.", file=sys.stderr)
+        '
+
     - name: Google Auth
       id: auth
       uses: 'google-github-actions/auth@v3'
@@ -52,15 +81,54 @@ jobs:
         SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         APP_ENV: production
         GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+        # Optional (recommended): secondary GCS replica/backup bucket in another region with Object Versioning + Retention
+        GCS_REPLICA_BUCKET_NAME: ${{ secrets.GCS_REPLICA_BUCKET_NAME }}
+        # Optional: set to "true" to fail uploads if replication to GCS_REPLICA_BUCKET_NAME fails after retries
+        GCS_REQUIRE_REPLICA: ${{ secrets.GCS_REQUIRE_REPLICA }}
       run: |-
         python3 -c '
-        import json, os
-        env_keys = ["MONGO_URI", "JWT_SECRET", "MSG91_AUTH_KEY", "MSG91_TEMPLATE_ID", "ADMIN_SECRET_KEY", "SENTRY_DSN", "APP_ENV", "GCS_BUCKET_NAME"]
-        env_vars = {k: os.environ[k] for k in env_keys if k in os.environ}
+        import json, os, sys
+
+        bucket = os.environ.get("GCS_BUCKET_NAME", "").strip()
+        replica_bucket = os.environ.get("GCS_REPLICA_BUCKET_NAME", "").strip()
+        require_replica = os.environ.get("GCS_REQUIRE_REPLICA", "").strip().lower()
+
+        if not bucket:
+            print("::error::GCS_BUCKET_NAME is empty; refusing to write env.json with empty storage bucket.", file=sys.stderr)
+            sys.exit(1)
+        if require_replica in ("1", "true", "yes", "on") and not replica_bucket:
+            print("::error::GCS_REQUIRE_REPLICA is enabled without GCS_REPLICA_BUCKET_NAME.", file=sys.stderr)
+            sys.exit(1)
+        if replica_bucket and replica_bucket == bucket:
+            print("::error::GCS_REPLICA_BUCKET_NAME must differ from GCS_BUCKET_NAME.", file=sys.stderr)
+            sys.exit(1)
+
+        env_keys = [
+            "MONGO_URI",
+            "JWT_SECRET",
+            "MSG91_AUTH_KEY",
+            "MSG91_TEMPLATE_ID",
+            "ADMIN_SECRET_KEY",
+            "SENTRY_DSN",
+            "APP_ENV",
+            "GCS_BUCKET_NAME",
+            "GCS_REPLICA_BUCKET_NAME",
+            "GCS_REQUIRE_REPLICA",
+        ]
+        trim_keys = {"APP_ENV", "GCS_BUCKET_NAME", "GCS_REPLICA_BUCKET_NAME", "GCS_REQUIRE_REPLICA"}
+        env_vars = {}
+        for k in env_keys:
+            val = os.environ.get(k, "")
+            if k in trim_keys:
+                val = val.strip()
+            # Never pass unset/empty GitHub Secrets as "" (gcloud --env-vars-file replaces service env vars).
+            if val.strip() != "":
+                env_vars[k] = val
         with open("env.json", "w") as f:
             json.dump(env_vars, f)
         '
 
+        trap 'rm -f env.json' EXIT
         gcloud run deploy raahi-api \
           --image asia-south2-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/raahi/backend:${{ github.sha }} \
           --region asia-south2 \
