@@ -96,6 +96,16 @@ func InitializeAuthCollection() {
 	StartIncompleteUserCleanupTask()
 }
 
+func getAuthUsersCollection() *mongo.Collection {
+	if userCollection != nil {
+		return userCollection
+	}
+	if config.Database != nil {
+		return config.Database.Collection("users")
+	}
+	return nil
+}
+
 // BuildIncompleteUserCleanupFilter builds the MongoDB filter for abandoned/incomplete
 // registrations older than cutoff, always excluding admin accounts.
 func BuildIncompleteUserCleanupFilter(cutoff time.Time) bson.M {
@@ -329,6 +339,18 @@ func VerifyFirebaseToken(c *gin.Context) {
 		}
 	}
 
+	// Self-heal legacy admin accounts whose Name remained empty from older /promote-admin flows
+	if user.Role == "admin" && strings.TrimSpace(user.Name) == "" {
+		user.Name = "Admin"
+		if usersCol := getAuthUsersCollection(); usersCol != nil {
+			_, _ = usersCol.UpdateOne(
+				dbCtx,
+				bson.M{"_id": user.ID, "$or": []bson.M{{"name": ""}, {"name": bson.M{"$exists": false}}}},
+				bson.M{"$set": bson.M{"name": "Admin"}},
+			)
+		}
+	}
+
 	jwtToken, err := utils.GenerateJWT(user.ID, user.TokenVersion)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate session token"})
@@ -346,6 +368,152 @@ func VerifyFirebaseToken(c *gin.Context) {
 		"refresh_token": refreshToken,
 		"user":          user,
 	})
+}
+
+type promoteAdminDeps struct {
+	findUserByID        func(ctx context.Context, userID primitive.ObjectID) (models.User, error)
+	updateAndFetchAdmin func(ctx context.Context, userID primitive.ObjectID, setFields bson.M) (models.User, error)
+	generateJWT         func(userID primitive.ObjectID, tokenVersion int) (string, error)
+	generateRefresh     func(userID primitive.ObjectID, tokenVersion int) (string, error)
+	notifyNewAdmin      func(promoted models.User)
+}
+
+var defaultPromoteAdminDeps = func() promoteAdminDeps {
+	return promoteAdminDeps{
+		findUserByID: func(ctx context.Context, userID primitive.ObjectID) (models.User, error) {
+			usersCol := getAuthUsersCollection()
+			if usersCol == nil {
+				return models.User{}, errors.New("user collection is not initialized")
+			}
+			var existing models.User
+			err := usersCol.FindOne(ctx, bson.M{"_id": userID}).Decode(&existing)
+			return existing, err
+		},
+		updateAndFetchAdmin: func(ctx context.Context, userID primitive.ObjectID, setFields bson.M) (models.User, error) {
+			usersCol := getAuthUsersCollection()
+			if usersCol == nil {
+				return models.User{}, errors.New("user collection is not initialized")
+			}
+			var promoted models.User
+			err := usersCol.FindOneAndUpdate(
+				ctx,
+				bson.M{"_id": userID},
+				bson.M{"$set": setFields},
+				options.FindOneAndUpdate().SetReturnDocument(options.After),
+			).Decode(&promoted)
+			return promoted, err
+		},
+		generateJWT:     utils.GenerateJWT,
+		generateRefresh: utils.GenerateRefreshToken,
+		notifyNewAdmin: func(promoted models.User) {
+			actorLabel := strings.TrimSpace(promoted.Name)
+			if actorLabel == "" {
+				actorLabel = promoted.PhoneNumber
+			}
+			NotifyAdminsAsync(AdminNotificationInput{
+				Title:          "New Admin Promoted",
+				Message:        fmt.Sprintf("%s (%s) was granted admin access.", actorLabel, promoted.PhoneNumber),
+				Type:           models.NotifTypeAdminPromoted,
+				Category:       models.NotifCategorySystem,
+				TargetView:     models.AdminViewAdminUsers,
+				RelatedID:      promoted.ID.Hex(),
+				ExcludeAdminID: promoted.ID,
+				Metadata: map[string]string{
+					"userId":     promoted.ID.Hex(),
+					"actorName":  promoted.Name,
+					"actorPhone": promoted.PhoneNumber,
+					"role":       "admin",
+				},
+			})
+		},
+	}
+}
+
+func sanitizeOptionalAdminName(raw string) string {
+	clean := strings.TrimSpace(raw)
+	clean = strings.ReplaceAll(clean, "<", "&lt;")
+	clean = strings.ReplaceAll(clean, ">", "&gt;")
+	if len(clean) > 100 {
+		clean = clean[:100]
+	}
+	if len(clean) < 2 {
+		return ""
+	}
+	return clean
+}
+
+type promoteAdminResult struct {
+	User         models.User
+	Token        string
+	RefreshToken string
+	StatusCode   int
+	ErrorMsg     string
+}
+
+func promoteUserToAdminSync(ctx context.Context, userId primitive.ObjectID, requestedName string, deps promoteAdminDeps) promoteAdminResult {
+	if deps.findUserByID == nil || deps.updateAndFetchAdmin == nil {
+		return promoteAdminResult{StatusCode: http.StatusServiceUnavailable, ErrorMsg: "Authentication service unavailable"}
+	}
+	if deps.generateJWT == nil {
+		deps.generateJWT = utils.GenerateJWT
+	}
+	if deps.generateRefresh == nil {
+		deps.generateRefresh = utils.GenerateRefreshToken
+	}
+
+	existing, err := deps.findUserByID(ctx, userId)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return promoteAdminResult{StatusCode: http.StatusNotFound, ErrorMsg: "User not found"}
+		}
+		return promoteAdminResult{StatusCode: config.DBErrorHTTPStatus(err), ErrorMsg: "Failed to load user account"}
+	}
+
+	wasAdmin := existing.Role == "admin"
+	setFields := bson.M{"role": "admin"}
+	if strings.TrimSpace(existing.Name) == "" {
+		// New phone accounts created during OTP verification start with an empty name;
+		// ensure promoted admin profiles carry a non-empty name for onboarding checks and alerts.
+		targetName := sanitizeOptionalAdminName(requestedName)
+		if targetName == "" {
+			targetName = "Admin"
+		}
+		setFields["name"] = targetName
+	}
+
+	promoted, err := deps.updateAndFetchAdmin(ctx, userId, setFields)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return promoteAdminResult{StatusCode: http.StatusNotFound, ErrorMsg: "User not found"}
+		}
+		return promoteAdminResult{StatusCode: config.DBErrorHTTPStatus(err), ErrorMsg: "Failed to promote user to admin"}
+	}
+	if strings.TrimSpace(promoted.Name) == "" {
+		if nameVal, ok := setFields["name"].(string); ok && nameVal != "" {
+			promoted.Name = nameVal
+		}
+	}
+	promoted.Role = "admin"
+
+	jwtToken, err := deps.generateJWT(promoted.ID, promoted.TokenVersion)
+	if err != nil {
+		return promoteAdminResult{StatusCode: http.StatusInternalServerError, ErrorMsg: "Failed to generate session token"}
+	}
+	refreshToken, err := deps.generateRefresh(promoted.ID, promoted.TokenVersion)
+	if err != nil {
+		return promoteAdminResult{StatusCode: http.StatusInternalServerError, ErrorMsg: "Failed to generate refresh token"}
+	}
+
+	if !wasAdmin && deps.notifyNewAdmin != nil {
+		deps.notifyNewAdmin(promoted)
+	}
+
+	return promoteAdminResult{
+		User:         promoted,
+		Token:        jwtToken,
+		RefreshToken: refreshToken,
+		StatusCode:   http.StatusOK,
+	}
 }
 
 func PromoteAdmin(c *gin.Context) {
@@ -371,8 +539,9 @@ func PromoteAdmin(c *gin.Context) {
 
 	var body struct {
 		SecretKey string `json:"secret_key"`
+		Name      string `json:"name"`
 	}
-	if err := c.BindJSON(&body); err != nil {
+	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
 		return
 	}
@@ -396,47 +565,18 @@ func PromoteAdmin(c *gin.Context) {
 	dbCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	res, err := userCollection.UpdateOne(
-		dbCtx,
-		bson.M{"_id": userId},
-		bson.M{"$set": bson.M{"role": "admin"}},
-	)
-
-	if err != nil {
-		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to promote user to admin"})
-		return
-	}
-	if res.MatchedCount == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+	res := promoteUserToAdminSync(dbCtx, userId, body.Name, defaultPromoteAdminDeps())
+	if res.StatusCode != http.StatusOK {
+		c.JSON(res.StatusCode, gin.H{"error": res.ErrorMsg})
 		return
 	}
 
-	if res.ModifiedCount > 0 {
-		var promoted models.User
-		if fetchErr := userCollection.FindOne(dbCtx, bson.M{"_id": userId}).Decode(&promoted); fetchErr == nil {
-			actorLabel := strings.TrimSpace(promoted.Name)
-			if actorLabel == "" {
-				actorLabel = promoted.PhoneNumber
-			}
-			NotifyAdminsAsync(AdminNotificationInput{
-				Title:          "New Admin Promoted",
-				Message:        fmt.Sprintf("%s (%s) was granted admin access.", actorLabel, promoted.PhoneNumber),
-				Type:           models.NotifTypeAdminPromoted,
-				Category:       models.NotifCategorySystem,
-				TargetView:     models.AdminViewAdminUsers,
-				RelatedID:      userId.Hex(),
-				ExcludeAdminID: userId,
-				Metadata: map[string]string{
-					"userId":     userId.Hex(),
-					"actorName":  promoted.Name,
-					"actorPhone": promoted.PhoneNumber,
-					"role":       "admin",
-				},
-			})
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Successfully promoted to admin"})
+	c.JSON(http.StatusOK, gin.H{
+		"message":       "Successfully promoted to admin",
+		"token":         res.Token,
+		"refresh_token": res.RefreshToken,
+		"user":          res.User,
+	})
 }
 
 func RefreshToken(c *gin.Context) {
