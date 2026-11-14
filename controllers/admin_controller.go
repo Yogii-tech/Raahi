@@ -763,6 +763,73 @@ func AdminGetBookingDetails(c *gin.Context) {
 	})
 }
 
+type adminDriverRow struct {
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	Phone              string `json:"phone"`
+	Location           string `json:"location"`
+	VerificationStatus string `json:"verificationStatus"`
+	RejectionReason    string `json:"rejectionReason"`
+	SubmittedAt        string `json:"submittedAt"`
+	VehicleName        string `json:"vehicleName"`
+	VehicleNumber      string `json:"vehicleNumber"`
+	VehicleType        string `json:"vehicleType"`
+	Seats              int    `json:"seats"`
+	SeatingLayout      string `json:"seatingLayout"`
+	DLUrl              string `json:"dlUrl"`
+	RCUrl              string `json:"rcUrl"`
+	PollutionUrl       string `json:"pollutionUrl"`
+	VehicleImageUrl    string `json:"vehicleImageUrl"`
+	OwnershipUrl       string `json:"ownershipUrl"`
+	DocumentCount      int    `json:"documentCount"`
+	TotalRides         int64  `json:"totalRides"`
+	CurrentRide        string `json:"currentRide"`
+}
+
+func buildAdminDriverRow(d models.User, totalRides int64) adminDriverRow {
+	status := d.VerificationStatus
+	if status == "" {
+		status = "pending"
+	}
+
+	location := d.Location
+	if location == "" {
+		location = "Bageshwar"
+	}
+
+	submittedAtStr := "Recent"
+	if !d.SubmittedAt.IsZero() {
+		submittedAtStr = d.SubmittedAt.Format("02 Jan 2006, 03:04 PM")
+	}
+
+	row := adminDriverRow{
+		ID:                 d.ID.Hex(),
+		Name:               d.Name,
+		Phone:              d.PhoneNumber,
+		Location:           location,
+		VerificationStatus: status,
+		RejectionReason:    d.RejectionReason,
+		SubmittedAt:        submittedAtStr,
+		DocumentCount:      models.CountVehicleDocuments(d.Vehicle),
+		TotalRides:         totalRides,
+	}
+
+	if d.Vehicle != nil {
+		row.VehicleName = d.Vehicle.VehicleName
+		row.VehicleNumber = d.Vehicle.VehicleNumber
+		row.VehicleType = d.Vehicle.VehicleType
+		row.Seats = d.Vehicle.Seats
+		row.SeatingLayout = d.Vehicle.SeatingLayout
+		row.DLUrl = d.Vehicle.DLUrl
+		row.RCUrl = d.Vehicle.RCUrl
+		row.PollutionUrl = d.Vehicle.PollutionUrl
+		row.VehicleImageUrl = d.Vehicle.VehicleImageUrl
+		row.OwnershipUrl = d.Vehicle.OwnershipUrl
+	}
+
+	return row
+}
+
 func AdminDrivers(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -775,28 +842,6 @@ func AdminDrivers(c *gin.Context) {
 	if err := decodeCursorAll(ctx, cursor, &drivers); err != nil {
 		c.JSON(config.DBErrorHTTPStatus(err), gin.H{"error": "Failed to parse drivers"})
 		return
-	}
-
-	type DriverRow struct {
-		ID                 string `json:"id"`
-		Name               string `json:"name"`
-		Phone              string `json:"phone"`
-		Location           string `json:"location"`
-		VerificationStatus string `json:"verificationStatus"`
-		RejectionReason    string `json:"rejectionReason"`
-		SubmittedAt        string `json:"submittedAt"`
-		VehicleName        string `json:"vehicleName"`
-		VehicleNumber      string `json:"vehicleNumber"`
-		VehicleType        string `json:"vehicleType"`
-		Seats              int    `json:"seats"`
-		SeatingLayout      string `json:"seatingLayout"`
-		DLUrl              string `json:"dlUrl"`
-		RCUrl              string `json:"rcUrl"`
-		PollutionUrl       string `json:"pollutionUrl"`
-		VehicleImageUrl    string `json:"vehicleImageUrl"`
-		OwnershipUrl       string `json:"ownershipUrl"`
-		TotalRides         int64  `json:"totalRides"`
-		CurrentRide        string `json:"currentRide"`
 	}
 
 	// PERF: Batch count driver rides in ONE aggregation instead of N+1 CountDocuments queries.
@@ -831,56 +876,13 @@ func AdminDrivers(c *gin.Context) {
 		}
 	}
 
-	var result []DriverRow
+	var result []adminDriverRow
 	for _, d := range drivers {
-		totalRides := driverRideCounts[d.ID]
-
-		status := d.VerificationStatus
-		if status == "" {
-			status = "pending"
-		}
-
-		location := d.Location
-		if location == "" {
-			location = "Bageshwar"
-		}
-
-		submittedAtStr := ""
-		if !d.SubmittedAt.IsZero() {
-			submittedAtStr = d.SubmittedAt.Format("02 Jan 2006, 03:04 PM")
-		} else {
-			submittedAtStr = "Recent"
-		}
-
-		row := DriverRow{
-			ID:                 d.ID.Hex(),
-			Name:               d.Name,
-			Phone:              d.PhoneNumber,
-			Location:           location,
-			VerificationStatus: status,
-			RejectionReason:    d.RejectionReason,
-			SubmittedAt:        submittedAtStr,
-			TotalRides:         totalRides,
-		}
-
-		if d.Vehicle != nil {
-			row.VehicleName = d.Vehicle.VehicleName
-			row.VehicleNumber = d.Vehicle.VehicleNumber
-			row.VehicleType = d.Vehicle.VehicleType
-			row.Seats = d.Vehicle.Seats
-			row.SeatingLayout = d.Vehicle.SeatingLayout
-			row.DLUrl = d.Vehicle.DLUrl
-			row.RCUrl = d.Vehicle.RCUrl
-			row.PollutionUrl = d.Vehicle.PollutionUrl
-			row.VehicleImageUrl = d.Vehicle.VehicleImageUrl
-			row.OwnershipUrl = d.Vehicle.OwnershipUrl
-		}
-
-		result = append(result, row)
+		result = append(result, buildAdminDriverRow(d, driverRideCounts[d.ID]))
 	}
 
 	if result == nil {
-		result = []DriverRow{}
+		result = []adminDriverRow{}
 	}
 	c.JSON(http.StatusOK, result)
 }
@@ -898,6 +900,20 @@ func buildReKYCUpdateDoc(driver models.User, reason string) bson.M {
 		setFields["vehicle.ownership_url"] = ""
 	}
 	return bson.M{"$set": setFields}
+}
+
+func validateAdminDriverVerification(driver models.User, targetStatus string) (int, string) {
+	fromStatus := models.VerificationStatus(driver.VerificationStatus)
+	toStatus := models.VerificationStatus(targetStatus)
+	if !models.CanTransitionVerificationStatus(fromStatus, toStatus) {
+		return http.StatusConflict, fmt.Sprintf("Invalid driver verification transition from %q to %q", fromStatus, toStatus)
+	}
+	if toStatus == models.VerificationStatusVerified {
+		if kycErr := validateDriverVehicleKYC(driver.Vehicle); kycErr != "" {
+			return http.StatusBadRequest, kycErr
+		}
+	}
+	return 0, ""
 }
 
 func AdminVerifyDriver(c *gin.Context) {
@@ -933,15 +949,9 @@ func AdminVerifyDriver(c *gin.Context) {
 
 	fromStatus := models.VerificationStatus(driver.VerificationStatus)
 	toStatus := models.VerificationStatus(body.Status)
-	if !models.CanTransitionVerificationStatus(fromStatus, toStatus) {
-		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Invalid driver verification transition from %q to %q", fromStatus, toStatus)})
+	if statusCode, errMsg := validateAdminDriverVerification(driver, body.Status); statusCode != 0 {
+		c.JSON(statusCode, gin.H{"error": errMsg})
 		return
-	}
-	if toStatus == models.VerificationStatusVerified {
-		if kycErr := validateDriverVehicleKYC(driver.Vehicle); kycErr != "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": kycErr})
-			return
-		}
 	}
 
 	reasonToSet := strings.TrimSpace(body.Reason)

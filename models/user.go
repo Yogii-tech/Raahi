@@ -1,9 +1,31 @@
 package models
 
 import (
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"strings"
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+// MinRequiredVehicleDocuments is the minimum number of distinct uploaded KYC
+// document URLs required before a driver can submit or be verified.
+const MinRequiredVehicleDocuments = 3
+
+// CountVehicleDocuments returns the count of distinct non-empty uploaded document URLs
+// across all five Vehicle document fields (DL, RC, Pollution, Vehicle Image, Ownership).
+func CountVehicleDocuments(v *Vehicle) int {
+	if v == nil {
+		return 0
+	}
+	seen := make(map[string]bool, 5)
+	for _, rawURL := range []string{v.DLUrl, v.RCUrl, v.PollutionUrl, v.VehicleImageUrl, v.OwnershipUrl} {
+		clean := strings.TrimSpace(rawURL)
+		if clean != "" {
+			seen[clean] = true
+		}
+	}
+	return len(seen)
+}
 
 // VerificationStatus represents the explicit driver KYC verification state.
 type VerificationStatus string

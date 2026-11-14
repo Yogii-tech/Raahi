@@ -142,11 +142,8 @@ func validateDriverVehicleKYC(v *models.Vehicle) string {
 	if math.IsNaN(v.RatePerKm) || math.IsInf(v.RatePerKm, 0) || v.RatePerKm < 0 {
 		return "Vehicle rate per km must be a valid non-negative number"
 	}
-	if strings.TrimSpace(v.DLUrl) == "" ||
-		strings.TrimSpace(v.RCUrl) == "" ||
-		strings.TrimSpace(v.PollutionUrl) == "" ||
-		strings.TrimSpace(v.VehicleImageUrl) == "" {
-		return "All required vehicle documents (DL, RC, Pollution, Vehicle Image) must be uploaded"
+	if models.CountVehicleDocuments(v) < models.MinRequiredVehicleDocuments {
+		return "At least 3 vehicle documents must be uploaded before verification"
 	}
 	return ""
 }
@@ -400,6 +397,7 @@ func UpdateProfile(c *gin.Context) {
 		if body.Vehicle != nil {
 			meta["vehicleName"] = body.Vehicle.VehicleName
 			meta["vehicleNumber"] = body.Vehicle.VehicleNumber
+			meta["documentCount"] = fmt.Sprintf("%d", models.CountVehicleDocuments(body.Vehicle))
 		}
 		NotifyAdminsAsync(AdminNotificationInput{
 			Title:      "New Driver Application",
@@ -430,6 +428,7 @@ func UpdateProfile(c *gin.Context) {
 		if body.Vehicle != nil {
 			meta["vehicleName"] = body.Vehicle.VehicleName
 			meta["vehicleNumber"] = body.Vehicle.VehicleNumber
+			meta["documentCount"] = fmt.Sprintf("%d", models.CountVehicleDocuments(body.Vehicle))
 		}
 		NotifyAdminsAsync(AdminNotificationInput{
 			Title:      "Driver Resubmitted Documents",

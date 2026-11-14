@@ -141,10 +141,16 @@ func TestDriverVehicleKYCAndLanguageHelpers(t *testing.T) {
 		t.Errorf("expected Seats=0 to fail KYC validation")
 	}
 
-	missingDoc := *base
-	missingDoc.RCUrl = "   "
-	if validateDriverVehicleKYC(&missingDoc) == "" {
-		t.Errorf("expected empty RCUrl to fail KYC validation")
+	threeDocs := *base
+	threeDocs.RCUrl = "   "
+	if msg := validateDriverVehicleKYC(&threeDocs); msg != "" {
+		t.Errorf("expected 3 distinct documents (with empty RCUrl) to pass KYC validation, got %q", msg)
+	}
+
+	twoDocs := threeDocs
+	twoDocs.PollutionUrl = "   "
+	if validateDriverVehicleKYC(&twoDocs) == "" {
+		t.Errorf("expected fewer than 3 documents to fail KYC validation")
 	}
 
 	if msg := validateDriverVehicleKYC(base); msg != "" {
